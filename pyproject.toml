@@ -1,0 +1,73 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "avtomatika-worker"
+version = "1.0.a2"
+description = "Worker SDK for the Avtomatika orchestrator."
+readme = "README.md"
+requires-python = ">=3.11"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "aiohttp~=3.13.2",
+    "python-json-logger~=4.0.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest",
+    "pytest-asyncio",
+    "aioresponses",
+    "pytest-mock",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/avtomatila-ai/avtomatika-worker"
+"Bug Tracker" = "https://github.com/avtomatila-ai/avtomatika-worker/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+markers = [
+    "e2e: marks tests as end-to-end tests",
+]
+pythonpath = "src"
+
+[tool.ruff]
+src = ["src", "tests"]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "A", "SIM", "C4", "PLC2401"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["avtomatika_worker"]
+
+[tool.ruff.format]
+quote-style = "double"
+skip-magic-trailing-comma = false
+
+[tool.mypy]
+python_version = "3.11"
+packages = ["avtomatika_worker"]
+package_path = "src"
+disallow_incomplete_defs = true
+disallow_untyped_calls = true
+no_implicit_optional = true
+ignore_missing_imports = true
+follow_imports = "skip"
+warn_unused_ignores = true
+warn_return_any = true
+disallow_any_unimported = false
+exclude = ["tests/"]
+
+[tool.coverage.run]
+source = ["src/avtomatika_worker"]
