@@ -16,9 +16,9 @@ def test_worker_config_loads_from_env(monkeypatch):
 
     config = WorkerConfig()
 
-    assert config.worker_id == "test-worker-from-env"
-    assert config.orchestrators[0]["url"] == "http://test-orchestrator-from-env"
-    assert config.max_concurrent_tasks == 5
+    assert config.WORKER_ID == "test-worker-from-env"
+    assert config.ORCHESTRATORS[0]["url"] == "http://test-orchestrator-from-env"
+    assert config.MAX_CONCURRENT_TASKS == 5
 
 
 def test_task_registration():
@@ -56,10 +56,7 @@ async def test_worker_polls_executes_and_sends_result(mocker, monkeypatch):
     monkeypatch.setenv("MAX_CONCURRENT_TASKS", "1")
     monkeypatch.setenv("HEARTBEAT_INTERVAL", "10")
     monkeypatch.setenv("ORCHESTRATOR_URL", "http://test-orchestrator")
-
-    # --- Correct Mocking Setup ---
-    session = mocker.MagicMock(spec=aiohttp.ClientSession)
-    session.closed = False
+    monkeypatch.setenv("COST_PER_SKILL", '{"successful_task": 0.5}')
 
     task_payload = {
         "job_id": "job-123",
@@ -68,22 +65,31 @@ async def test_worker_polls_executes_and_sends_result(mocker, monkeypatch):
         "params": {"input": "test"},
     }
 
-    # Create a shared response mock for GET
-    get_response = mocker.AsyncMock(spec=aiohttp.ClientResponse)
-    get_response.status = 200
-    get_response.json = mocker.AsyncMock(return_value=task_payload)
-    get_response.__aenter__.return_value = get_response
+    session = mocker.MagicMock(spec=aiohttp.ClientSession)
+    session.closed = False
 
-    # Create a shared response mock for POST
-    post_response = mocker.AsyncMock(spec=aiohttp.ClientResponse)
-    post_response.status = 200
-    post_response.__aenter__.return_value = post_response
-    post_response.json = mocker.AsyncMock(return_value={"status": "registered"})
+    # Mock for GET (polling for tasks)
+    get_response_success = mocker.AsyncMock(spec=aiohttp.ClientResponse)
+    get_response_success.status = 200
+    get_response_success.json = mocker.AsyncMock(return_value=task_payload)
+    get_response_success.__aenter__.return_value = get_response_success
+
+    get_response_no_task = mocker.AsyncMock(spec=aiohttp.ClientResponse)
+    get_response_no_task.status = 204
+    get_response_no_task.__aenter__.return_value = get_response_no_task
 
     session.get = mocker.MagicMock(
-        side_effect=[get_response, mocker.MagicMock(spec=aiohttp.ClientResponse, status=204)]
+        side_effect=[get_response_success, get_response_no_task]  # First call gets a task, subsequent get no task
     )
-    session.post = mocker.MagicMock(return_value=post_response)
+
+    # Mock for POST (registration and result sending)
+    post_response_success = mocker.AsyncMock(spec=aiohttp.ClientResponse)
+    post_response_success.status = 200
+    post_response_success.__aenter__.return_value = post_response_success
+
+    # Set side_effect for session.post to return different responses
+    # First POST is registration, second is task result
+    session.post = mocker.MagicMock(side_effect=[post_response_success, post_response_success])
 
     # Mock for PATCH (heartbeat)
     patch_response = mocker.AsyncMock(spec=aiohttp.ClientResponse)
@@ -98,7 +104,7 @@ async def test_worker_polls_executes_and_sends_result(mocker, monkeypatch):
         return {"status": "success"}
 
     worker_task = asyncio.create_task(worker.main())
-    await asyncio.sleep(0.1)
+    await asyncio.sleep(0.5)
     worker._shutdown_event.set()
     with contextlib.suppress(asyncio.CancelledError):
         await asyncio.wait_for(worker_task, timeout=1.0)
@@ -106,8 +112,19 @@ async def test_worker_polls_executes_and_sends_result(mocker, monkeypatch):
     # --- Assertions ---
     # Assert registration, polling, and result sending were called
     assert session.get.call_count > 0
+
+    # Check that POST was called for registration and for sending result
+    # The order can vary, so we check using 'any'
     assert any("register" in call.args[0] for call in session.post.call_args_list)
     assert any("result" in call.args[0] for call in session.post.call_args_list)
+
+    # Find the registration call and check the payload
+    for call in session.post.call_args_list:
+        if "register" in call.args[0]:
+            assert call.kwargs["json"]["cost_per_skill"] == {"successful_task": 0.5}
+            break
+    else:
+        pytest.fail("Registration call not found")
 
 
 @pytest.mark.asyncio
@@ -243,7 +260,7 @@ def test_get_current_state_busy():
     """Tests that _get_current_state returns 'busy' when the worker is at max capacity."""
     worker = Worker()
     worker._current_load = 10
-    worker._config.max_concurrent_tasks = 10
+    worker._config.MAX_CONCURRENT_TASKS = 10
     state = worker._get_current_state()
     assert state["status"] == "busy"
     assert state["supported_tasks"] == []
@@ -297,19 +314,29 @@ def test_get_current_state_with_task_type_limits():
 @pytest.mark.asyncio
 async def test_run_and_shutdown(mocker):
     """Tests that the worker can start, run, and shut down gracefully."""
+    # This test is more about lifecycle than network calls, but we need
+    # to provide valid mocks for the calls that happen on startup.
     session = mocker.MagicMock(spec=aiohttp.ClientSession)
     session.closed = False
-    post_response = mocker.AsyncMock(spec=aiohttp.ClientResponse)
-    post_response.status = 200
-    post_response.__aenter__.return_value = post_response
-    post_response.json = mocker.AsyncMock(return_value={"status": "registered"})
-    session.post = mocker.MagicMock(return_value=post_response)
-    session.get = mocker.MagicMock(return_value=mocker.AsyncMock(spec=aiohttp.ClientResponse, status=204))
-    session.patch = mocker.MagicMock(return_value=mocker.AsyncMock(spec=aiohttp.ClientResponse, status=200))
+
+    # Setup for POST (register)
+    post_cm = mocker.AsyncMock()
+    post_cm.__aenter__.return_value.status = 200
+    session.post.return_value = post_cm
+
+    # Setup for GET (poll)
+    get_cm = mocker.AsyncMock()
+    get_cm.__aenter__.return_value.status = 204  # No tasks
+    session.get.return_value = get_cm
+
+    # Setup for PATCH (heartbeat)
+    patch_cm = mocker.AsyncMock()
+    patch_cm.__aenter__.return_value.status = 200
+    session.patch.return_value = patch_cm
 
     worker = Worker(http_session=session)
     run_task = asyncio.create_task(worker.main())
-    await asyncio.sleep(0.1)
+    await asyncio.sleep(0.1)  # Give worker time to start up
     worker._shutdown_event.set()
     with contextlib.suppress(asyncio.CancelledError):
         await asyncio.wait_for(run_task, timeout=1.0)
@@ -320,19 +347,19 @@ async def test_send_result_success(mocker):
     """Tests that _send_result sends a successful result to the orchestrator."""
     session = mocker.MagicMock(spec=aiohttp.ClientSession)
     session.closed = False
-    post_response = mocker.AsyncMock(spec=aiohttp.ClientResponse)
-    post_response.status = 200
-    post_response.__aenter__.return_value = post_response
-    session.post = mocker.MagicMock(return_value=post_response)
+
+    post_cm = mocker.AsyncMock()
+    post_cm.__aenter__.return_value.status = 200
+    session.post.return_value = post_cm
 
     worker = Worker(http_session=session)
     payload = {
         "job_id": "job-1",
         "task_id": "task-1",
-        "worker_id": worker._config.worker_id,
+        "worker_id": worker._config.WORKER_ID,
         "result": {"status": "success"},
     }
-    await worker._send_result(payload, "http://test-orchestrator")
+    await worker._send_result(payload, {"url": "http://test-orchestrator"})
 
     session.post.assert_called_once()
     sent_payload = session.post.call_args.kwargs["json"]
@@ -344,26 +371,25 @@ async def test_send_result_failure(mocker):
     """Tests that _send_result retries on failure and then raises an exception."""
     session = mocker.MagicMock(spec=aiohttp.ClientSession)
     session.closed = False
-    post_response = mocker.AsyncMock(spec=aiohttp.ClientResponse)
-    post_response.status = 500
-    post_response.__aenter__.return_value = post_response
-    session.post = mocker.MagicMock(
-        side_effect=[
-            mocker.AsyncMock(spec=aiohttp.ClientResponse, status=500),
-            mocker.AsyncMock(spec=aiohttp.ClientResponse, status=500),
-        ]
-    )
+
+    # side_effect function to produce a new context manager mock on each call
+    def mock_failed_post(*args, **kwargs):
+        cm = mocker.AsyncMock()
+        cm.__aenter__.return_value.status = 500
+        return cm
+
+    session.post.side_effect = mock_failed_post
 
     worker = Worker(http_session=session)
-    worker._config.result_max_retries = 2
-    worker._config.result_retry_initial_delay = 0.01
+    worker._config.RESULT_MAX_RETRIES = 2
+    worker._config.RESULT_RETRY_INITIAL_DELAY = 0.01
 
     payload = {
         "job_id": "job-1",
         "task_id": "task-1",
-        "worker_id": worker._config.worker_id,
+        "worker_id": worker._config.WORKER_ID,
         "result": {"status": "failed"},
     }
-    await worker._send_result(payload, "http://test-orchestrator")
+    await worker._send_result(payload, {"url": "http://test-orchestrator"})
 
     assert session.post.call_count == 2

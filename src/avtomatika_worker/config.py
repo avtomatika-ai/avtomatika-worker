@@ -12,56 +12,63 @@ class WorkerConfig:
 
     def __init__(self):
         # --- Basic worker information ---
-        self.worker_id: str = getenv("WORKER_ID", f"worker-{uuid4()}")
-        self.worker_type: str = getenv("WORKER_TYPE", "generic-cpu-worker")
-        self.worker_port: int = int(getenv("WORKER_PORT", "8083"))
-        self.hostname: str = gethostname()
+        self.WORKER_ID: str = getenv("WORKER_ID", f"worker-{uuid4()}")
+        self.WORKER_TYPE: str = getenv("WORKER_TYPE", "generic-cpu-worker")
+        self.WORKER_PORT: int = int(getenv("WORKER_PORT", "8083"))
+        self.HOSTNAME: str = gethostname()
         try:
-            self.ip_address: str = gethostbyname(self.hostname)
+            self.IP_ADDRESS: str = gethostbyname(self.HOSTNAME)
         except gaierror:
-            self.ip_address: str = "127.0.0.1"
+            self.IP_ADDRESS: str = "127.0.0.1"
 
         # --- Orchestrator settings ---
-        self.orchestrators: list[dict[str, Any]] = self._get_orchestrators_config()
+        self.ORCHESTRATORS: list[dict[str, Any]] = self._get_orchestrators_config()
 
         # --- Security ---
-        self.worker_token: str = getenv(
+        self.WORKER_TOKEN: str = getenv(
             "WORKER_INDIVIDUAL_TOKEN",
             getenv("WORKER_TOKEN", "your-secret-worker-token"),
         )
 
         # --- Resources and performance ---
-        self.cost_per_second: float = float(getenv("WORKER_COST_PER_SECOND", "0.01"))
-        self.max_concurrent_tasks: int = int(getenv("MAX_CONCURRENT_TASKS", "10"))
-        self.resources: dict[str, Any] = {
+        self.COST_PER_SKILL: dict[str, float] = self._load_json_from_env("COST_PER_SKILL", default={})
+        self.MAX_CONCURRENT_TASKS: int = int(getenv("MAX_CONCURRENT_TASKS", "10"))
+        self.RESOURCES: dict[str, Any] = {
             "cpu_cores": int(getenv("CPU_CORES", "4")),
             "gpu_info": self._get_gpu_info(),
         }
 
         # --- Installed software and models (read as JSON strings) ---
-        self.installed_software: dict[str, str] = self._load_json_from_env(
+        self.INSTALLED_SOFTWARE: dict[str, str] = self._load_json_from_env(
             "INSTALLED_SOFTWARE",
             default={"python": "3.9"},
         )
-        self.installed_models: list[dict[str, str]] = self._load_json_from_env(
+        self.INSTALLED_MODELS: list[dict[str, str]] = self._load_json_from_env(
             "INSTALLED_MODELS",
             default=[],
         )
 
+        # --- S3 Settings for payload offloading ---
+        self.WORKER_PAYLOAD_DIR: str = getenv("WORKER_PAYLOAD_DIR", "/tmp/payloads")
+        self.S3_ENDPOINT_URL: str | None = getenv("S3_ENDPOINT_URL")
+        self.S3_ACCESS_KEY: str | None = getenv("S3_ACCESS_KEY")
+        self.S3_SECRET_KEY: str | None = getenv("S3_SECRET_KEY")
+        self.S3_DEFAULT_BUCKET: str = getenv("S3_DEFAULT_BUCKET", "avtomatika-payloads")
+
         # --- Tuning parameters ---
-        self.heartbeat_interval: float = float(getenv("HEARTBEAT_INTERVAL", "15"))
-        self.result_max_retries: int = int(getenv("RESULT_MAX_RETRIES", "5"))
-        self.result_retry_initial_delay: float = float(
+        self.HEARTBEAT_INTERVAL: float = float(getenv("HEARTBEAT_INTERVAL", "15"))
+        self.RESULT_MAX_RETRIES: int = int(getenv("RESULT_MAX_RETRIES", "5"))
+        self.RESULT_RETRY_INITIAL_DELAY: float = float(
             getenv("RESULT_RETRY_INITIAL_DELAY", "1.0"),
         )
-        self.heartbeat_debounce_delay: float = float(getenv("WORKER_HEARTBEAT_DEBOUNCE_DELAY", 0.1))
-        self.task_poll_timeout: float = float(getenv("TASK_POLL_TIMEOUT", "30"))
-        self.task_poll_error_delay: float = float(
+        self.HEARTBEAT_DEBOUNCE_DELAY: float = float(getenv("WORKER_HEARTBEAT_DEBOUNCE_DELAY", 0.1))
+        self.TASK_POLL_TIMEOUT: float = float(getenv("TASK_POLL_TIMEOUT", "30"))
+        self.TASK_POLL_ERROR_DELAY: float = float(
             getenv("TASK_POLL_ERROR_DELAY", "5.0"),
         )
-        self.idle_poll_delay: float = float(getenv("IDLE_POLL_DELAY", "0.01"))
-        self.enable_websockets: bool = getenv("WORKER_ENABLE_WEBSOCKETS", "false").lower() == "true"
-        self.multi_orchestrator_mode: str = getenv("MULTI_ORCHESTRATOR_MODE", "FAILOVER")
+        self.IDLE_POLL_DELAY: float = float(getenv("IDLE_POLL_DELAY", "0.01"))
+        self.ENABLE_WEBSOCKETS: bool = getenv("WORKER_ENABLE_WEBSOCKETS", "false").lower() == "true"
+        self.MULTI_ORCHESTRATOR_MODE: str = getenv("MULTI_ORCHESTRATOR_MODE", "FAILOVER")
 
     def _get_orchestrators_config(self) -> list[dict[str, Any]]:
         """
@@ -72,16 +79,20 @@ class WorkerConfig:
         if orchestrators_json:
             try:
                 orchestrators = loads(orchestrators_json)
+                if getenv("ORCHESTRATOR_URL"):
+                    print("Info: Both ORCHESTRATORS_CONFIG and ORCHESTRATOR_URL are set. Using ORCHESTRATORS_CONFIG.")
                 for o in orchestrators:
                     if "priority" not in o:
                         o["priority"] = 10
+                    if "weight" not in o:
+                        o["weight"] = 1
                 orchestrators.sort(key=lambda x: (x.get("priority", 10), x.get("url")))
                 return orchestrators
             except JSONDecodeError:
                 print("Warning: Could not decode JSON from ORCHESTRATORS_CONFIG. Falling back to default.")
 
         orchestrator_url = getenv("ORCHESTRATOR_URL", "http://localhost:8080")
-        return [{"url": orchestrator_url, "priority": 1}]
+        return [{"url": orchestrator_url, "priority": 1, "weight": 1}]
 
     def _get_gpu_info(self) -> dict[str, Any] | None:
         """Collects GPU information from environment variables.

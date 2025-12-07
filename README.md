@@ -8,22 +8,97 @@ This is an SDK for creating workers compatible with the **Avtomatika** orchestra
 pip install avtomatika-worker
 ```
 
-## Quick Start
+For advanced validation features, you can install the SDK with the `pydantic` extra:
+```bash
+pip install "avtomatika-worker[pydantic]"
+```
 
-Creating a worker is simple. You instantiate the `Worker` class and then register your task-handling functions using the `@worker.task` decorator.
+## Configuration
 
+The worker is configured entirely through environment variables. Before running your worker, you need to set a few essential variables.
+
+-   **`WORKER_ID`**: A unique name for your worker instance. If not provided, a random UUID will be generated.
+-   **`ORCHESTRATOR_URL`**: The address of the Avtomatika orchestrator.
+-   **`WORKER_TOKEN`**: An authentication token to connect to the orchestrator.
+
+Here is an example of how you might set them in your shell:
+```bash
+export WORKER_ID="image-processor-worker-1"
+export ORCHESTRATOR_URL="http://localhost:8080"
+export WORKER_TOKEN="your-secret-token"
+```
+
+A complete list of all available configuration variables can be found in the **Full Configuration Reference** section at the end of this document.
+
+## Programmatic Configuration (Advanced)
+
+While using environment variables is the recommended approach, you can also configure the worker programmatically. This is useful for advanced scenarios, such as dynamic configuration or integration into larger applications.
+
+The process supports partial configuration. When you create a `WorkerConfig` instance, it **first loads all settings from environment variables**. You can then override specific values in your code before passing the completed config object to the `Worker`.
+
+**Note:** The attributes on the `WorkerConfig` object use `UPPERCASE_SNAKE_CASE` to mirror the corresponding environment variables.
+
+### Example of Partial Configuration
+
+Let's assume you have an environment variable set for the orchestrator URL:
+```bash
+export ORCHESTRATOR_URL="http://orchestrator.from.env:8080"
+```
+
+You can then write Python code to override other settings:
 ```python
 import asyncio
 from avtomatika_worker import Worker
+from avtomatika_worker.config import WorkerConfig
 
-# 1. Create a worker instance
+# 1. Create a config object. It automatically reads ORCHESTRATOR_URL
+#    from the environment variables at this step.
+custom_config = WorkerConfig()
+
+# 2. Programmatically override or set other attributes.
+custom_config.WORKER_ID = "programmatic-worker-1"
+custom_config.WORKER_TOKEN = "super-secret-token-from-code"
+custom_config.MAX_CONCURRENT_TASKS = 5
+
+# 3. Pass the final config object to the Worker.
+#    It will use the values from your code (e.g., WORKER_ID)
+#    and the values from the environment (e.g., ORCHESTRATORS).
 worker = Worker(
-    worker_type="image-processing",
-    skill_dependencies={
-        "resize_image": ["pillow"],
-        "add_watermark": ["pillow", "numpy"],
-    }
+    worker_type="special-cpu-worker",
+    config=custom_config
 )
+
+@worker.task("do_work")
+async def do_work(params: dict, **kwargs):
+    # ...
+    return {"status": "success"}
+
+if __name__ == "__main__":
+    worker.run_with_health_check()
+```
+
+
+
+## Quick Start
+
+For quick testing and visibility during startup, you can add basic logging configuration to your worker script. This ensures that informational messages, including registration with the orchestrator, are printed to the console.
+
+You can configure your worker either via environment variables (recommended for production) or directly in your Python code for quick testing or specialized setups.
+
+### Option 1: Configure via Environment Variables (Recommended)
+
+Save the following code as `my_worker.py`:
+```python
+import asyncio
+import logging # Import logging
+from avtomatika_worker import Worker
+
+# Configure basic logging to see worker messages
+logging.basicConfig(level=logging.INFO)
+
+# 1. Create a worker instance.
+#    The SDK automatically reads the configuration from environment variables.
+worker = Worker(worker_type="image-processing")
 
 # 2. Register a task handler using the decorator
 @worker.task("resize_image")
@@ -54,7 +129,129 @@ if __name__ == "__main__":
     # The SDK will automatically connect to the orchestrator,
     # register itself, and start polling for tasks.
     worker.run_with_health_check()
+```
 
+After setting the required environment variables, you can run your worker.
+
+**Example:**
+```bash
+export WORKER_ID="image-processor-worker-1"
+export ORCHESTRATOR_URL="http://localhost:8080"
+export WORKER_TOKEN="your-secret-token"
+
+python my_worker.py
+```
+
+### Option 2: Configure Programmatically (Alternative)
+
+For quick testing or if you prefer to define configuration directly in code for simple examples, you can create and pass a `WorkerConfig` object.
+
+Save the following code as `my_worker_programmatic.py`:
+```python
+import asyncio
+import logging # Import logging
+from avtomatika_worker import Worker
+from avtomatika_worker.config import WorkerConfig # Import WorkerConfig
+
+# Configure basic logging to see worker messages
+logging.basicConfig(level=logging.INFO)
+
+# 1. Create and configure a WorkerConfig object
+my_config = WorkerConfig()
+my_config.WORKER_ID = "image-processor-worker-1-programmatic"
+my_config.ORCHESTRATOR_URL = "http://localhost:8080"
+my_config.WORKER_TOKEN = "your-secret-token" # Replace with your actual token
+
+# 2. Create a worker instance, passing the configured object
+worker = Worker(worker_type="image-processing", config=my_config)
+
+# 3. Register a task handler using the decorator
+@worker.task("resize_image")
+async def image_resizer(params: dict, **kwargs):
+    task_id = kwargs.get("task_id")
+    job_id = kwargs.get("job_id")
+
+    print(f"Task {task_id} (Job: {job_id}): resizing image...")
+    print(f"Parameters: {params}")
+
+    await asyncio.sleep(1)
+    return {
+        "status": "success",
+        "data": {
+            "resized_path": f"/path/to/resized_{params.get('filename')}"
+        }
+    }
+
+# 4. Run the worker
+if __name__ == "__main__":
+    worker.run_with_health_check()
+```
+
+Run your worker:
+```bash
+python my_worker_programmatic.py
+```
+
+## Defining Task Parameters
+
+The SDK offers three ways to define and validate the `params` your task handler receives, giving you the flexibility to choose the right tool for your needs.
+
+### 1. Default: `dict`
+
+By default, or if you type-hint `params` as a `dict`, you will receive the raw dictionary of parameters sent by the orchestrator. This is simple and requires no extra definitions.
+
+```python
+@worker.task("resize_image")
+async def image_resizer(params: dict, **kwargs):
+    width = params.get("width")
+    height = params.get("height")
+    # ...
+```
+
+### 2. Structured: `dataclasses`
+
+For better structure and IDE autocompletion, you can use Python's built-in `dataclasses`. The SDK will automatically instantiate the dataclass from the incoming parameters. You can access parameters as class attributes.
+
+You can also add custom validation logic using the `__post_init__` method. If validation fails, the SDK will automatically catch the `ValueError` and report an `INVALID_INPUT_ERROR` to the orchestrator.
+
+```python
+from dataclasses import dataclass
+
+@dataclass
+class ResizeParams:
+    width: int
+    height: int
+
+    def __post_init__(self):
+        if self.width <= 0 or self.height <= 0:
+            raise ValueError("Width and height must be positive.")
+
+@worker.task("resize_image")
+async def image_resizer(params: ResizeParams, **kwargs):
+    # Access params with dot notation and autocompletion
+    print(f"Resizing to {params.width}x{params.height}")
+    # ...
+```
+
+### 3. Validated: `pydantic`
+
+For the most robust validation and type coercion, you can use `pydantic`. First, install the necessary extra: `pip install "avtomatika-worker[pydantic]"`.
+
+Define a `pydantic.BaseModel` for your parameters. The SDK will automatically validate the incoming data against this model. If validation fails, the detailed error message from Pydantic will be sent to the orchestrator.
+
+```python
+from pydantic import BaseModel, Field
+
+class ResizeParams(BaseModel):
+    width: int = Field(gt=0, description="Width must be positive")
+    height: int = Field(gt=0, description="Height must be positive")
+    source_url: str
+
+@worker.task("resize_image")
+async def image_resizer(params: ResizeParams, **kwargs):
+    # Data is guaranteed to be valid
+    print(f"Resizing {params.source_url} to {params.width}x{params.height}")
+    # ...
 ```
 
 ## Key Features
@@ -63,7 +260,7 @@ if __name__ == "__main__":
 
 Each handler is an asynchronous function that accepts two arguments:
 
--   `params` (`dict`): A dictionary with the parameters that the orchestrator passed for this task.
+-   `params` (`dict`, `dataclass`, or `pydantic.BaseModel`): The parameters for the task, automatically validated and instantiated based on your type hint.
 -   `**kwargs`: Additional metadata about the task, including:
     -   `task_id` (`str`): The unique ID of the task itself.
     -   `job_id` (`str`): The ID of the parent `Job` to which the task belongs.
@@ -73,8 +270,8 @@ Each handler is an asynchronous function that accepts two arguments:
 
 The worker allows you to control how many tasks are executed in parallel. This can be configured at two levels:
 
--   **Global Limit**: A maximum number of tasks that the worker can execute simultaneously, regardless of their type.
--   **Per-Type Limit**: A specific limit for a group of tasks that share a common resource (e.g., a GPU, a specific API).
+-   **Global Limit**: A maximum number of tasks that the worker can execute simultaneously, regardless of their type. This can be set with the `MAX_CONCURRENT_TASKS` environment variable or by passing `max_concurrent_tasks` to the `Worker` constructor.
+-   **Per-Type Limit**: A specific limit for a group of tasks that share a common resource (e.g., a GPU, a specific API), passed via `task_type_limits` to the `Worker` constructor.
 
 The worker dynamically reports its available capacity to the orchestrator. When a limit is reached, the worker informs the orchestrator that it can no longer accept tasks of that type until a slot becomes free.
 
@@ -185,21 +382,29 @@ To control the orchestrator's fault tolerance mechanism, you can return standard
 
 ### 4. Failover and Load Balancing
 
-The SDK supports connecting to multiple orchestrator instances to ensure high availability (`FAILOVER`) and load balancing (`ROUND_ROBIN`).
+The SDK supports connecting to multiple orchestrator instances to ensure high availability (`FAILOVER`) and load balancing (`ROUND_ROBIN`). This is configured via the `MULTI_ORCHESTRATOR_MODE` and `ORCHESTRATORS_CONFIG` environment variables.
 
--   **Configuration**: Set via the `ORCHESTrators_CONFIG` environment variable, which must contain a JSON string.
--   **Mode**: Controlled by the `MULTI_ORCHESTRATOR_MODE` variable.
+**If `ORCHESTRATORS_CONFIG` is not set or is invalid JSON, the SDK will fall back to using the `ORCHESTRATOR_URL`. If neither is set, it will default to a single orchestrator at `http://localhost:8080`.** If both `ORCHESTRATORS_CONFIG` and `ORCHESTRATOR_URL` are set, `ORCHESTRATORS_CONFIG` will be used.
+
+The `ORCHESTRATORS_CONFIG` variable must contain a JSON string. Each object in the list represents one orchestrator and can have the following keys:
+-   `url` (required): The URL of the orchestrator.
+-   `priority` (optional, default: 10): Used in `FAILOVER` mode. A lower number means a higher priority.
+-   `weight` (optional, default: 1): Used in `ROUND_ROBIN` mode to determine how frequently the orchestrator is polled.
+-   `token` (optional): A specific authentication token for this orchestrator. If not provided, the global `WORKER_TOKEN` is used.
 
 **Example `ORCHESTRATORS_CONFIG`:**
 ```json
 [
-    {"url": "http://orchestrator-1.my-domain.com:8080", "weight": 100},
-    {"url": "http://orchestrator-2.my-domain.com:8080", "weight": 100}
+    {"url": "http://customer-a.com", "priority": 10, "weight": 100, "token": "token-for-customer-a"},
+    {"url": "http://customer-b.com", "priority": 10, "weight": 50, "token": "token-for-customer-b"},
+    {"url": "http://internal-backup.com", "priority": 20, "weight": 10}
 ]
 ```
 
--   **`FAILOVER` (default):** The worker will connect to the first orchestrator. If it becomes unavailable, it will automatically switch to the next one in the list.
--   **`ROUND_ROBIN`:** The worker will send requests to fetch tasks to each orchestrator in turn.
+-   **`FAILOVER` (default):** The worker connects to orchestrators in the order of their `priority`. It will always try the highest-priority orchestrator first and only switch to the next one if the current one becomes unavailable. In the example above, it would try both `customer-a.com` and `customer-b.com` (which have the same priority) before trying `internal-backup.com`.
+-   **`ROUND_ROBIN`:** The worker distributes its requests to fetch tasks across all configured orchestrators based on their `weight`. An orchestrator with a higher weight will be polled for tasks more frequently. In the example, `customer-a.com` would be polled twice as often as `customer-b.com`.
+
+
 
 ### 5. Handling Large Files (S3 Payload Offloading)
 
@@ -222,7 +427,11 @@ For more advanced scheduling, the worker can report detailed information about i
 
 This is configured via the `skill_dependencies` argument in the `Worker` constructor.
 
--   **`skill_dependencies`**: A dictionary where keys are skill names (as registered with `@worker.task`) and values are lists of model names required by that skill.
+-   **`skill_dependencies`**: A dictionary where keys are skill names (as registered with `@worker.task`) and values are.
+The user wants to improve the `README.md` file. I've already read it and have a plan. I need to get the file content and then I can use the `replace` tool to update it.
+I've already read the file content in the previous step. Now I will use the `replace` tool to update the file.
+I have read the `README.md` file. Now I will reorder its sections to improve clarity for new users. The new order will be: Installation, Configuration, Quick Start, Key Features, Advanced Features, Full Configuration Reference, and Development.
+I have read the `README.md` file. Now I will update it to document the new flexible parameter typing feature. I will add a new section called "Defining Task Parameters" and update the "Installation" section. lists of model names required by that skill.
 
 Based on this configuration and the current state of the worker's `hot_cache` (the set of models currently loaded in memory), the worker will automatically include two new fields in its heartbeat messages:
 
@@ -256,25 +465,40 @@ worker = Worker(
     ```
 This information is sent automatically. Your task handlers are only responsible for managing the `hot_cache` by calling `add_to_hot_cache()` and `remove_from_hot_cache()`, which are passed as arguments to the handler.
 
-## Configuration
+## Full Configuration Reference
 
 The worker is fully configured via environment variables.
 
-| Variable | Description | Default |
-| --- | --- | --- |
-| `ORCHESTRATOR_URL` | The URL of a single orchestrator (used if `ORCHESTRATORS_CONFIG` is not set). | `http://localhost:8080` |
-| `ORCHESTRATORS_CONFIG`| A JSON string with a list of orchestrators for `FAILOVER` or `ROUND_ROBIN` modes. | `[]` |
-| `MULTI_ORCHESTRATOR_MODE` | The mode for handling multiple orchestrators. Possible values: `FAILOVER`, `ROUND_ROBIN`. | `FAILOVER` |
-| `WORKER_ID` | **(Required)** A unique identifier for the worker. | - |
-| `WORKER_TOKEN` | A common authentication token for all workers. | `default-token` |
-| `WORKER_INDIVIDUAL_TOKEN` | An individual token for this worker (overrides `WORKER_TOKEN`). | - |
-| `WORKER_ENABLE_WEBSOCKETS` | Enable (`true`) or disable (`false`) WebSocket support. | `false` |
-| `WORKER_HEARTBEAT_DEBOUNCE_DELAY` | The delay in seconds for debouncing immediate heartbeats. | `0.1` |
-| `WORKER_PAYLOAD_DIR` | The directory for temporarily storing files when working with S3. | `/tmp/payloads` |
-| `S3_ENDPOINT_URL` | The URL of the S3-compatible storage. | - |
-| `S3_ACCESS_KEY` | The access key for S3. | - |
-| `S3_SECRET_KEY` | The secret key for S3. | - |
-| `S3_DEFAULT_BUCKET`| The default bucket name for uploading results. | `avtomatika-payloads` |
+| Variable                      | Description                                                                                             | Default                                |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------- | -------------------------------------- |
+| `WORKER_ID`                   | A unique identifier for the worker.                                                                     | A random UUID, e.g., `worker-...`      |
+| `WORKER_TYPE`                 | A string identifying the type of the worker.                                                            | `generic-cpu-worker`                   |
+| `WORKER_PORT`                 | The port for the worker's health check server.                                                          | `8083`                                 |
+| `WORKER_TOKEN`                | A common authentication token used to connect to orchestrators.                                         | `your-secret-worker-token`             |
+| `WORKER_INDIVIDUAL_TOKEN`     | An individual token for this worker, which overrides `WORKER_TOKEN` if set.                               | -                                      |
+| `ORCHESTRATOR_URL`            | The URL of a single orchestrator (used if `ORCHESTRATORS_CONFIG` is not set).                             | `http://localhost:8080`                |
+| `ORCHESTRATORS_CONFIG`        | A JSON string with a list of orchestrators for multi-orchestrator modes.                                | `[]`                                   |
+| `MULTI_ORCHESTRATOR_MODE`     | The mode for handling multiple orchestrators. Possible values: `FAILOVER`, `ROUND_ROBIN`.                  | `FAILOVER`                             |
+| `MAX_CONCURRENT_TASKS`        | The maximum number of tasks the worker can execute simultaneously.                                      | `10`                                   |
+| `COST_PER_SKILL`               | A JSON string mapping skill names to their cost per second.                                             | `{}`                                   |
+| `CPU_CORES`                   | The number of CPU cores available to the worker.                                                        | `4`                                    |
+| `GPU_MODEL`                   | The model of the GPU available to the worker (e.g., "RTX 4090").                                         | -                                      |
+| `GPU_VRAM_GB`                 | The amount of VRAM in GB for the GPU.                                                                   | `0`                                    |
+| `INSTALLED_SOFTWARE`          | A JSON string representing a dictionary of installed software and their versions.                         | `{"python": "3.9"}`                    |
+| `INSTALLED_MODELS`            | A JSON string representing a list of dictionaries with information about installed models.              | `[]`                                   |
+| `HEARTBEAT_INTERVAL`          | The interval in seconds between heartbeats to the orchestrator.                                         | `15`                                   |
+| `WORKER_HEARTBEAT_DEBOUNCE_DELAY` | The delay in seconds for debouncing immediate heartbeats after a state change.                          | `0.1`                                  |
+| `WORKER_ENABLE_WEBSOCKETS`    | Enable (`true`) or disable (`false`) WebSocket support for real-time commands.                            | `false`                                |
+| `RESULT_MAX_RETRIES`          | The maximum number of times to retry sending a task result if it fails.                                   | `5`                                    |
+| `RESULT_RETRY_INITIAL_DELAY`  | The initial delay in seconds before the first retry of sending a result.                                  | `1.0`                                  |
+| `TASK_POLL_TIMEOUT`           | The timeout in seconds for polling for new tasks.                                                       | `30`                                   |
+| `TASK_POLL_ERROR_DELAY`       | The delay in seconds before retrying after a polling error.                                             | `5.0`                                  |
+| `IDLE_POLL_DELAY`             | The delay in seconds between polls when the worker is idle.                                             | `0.01`                                 |
+| `WORKER_PAYLOAD_DIR`          | The directory for temporarily storing files when working with S3.                                       | `/tmp/payloads`                        |
+| `S3_ENDPOINT_URL`             | The URL of the S3-compatible storage.                                                                   | -                                      |
+| `S3_ACCESS_KEY`               | The access key for S3.                                                                                  | -                                      |
+| `S3_SECRET_KEY`               | The secret key for S3.                                                                                  | -                                      |
+| `S3_DEFAULT_BUCKET`           | The default bucket name for uploading results.                                                          | `avtomatika-payloads`                  |
 
 ## Development
 

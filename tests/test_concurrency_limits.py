@@ -1,3 +1,4 @@
+from avtomatika_worker.config import WorkerConfig
 from avtomatika_worker.worker import Worker
 
 
@@ -16,7 +17,11 @@ def test_task_registration_with_type():
 
 def test_get_current_state_initial():
     """Tests the initial state of the worker."""
-    worker = Worker(max_concurrent_tasks=5, task_type_limits={"video": 1, "audio": 2})
+    mock_config = WorkerConfig()
+    mock_config.MAX_CONCURRENT_TASKS = 5  # Set initial limit
+    mock_config.ORCHESTRATORS = [{"url": "http://test", "weight": 1}]  # Needs to be defined
+
+    worker = Worker(config=mock_config, task_type_limits={"video": 1, "audio": 2})
 
     @worker.task("process_video", task_type="video")
     async def video_handler(params: dict): ...
@@ -38,7 +43,11 @@ def test_get_current_state_initial():
 
 def test_get_current_state_global_limit_reached():
     """Tests that the worker becomes busy when the global concurrency limit is reached."""
-    worker = Worker(max_concurrent_tasks=1)
+    # Create a mock config to ensure MAX_CONCURRENT_TASKS is controlled
+    mock_config = WorkerConfig()
+    mock_config.MAX_CONCURRENT_TASKS = 1
+
+    worker = Worker(config=mock_config)  # Pass the mock config
     worker._current_load = 1
 
     @worker.task("some_task")

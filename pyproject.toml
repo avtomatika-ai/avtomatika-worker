@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "avtomatika-worker"
-version = "1.0.a2"
+version = "1.0.b1"
 description = "Worker SDK for the Avtomatika orchestrator."
 readme = "README.md"
 requires-python = ">=3.11"
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
@@ -17,6 +17,7 @@ classifiers = [
 dependencies = [
     "aiohttp~=3.13.2",
     "python-json-logger~=4.0.0",
+    "aioboto3~=13.0.0",
 ]
 
 [project.optional-dependencies]
@@ -25,7 +26,11 @@ test = [
     "pytest-asyncio",
     "aioresponses",
     "pytest-mock",
+    "pydantic",
+    "moto[server]",
+    "aiofiles",
 ]
+pydantic = ["pydantic"]
 
 [project.urls]
 "Homepage" = "https://github.com/avtomatila-ai/avtomatika-worker"
@@ -39,6 +44,11 @@ markers = [
     "e2e: marks tests as end-to-end tests",
 ]
 pythonpath = "src"
+filterwarnings = [
+    "ignore:'asyncio.iscoroutinefunction' is deprecated:DeprecationWarning",
+    "ignore:coroutine 'AsyncMockMixin._execute_mock_call' was never awaited:RuntimeWarning",
+    "ignore:datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version.:DeprecationWarning",
+]
 
 [tool.ruff]
 src = ["src", "tests"]

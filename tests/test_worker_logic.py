@@ -34,7 +34,7 @@ async def test_debounced_heartbeat_sender(mocker):
     and then sends a heartbeat.
     """
     worker = Worker()
-    worker._config.heartbeat_debounce_delay = 0.01
+    worker._config.HEARTBEAT_DEBOUNCE_DELAY = 0.01
     mock_send_heartbeats = mocker.patch.object(worker, "_send_heartbeats_to_all", new_callable=mocker.AsyncMock)
     mock_sleep = mocker.patch("avtomatika_worker.worker.sleep", new_callable=mocker.AsyncMock)
 
@@ -89,7 +89,7 @@ async def test_poll_for_tasks_receives_task(mocker):
     mocker.patch.object(worker, "_schedule_heartbeat_debounce")
     worker._process_task = mocker.AsyncMock()
 
-    await worker._poll_for_tasks("http://test-orchestrator")
+    await worker._poll_for_tasks({"url": "http://test-orchestrator"})
 
     session.get.assert_called_once()
     worker._process_task.assert_called_once()
@@ -113,7 +113,7 @@ async def test_poll_for_tasks_no_task(mocker):
     worker._process_task = mocker.AsyncMock()
     mock_sleep = mocker.patch("avtomatika_worker.worker.sleep", new_callable=mocker.AsyncMock)
 
-    await worker._poll_for_tasks("http://test-orchestrator")
+    await worker._poll_for_tasks({"url": "http://test-orchestrator"})
 
     session.get.assert_called_once()
     worker._process_task.assert_not_called()
@@ -132,17 +132,22 @@ async def test_start_polling_busy(mocker):
     with pytest.raises(asyncio.CancelledError):
         await worker._start_polling()
 
-    mock_sleep.assert_called_once_with(worker._config.idle_poll_delay)
+    mock_sleep.assert_called_once_with(worker._config.IDLE_POLL_DELAY)
 
 
 @pytest.mark.asyncio
 async def test_start_polling_round_robin(mocker):
     """Tests that _start_polling uses round-robin to select orchestrators."""
     worker = Worker()
-    worker._config.multi_orchestrator_mode = "ROUND_ROBIN"
-    worker._config.orchestrators = [{"url": "http://test-1"}, {"url": "http://test-2"}]
+    worker._config.MULTI_ORCHESTRATOR_MODE = "ROUND_ROBIN"
+    worker._config.ORCHESTRATORS = [
+        {"url": "http://test-1", "weight": 1, "current_weight": 0},
+        {"url": "http://test-2", "weight": 1, "current_weight": 0},
+    ]
+    worker._total_orchestrator_weight = 2
     worker._get_current_state = mocker.MagicMock(return_value={"status": "idle"})
 
+    # We only want to test one iteration of the polling loop
     async def poll_side_effect(*args, **kwargs):
         worker._shutdown_event.set()
 
@@ -151,8 +156,8 @@ async def test_start_polling_round_robin(mocker):
 
     await worker._start_polling()
 
-    assert worker._round_robin_index == 1
-    worker._poll_for_tasks.assert_called_once_with("http://test-1")
+    # With equal weights, the first one should be chosen
+    worker._poll_for_tasks.assert_called_once_with(worker._config.ORCHESTRATORS[0])
 
 
 @pytest.mark.asyncio
@@ -170,7 +175,7 @@ async def test_process_task_exception(mocker):
         "task_id": "task-1",
         "type": "failing_task",
         "params": {},
-        "orchestrator_url": "http://test-orchestrator",
+        "orchestrator": {"url": "http://test-orchestrator"},
     }
 
     await worker._process_task(task_data)
@@ -193,7 +198,7 @@ async def test_process_unsupported_task(mocker):
         "task_id": "task-1",
         "type": "unsupported_task",
         "params": {},
-        "orchestrator_url": "http://test-orchestrator",
+        "orchestrator": {"url": "http://test-orchestrator"},
     }
 
     await worker._process_task(task_data)
@@ -201,7 +206,7 @@ async def test_process_unsupported_task(mocker):
     worker._send_result.assert_called_once()
     payload = worker._send_result.call_args.args[0]
     assert payload["result"]["status"] == "failure"
-    assert payload["result"]["error_message"] == "Unsupported task: unsupported_task"
+    assert payload["result"]["error"]["message"] == "Unsupported task: unsupported_task"
 
 
 @pytest.mark.asyncio
@@ -212,21 +217,18 @@ async def test_process_task_cancelled(mocker):
 
     @worker.task("cancellable_task")
     async def cancellable_task(params: dict, **kwargs):
-        await asyncio.sleep(1)
+        raise asyncio.CancelledError
 
     task_data = {
         "job_id": "job-1",
         "task_id": "task-1",
         "type": "cancellable_task",
         "params": {},
-        "orchestrator_url": "http://test-orchestrator",
+        "orchestrator": {"url": "http://test-orchestrator"},
     }
 
-    # Mock the handler to raise CancelledError
-    handler_mock = mocker.AsyncMock(side_effect=asyncio.CancelledError)
-    worker._task_handlers["cancellable_task"]["func"] = handler_mock
-
-    await worker._process_task(task_data)
+    with pytest.raises(asyncio.CancelledError):
+        await worker._process_task(task_data)
 
     worker._send_result.assert_called_once()
     payload = worker._send_result.call_args.args[0]
@@ -304,6 +306,6 @@ async def test_run_health_check_server(mocker):
     mock_runner_instance.cleanup.assert_called_once()
 
     mock_site_class.assert_called_once_with(
-        mock_runner_instance, "0.0.0.0", worker._config.worker_port
+        mock_runner_instance, "0.0.0.0", worker._config.WORKER_PORT
     )  # TCPSite(runner, ...)
     mock_site_instance.start.assert_called_once()
