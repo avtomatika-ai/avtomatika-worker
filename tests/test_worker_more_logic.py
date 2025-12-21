@@ -25,10 +25,12 @@ def test_pydantic_not_installed():
     reload(worker)
 
 
-def test_task_decorator_warns_on_undefined_type(caplog):
+@pytest.mark.filterwarnings("ignore:coroutine 'AsyncMockMixin._execute_mock_call' was never awaited:RuntimeWarning")
+def test_task_decorator_warns_on_undefined_type(caplog, mocker):
     """
     Tests that the task decorator logs a warning if a task_type is not in task_type_limits.
     """
+    mocker.patch("avtomatika_worker.worker.S3Manager")
     worker = Worker(task_type_limits={"gpu": 1})
     with caplog.at_level("WARNING"):
 
@@ -167,25 +169,27 @@ async def test_process_task_handles_param_validation_error(mocker):
     assert result["error"]["code"] == INVALID_INPUT_ERROR
     assert "Invalid params" in result["error"]["message"]
 
-    def test_run_keyboard_interrupt(mocker):
-        """Tests that run() handles KeyboardInterrupt gracefully."""
-        worker = Worker()
-        mocker.patch.object(worker, "main", side_effect=KeyboardInterrupt)
-        mock_shutdown_set = mocker.patch.object(worker._shutdown_event, "set")
 
-        worker.run()
+def test_run_keyboard_interrupt(mocker):
+    """Tests that run() handles KeyboardInterrupt gracefully."""
+    worker = Worker()
+    mocker.patch.object(worker, "main", side_effect=KeyboardInterrupt)
+    mock_shutdown_set = mocker.patch.object(worker._shutdown_event, "set")
 
-        mock_shutdown_set.assert_called_once()
+    worker.run()
 
-    def test_run_with_health_check_keyboard_interrupt(mocker):
-        """Tests that run_with_health_check() handles KeyboardInterrupt."""
-        worker = Worker()
-        mocker.patch.object(worker, "main", side_effect=KeyboardInterrupt)
-        mock_shutdown_set = mocker.patch.object(worker._shutdown_event, "set")
+    mock_shutdown_set.assert_called_once()
 
-        worker.run_with_health_check()
 
-        mock_shutdown_set.assert_called_once()
+def test_run_with_health_check_keyboard_interrupt(mocker):
+    """Tests that run_with_health_check() handles KeyboardInterrupt."""
+    worker = Worker()
+    mocker.patch.object(worker, "main", side_effect=KeyboardInterrupt)
+    mock_shutdown_set = mocker.patch.object(worker._shutdown_event, "set")
+
+    worker.run_with_health_check()
+
+    mock_shutdown_set.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_listen_for_commands_handles_invalid_json(mocker, caplog):

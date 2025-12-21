@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "avtomatika-worker"
-version = "1.0.b1"
+version = "1.0.b2"
 description = "Worker SDK for the Avtomatika orchestrator."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -17,7 +17,8 @@ classifiers = [
 dependencies = [
     "aiohttp~=3.13.2",
     "python-json-logger~=4.0.0",
-    "aioboto3~=13.0.0",
+    "aioboto3~=15.5.0",
+    "aiofiles~=25.1.0",
 ]
 
 [project.optional-dependencies]
@@ -27,14 +28,12 @@ test = [
     "aioresponses",
     "pytest-mock",
     "pydantic",
-    "moto[server]",
-    "aiofiles",
 ]
 pydantic = ["pydantic"]
 
 [project.urls]
-"Homepage" = "https://github.com/avtomatila-ai/avtomatika-worker"
-"Bug Tracker" = "https://github.com/avtomatila-ai/avtomatika-worker/issues"
+"Homepage" = "https://github.com/avtomatika-ai/avtomatika-worker"
+"Bug Tracker" = "https://github.com/avtomatika-ai/avtomatika-worker/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -47,7 +46,7 @@ pythonpath = "src"
 filterwarnings = [
     "ignore:'asyncio.iscoroutinefunction' is deprecated:DeprecationWarning",
     "ignore:coroutine 'AsyncMockMixin._execute_mock_call' was never awaited:RuntimeWarning",
-    "ignore:datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version.:DeprecationWarning",
+    "ignore::pytest.PytestUnraisableExceptionWarning"
 ]
 
 [tool.ruff]

@@ -4,12 +4,14 @@ from dataclasses import is_dataclass
 from inspect import Parameter, signature
 from json import JSONDecodeError
 from logging import getLogger
+from os.path import join
 from typing import Any, Callable
 
 from aiohttp import ClientError, ClientSession, ClientTimeout, ClientWebSocketResponse, WSMsgType, web
 
 from .config import WorkerConfig
 from .s3 import S3Manager
+from .task_files import TaskFiles
 from .types import INVALID_INPUT_ERROR, PERMANENT_ERROR, TRANSIENT_ERROR, ParamValidationError
 
 try:
@@ -192,11 +194,10 @@ class Worker:
                     task_data["orchestrator"] = orchestrator
 
                     self._current_load += 1
-                    task_handler_info = self._task_handlers.get(task_data["type"])
-                    if task_handler_info:
-                        task_type_for_limit = task_handler_info.get("type")
-                        if task_type_for_limit:
-                            self._current_load_by_type[task_type_for_limit] += 1
+                    if (task_handler_info := self._task_handlers.get(task_data["type"])) and (
+                        task_type_for_limit := task_handler_info.get("type")
+                    ):
+                        self._current_load_by_type[task_type_for_limit] += 1
                     self._schedule_heartbeat_debounce()
 
                     task = create_task(self._process_task(task_data))
@@ -217,8 +218,7 @@ class Worker:
                 continue
 
             if self._config.MULTI_ORCHESTRATOR_MODE == "ROUND_ROBIN":
-                orchestrator = self._get_next_orchestrator()
-                if orchestrator:
+                if orchestrator := self._get_next_orchestrator():
                     await self._poll_for_tasks(orchestrator)
             else:
                 for orchestrator in self._config.ORCHESTRATORS:
@@ -229,7 +229,8 @@ class Worker:
             if self._current_load == 0:
                 await sleep(self._config.IDLE_POLL_DELAY)
 
-    def _prepare_task_params(self, handler: Callable, params: dict[str, Any]) -> Any:
+    @staticmethod
+    def _prepare_task_params(handler: Callable, params: dict[str, Any]) -> Any:
         """
         Inspects the handler's signature to validate and instantiate params.
         Supports dict, dataclasses, and optional pydantic models.
@@ -261,8 +262,7 @@ class Worker:
                     if f.default is Parameter.empty and f.default_factory is Parameter.empty
                 ]
 
-                missing_fields = [f for f in required_fields if f not in filtered_params]
-                if missing_fields:
+                if missing_fields := [f for f in required_fields if f not in filtered_params]:
                     raise ParamValidationError(f"Missing required fields for dataclass: {', '.join(missing_fields)}")
 
                 return params_annotation(**filtered_params)
@@ -271,6 +271,20 @@ class Worker:
                 raise ParamValidationError(str(e)) from e
 
         return params
+
+    def _prepare_dependencies(self, handler: Callable, task_id: str) -> dict[str, Any]:
+        """Injects dependencies based on type hints."""
+        deps = {}
+        task_dir = join(self._config.TASK_FILES_DIR, task_id)
+        # Always create the object, but directory is lazy
+        task_files = TaskFiles(task_dir)
+
+        sig = signature(handler)
+        for name, param in sig.parameters.items():
+            if param.annotation is TaskFiles:
+                deps[name] = task_files
+
+        return deps
 
     async def _process_task(self, task_data: dict[str, Any]):
         """Executes the task logic."""
@@ -293,8 +307,9 @@ class Worker:
                 result_sent = True  # Mark result as sent
                 return
 
-            params = await self._s3_manager.process_params(params)
+            params = await self._s3_manager.process_params(params, task_id)
             validated_params = self._prepare_task_params(handler_data["func"], params)
+            deps = self._prepare_dependencies(handler_data["func"], task_id)
 
             result = await handler_data["func"](
                 validated_params,
@@ -304,6 +319,7 @@ class Worker:
                 send_progress=self.send_progress,
                 add_to_hot_cache=self.add_to_hot_cache,
                 remove_from_hot_cache=self.remove_from_hot_cache,
+                **deps,
             )
             result = await self._s3_manager.process_result(result)
         except ParamValidationError as e:
@@ -318,6 +334,9 @@ class Worker:
             logger.exception(f"An unexpected error occurred while processing task {task_id}:")
             result = {"status": "failure", "error": {"code": TRANSIENT_ERROR, "message": str(e)}}
         finally:
+            # Cleanup task workspace
+            await self._s3_manager.cleanup(task_id)
+
             if not result_sent:  # Only send if not already sent
                 payload = {"job_id": job_id, "task_id": task_id, "worker_id": self._config.WORKER_ID, "result": result}
                 await self._send_result(payload, orchestrator)
@@ -442,7 +461,11 @@ class Worker:
 
     async def _run_health_check_server(self):
         app = web.Application()
-        app.router.add_get("/health", lambda r: web.Response(text="OK"))
+
+        async def health_handler(_):
+            return web.Response(text="OK")
+
+        app.router.add_get("/health", health_handler)
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.TCPSite(runner, "0.0.0.0", self._config.WORKER_PORT)

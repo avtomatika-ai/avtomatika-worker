@@ -49,7 +49,7 @@ class WorkerConfig:
         )
 
         # --- S3 Settings for payload offloading ---
-        self.WORKER_PAYLOAD_DIR: str = getenv("WORKER_PAYLOAD_DIR", "/tmp/payloads")
+        self.TASK_FILES_DIR: str = getenv("TASK_FILES_DIR", "/tmp/payloads")
         self.S3_ENDPOINT_URL: str | None = getenv("S3_ENDPOINT_URL")
         self.S3_ACCESS_KEY: str | None = getenv("S3_ACCESS_KEY")
         self.S3_SECRET_KEY: str | None = getenv("S3_SECRET_KEY")
@@ -75,8 +75,7 @@ class WorkerConfig:
         Loads orchestrator configuration from the ORCHESTRATORS_CONFIG environment variable.
         For backward compatibility, if it is not set, it uses ORCHESTRATOR_URL.
         """
-        orchestrators_json = getenv("ORCHESTRATORS_CONFIG")
-        if orchestrators_json:
+        if orchestrators_json := getenv("ORCHESTRATORS_CONFIG"):
             try:
                 orchestrators = loads(orchestrators_json)
                 if getenv("ORCHESTRATOR_URL"):
@@ -94,23 +93,23 @@ class WorkerConfig:
         orchestrator_url = getenv("ORCHESTRATOR_URL", "http://localhost:8080")
         return [{"url": orchestrator_url, "priority": 1, "weight": 1}]
 
-    def _get_gpu_info(self) -> dict[str, Any] | None:
+    @staticmethod
+    def _get_gpu_info() -> dict[str, Any] | None:
         """Collects GPU information from environment variables.
         Returns None if GPU is not configured.
         """
-        gpu_model = getenv("GPU_MODEL")
-        if not gpu_model:
+        if gpu_model := getenv("GPU_MODEL"):
+            return {
+                "model": gpu_model,
+                "vram_gb": int(getenv("GPU_VRAM_GB", "0")),
+            }
+        else:
             return None
 
-        return {
-            "model": gpu_model,
-            "vram_gb": int(getenv("GPU_VRAM_GB", "0")),
-        }
-
-    def _load_json_from_env(self, key: str, default: Any) -> Any:
+    @staticmethod
+    def _load_json_from_env(key: str, default: Any) -> Any:
         """Safely loads a JSON string from an environment variable."""
-        value = getenv(key)
-        if value:
+        if value := getenv(key):
             try:
                 return loads(value)
             except JSONDecodeError:

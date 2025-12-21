@@ -19,6 +19,7 @@ def test_worker_config_defaults():
         assert config.RESOURCES["gpu_info"] is None
         assert config.INSTALLED_SOFTWARE == {"python": "3.9"}
         assert config.INSTALLED_MODELS == []
+        assert config.TASK_FILES_DIR == "/tmp/payloads"
         assert config.HEARTBEAT_INTERVAL == 15
         assert config.RESULT_MAX_RETRIES == 5
         assert config.RESULT_RETRY_INITIAL_DELAY == 1.0
@@ -56,6 +57,7 @@ def test_worker_config_custom_values():
             "IDLE_POLL_DELAY": "0.02",
             "WORKER_ENABLE_WEBSOCKETS": "true",
             "MULTI_ORCHESTRATOR_MODE": "ROUND_ROBIN",
+            "TASK_FILES_DIR": "/custom/path",
         },
         clear=True,
     ):
@@ -71,6 +73,7 @@ def test_worker_config_custom_values():
         assert config.RESOURCES["gpu_info"] == {"model": "RTX 4090", "vram_gb": 24}
         assert config.INSTALLED_SOFTWARE == {"python": "3.10"}
         assert config.INSTALLED_MODELS == [{"name": "test-model"}]
+        assert config.TASK_FILES_DIR == "/custom/path"
         assert config.HEARTBEAT_INTERVAL == 30
         assert config.RESULT_MAX_RETRIES == 10
         assert config.RESULT_RETRY_INITIAL_DELAY == 2.0

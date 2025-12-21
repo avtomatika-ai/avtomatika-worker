@@ -406,18 +406,92 @@ The `ORCHESTRATORS_CONFIG` variable must contain a JSON string. Each object in t
 
 
 
-### 5. Handling Large Files (S3 Payload Offloading)
+
+
+### 5. File System Helper (TaskFiles)
+
+To simplify working with temporary files and paths, the SDK provides a `TaskFiles` helper class. It automatically manages directory creation within the isolated task folder and provides an asynchronous interface for file operations. Just add an argument typed as `TaskFiles` to your handler:
+
+```python
+from avtomatika_worker import Worker, TaskFiles
+
+@worker.task("generate_report")
+async def generate_report(params: dict, files: TaskFiles, **kwargs):
+    # 1. Easy read/write
+    await files.write("data.json", '{"status": "ok"}')
+    content = await files.read("data.json")
+    
+    # 2. Get path (directory is created automatically)
+    output_path = await files.path_to("report.pdf")
+    
+    # 3. Check and list files
+    if await files.exists("input.jpg"):
+        file_list = await files.list()
+    
+    return {"data": {"report": output_path}}
+```
+
+**Available Methods (all asynchronous):**
+- `await path_to(name)` — returns the full path to a file (ensures the task directory exists).
+- `await read(name, mode='r')` — reads the entire file.
+- `await write(name, data, mode='w')` — writes data to a file.
+- `await list()` — lists filenames in the task directory.
+- `await exists(name)` — checks if a file exists.
+- `async with open(name, mode)` — async context manager for advanced usage.
+
+> **Note: Automatic Cleanup**
+>
+> The SDK automatically deletes the entire task directory (including everything created via `TaskFiles`) immediately after the task completes and the result is sent.
+
+### 6. Handling Large Files (S3 Payload Offloading)
 
 The SDK supports working with large files "out of the box" via S3-compatible storage.
 
--   **Automatic Download**: If a value in `params` is a URI of the form `s3://...`, the SDK will automatically download the file to the local disk and replace the URI in `params` with the local path.
--   **Automatic Upload**: If your handler returns a local file path in `data` (located within the `WORKER_PAYLOAD_DIR` directory), the SDK will automatically upload this file to S3 and replace the path with an `s3://` URI in the final result.
+-   **Automatic Download**: If a value in `params` is a URI of the form `s3://...`, the SDK will automatically download the file to the local disk and replace the URI in `params` with the local path. **If the URI ends with `/` (e.g., `s3://bucket/data/`), the SDK treats it as a folder prefix and recursively downloads all matching objects into a local directory.**
+-   **Automatic Upload**: If your handler returns a local file path in `data` (located within the `TASK_FILES_DIR` directory), the SDK will automatically upload this file to S3 and replace the path with an `s3://` URI in the final result. **If the path is a directory, the SDK recursively uploads all files within it.**
 
-This functionality is transparent to your code and only requires configuring environment variables for S3 access.
+This functionality is transparent to your code.
 
-### 6. WebSocket Support
+#### S3 Example
 
-If enabled, the SDK establishes a persistent WebSocket connection with the orchestrator to receive real-time commands, such as canceling an ongoing task.
+Suppose the orchestrator sends a task with `{"input_image": "s3://my-bucket/photo.jpg"}`:
+
+```python
+import os
+from avtomatika_worker import Worker, TaskFiles
+
+worker = Worker(worker_type="image-worker")
+
+@worker.task("process_image")
+async def handle_image(params: dict, files: TaskFiles, **kwargs):
+    # SDK has already downloaded the file.
+    # 'input_image' now contains a local path like '/tmp/payloads/task-id/photo.jpg'
+    local_input = params["input_image"]
+    local_output = await files.path_to("processed.png")
+
+    # Your logic here (using local files)
+    # ... image processing ...
+
+    # Return the local path of the result.
+    # The SDK will upload it back to S3 automatically.
+    return {
+        "status": "success",
+        "data": {
+            "output_image": local_output
+        }
+    }
+```
+
+This only requires configuring environment variables for S3 access (see Full Configuration Reference).
+
+> **Important: S3 Consistency**
+>
+> The SDK **does not validate** that the Worker and Orchestrator share the same storage backend. You must ensure that:
+> 1. The Worker can reach the `S3_ENDPOINT_URL` used by the Orchestrator.
+> 2. The Worker's credentials allow reading from the buckets referenced in the incoming `s3://` URIs.
+> 3. The Worker's credentials allow writing to the `S3_DEFAULT_BUCKET`.
+
+### 7. WebSocket Support
 
 ## Advanced Features
 
@@ -494,7 +568,7 @@ The worker is fully configured via environment variables.
 | `TASK_POLL_TIMEOUT`           | The timeout in seconds for polling for new tasks.                                                       | `30`                                   |
 | `TASK_POLL_ERROR_DELAY`       | The delay in seconds before retrying after a polling error.                                             | `5.0`                                  |
 | `IDLE_POLL_DELAY`             | The delay in seconds between polls when the worker is idle.                                             | `0.01`                                 |
-| `WORKER_PAYLOAD_DIR`          | The directory for temporarily storing files when working with S3.                                       | `/tmp/payloads`                        |
+| `TASK_FILES_DIR`          | The directory for temporarily storing files when working with S3.                                       | `/tmp/payloads`                        |
 | `S3_ENDPOINT_URL`             | The URL of the S3-compatible storage.                                                                   | -                                      |
 | `S3_ACCESS_KEY`               | The access key for S3.                                                                                  | -                                      |
 | `S3_SECRET_KEY`               | The secret key for S3.                                                                                  | -                                      |
