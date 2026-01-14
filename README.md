@@ -1,6 +1,6 @@
 # Avtomatika Worker SDK
 
-This is an SDK for creating workers compatible with the **Avtomatika** orchestrator. The SDK handles all the complexity of interacting with the orchestrator, allowing you to focus on writing your business logic.
+This is the official SDK for creating workers compatible with the **[Avtomatika Orchestrator](https://github.com/avtomatika-ai/avtomatika)**. It implements the **[RCA Protocol](https://github.com/avtomatika-ai/rca)**, handling all communication complexity (polling, heartbeats, S3 offloading) so you can focus on writing your business logic.
 
 ## Installation
 
@@ -445,7 +445,7 @@ async def generate_report(params: dict, files: TaskFiles, **kwargs):
 
 ### 6. Handling Large Files (S3 Payload Offloading)
 
-The SDK supports working with large files "out of the box" via S3-compatible storage.
+The SDK supports working with large files "out of the box" via S3-compatible storage, using the high-performance **`obstore`** library (Rust-based).
 
 -   **Automatic Download**: If a value in `params` is a URI of the form `s3://...`, the SDK will automatically download the file to the local disk and replace the URI in `params` with the local path. **If the URI ends with `/` (e.g., `s3://bucket/data/`), the SDK treats it as a folder prefix and recursively downloads all matching objects into a local directory.**
 -   **Automatic Upload**: If your handler returns a local file path in `data` (located within the `TASK_FILES_DIR` directory), the SDK will automatically upload this file to S3 and replace the path with an `s3://` URI in the final result. **If the path is a directory, the SDK recursively uploads all files within it.**
@@ -573,6 +573,7 @@ The worker is fully configured via environment variables.
 | `S3_ACCESS_KEY`               | The access key for S3.                                                                                  | -                                      |
 | `S3_SECRET_KEY`               | The secret key for S3.                                                                                  | -                                      |
 | `S3_DEFAULT_BUCKET`           | The default bucket name for uploading results.                                                          | `avtomatika-payloads`                  |
+| `S3_REGION`                   | The region for S3 storage (required by some providers).                                                 | `us-east-1`                            |
 
 ## Development
 

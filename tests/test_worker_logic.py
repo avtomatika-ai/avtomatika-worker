@@ -1,9 +1,9 @@
 import asyncio
 from unittest.mock import MagicMock
 
-import aiohttp
 import pytest
 
+from avtomatika_worker.client import OrchestratorClient
 from avtomatika_worker.worker import Worker
 
 
@@ -20,7 +20,7 @@ async def test_validate_config_warns_on_unused_task_type_limits(mocker):
     def cpu_task(params: dict):
         pass
 
-    worker._validate_config()
+    worker._validate_task_types()
 
     logger_mock.assert_called_once_with(
         "Configuration warning: A limit is defined for task type 'gpu', but no tasks are registered with this type."
@@ -71,53 +71,41 @@ async def test_schedule_heartbeat_debounce(mocker):
 @pytest.mark.asyncio
 async def test_poll_for_tasks_receives_task(mocker):
     """Tests that _poll_for_tasks correctly processes a received task."""
-    session = mocker.MagicMock(spec=aiohttp.ClientSession)
-    session.closed = False
+    client = mocker.AsyncMock(spec=OrchestratorClient)
     task_payload = {
         "job_id": "job-123",
         "task_id": "task-456",
         "type": "successful_task",
         "params": {"input": "test"},
     }
-    get_response = mocker.AsyncMock(spec=aiohttp.ClientResponse)
-    get_response.status = 200
-    get_response.json = mocker.AsyncMock(return_value=task_payload)
-    get_response.__aenter__.return_value = get_response
-    session.get = mocker.MagicMock(return_value=get_response)
+    client.poll_task.return_value = task_payload
 
-    worker = Worker(http_session=session)
+    worker = Worker()
     mocker.patch.object(worker, "_schedule_heartbeat_debounce")
     worker._process_task = mocker.AsyncMock()
 
-    await worker._poll_for_tasks({"url": "http://test-orchestrator"})
+    await worker._poll_for_tasks(client)
 
-    session.get.assert_called_once()
+    client.poll_task.assert_called_once_with(timeout=worker._config.TASK_POLL_TIMEOUT)
     worker._process_task.assert_called_once()
+    # verify client was injected
+    assert worker._process_task.call_args[0][0]["client"] == client
 
 
 @pytest.mark.asyncio
 async def test_poll_for_tasks_no_task(mocker):
-    """Tests that _poll_for_tasks handles a non-200 response correctly."""
-    session = mocker.MagicMock(spec=aiohttp.ClientSession)
-    session.closed = False
-    get_response = mocker.AsyncMock(spec=aiohttp.ClientResponse)
-    get_response.status = 204
-    get_response.__aenter__.return_value = get_response
-    session.get = mocker.MagicMock(return_value=get_response)
+    """Tests that _poll_for_tasks handles no task correctly."""
+    client = mocker.AsyncMock(spec=OrchestratorClient)
+    client.poll_task.return_value = None
 
-    worker = Worker(http_session=session)
-    # Mock _schedule_heartbeat_debounce to avoid RuntimeWarning in case it's called unexpectedly
-    # or if implicit setup causes issues.
+    worker = Worker()
     mocker.patch.object(worker, "_schedule_heartbeat_debounce")
-
     worker._process_task = mocker.AsyncMock()
-    mock_sleep = mocker.patch("avtomatika_worker.worker.sleep", new_callable=mocker.AsyncMock)
 
-    await worker._poll_for_tasks({"url": "http://test-orchestrator"})
+    await worker._poll_for_tasks(client)
 
-    session.get.assert_called_once()
+    client.poll_task.assert_called_once()
     worker._process_task.assert_not_called()
-    mock_sleep.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -140,9 +128,14 @@ async def test_start_polling_round_robin(mocker):
     """Tests that _start_polling uses round-robin to select orchestrators."""
     worker = Worker()
     worker._config.MULTI_ORCHESTRATOR_MODE = "ROUND_ROBIN"
-    worker._config.ORCHESTRATORS = [
-        {"url": "http://test-1", "weight": 1, "current_weight": 0},
-        {"url": "http://test-2", "weight": 1, "current_weight": 0},
+
+    # Setup mock clients
+    client1 = mocker.AsyncMock(spec=OrchestratorClient)
+    client2 = mocker.AsyncMock(spec=OrchestratorClient)
+
+    worker._clients = [
+        ({"url": "http://test-1", "weight": 1, "current_weight": 0}, client1),
+        ({"url": "http://test-2", "weight": 1, "current_weight": 0}, client2),
     ]
     worker._total_orchestrator_weight = 2
     worker._get_current_state = mocker.MagicMock(return_value={"status": "idle"})
@@ -157,14 +150,15 @@ async def test_start_polling_round_robin(mocker):
     await worker._start_polling()
 
     # With equal weights, the first one should be chosen
-    worker._poll_for_tasks.assert_called_once_with(worker._config.ORCHESTRATORS[0])
+    worker._poll_for_tasks.assert_called_once_with(client1)
 
 
 @pytest.mark.asyncio
 async def test_process_task_exception(mocker):
     """Tests that _process_task handles exceptions in the task handler."""
     worker = Worker()
-    worker._send_result = mocker.AsyncMock()
+
+    client = mocker.AsyncMock(spec=OrchestratorClient)
 
     @worker.task("failing_task")
     def failing_task(params: dict, **kwargs):
@@ -175,13 +169,14 @@ async def test_process_task_exception(mocker):
         "task_id": "task-1",
         "type": "failing_task",
         "params": {},
+        "client": client,
         "orchestrator": {"url": "http://test-orchestrator"},
     }
 
     await worker._process_task(task_data)
 
-    worker._send_result.assert_called_once()
-    payload = worker._send_result.call_args.args[0]
+    client.send_result.assert_called_once()
+    payload = client.send_result.call_args.args[0]
     assert payload["result"]["status"] == "failure"
     assert payload["result"]["error"]["code"] == "TRANSIENT_ERROR"
     assert payload["result"]["error"]["message"] == "Task failed"
@@ -191,20 +186,21 @@ async def test_process_task_exception(mocker):
 async def test_process_unsupported_task(mocker):
     """Tests that _process_task handles unsupported tasks correctly."""
     worker = Worker()
-    worker._send_result = mocker.AsyncMock()
+    client = mocker.AsyncMock(spec=OrchestratorClient)
 
     task_data = {
         "job_id": "job-1",
         "task_id": "task-1",
         "type": "unsupported_task",
         "params": {},
+        "client": client,
         "orchestrator": {"url": "http://test-orchestrator"},
     }
 
     await worker._process_task(task_data)
 
-    worker._send_result.assert_called_once()
-    payload = worker._send_result.call_args.args[0]
+    client.send_result.assert_called_once()
+    payload = client.send_result.call_args.args[0]
     assert payload["result"]["status"] == "failure"
     assert payload["result"]["error"]["message"] == "Unsupported task: unsupported_task"
 
@@ -213,7 +209,7 @@ async def test_process_unsupported_task(mocker):
 async def test_process_task_cancelled(mocker):
     """Tests that _process_task handles cancelled tasks correctly."""
     worker = Worker()
-    worker._send_result = mocker.AsyncMock()
+    client = mocker.AsyncMock(spec=OrchestratorClient)
 
     @worker.task("cancellable_task")
     async def cancellable_task(params: dict, **kwargs):
@@ -224,14 +220,15 @@ async def test_process_task_cancelled(mocker):
         "task_id": "task-1",
         "type": "cancellable_task",
         "params": {},
+        "client": client,
         "orchestrator": {"url": "http://test-orchestrator"},
     }
 
     with pytest.raises(asyncio.CancelledError):
         await worker._process_task(task_data)
 
-    worker._send_result.assert_called_once()
-    payload = worker._send_result.call_args.args[0]
+    client.send_result.assert_called_once()
+    payload = client.send_result.call_args.args[0]
     assert payload["result"]["status"] == "cancelled"
 
 

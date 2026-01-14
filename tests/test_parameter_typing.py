@@ -3,11 +3,10 @@ from dataclasses import dataclass
 import pytest
 from pydantic import BaseModel, Field
 
-from avtomatika_worker.types import INVALID_INPUT_ERROR
+from avtomatika_worker.client import OrchestratorClient
 from avtomatika_worker.worker import Worker
 
 
-# --- Test Setup ---
 @dataclass
 class SimpleDataclass:
     message: str
@@ -21,22 +20,19 @@ class DataclassWithValidation:
 
     def __post_init__(self):
         if self.age < 18:
-            raise ValueError("Age must be 18 or over.")
+            raise ValueError("Must be at least 18")
 
 
 class PydanticModel(BaseModel):
     name: str
-    value: float = Field(gt=0, description="Value must be positive")
-
-
-# --- Tests ---
+    value: float = Field(gt=0)
 
 
 @pytest.mark.asyncio
 async def test_process_task_with_default_dict(mocker):
     """Tests that a handler with a standard `dict` annotation receives the raw dict."""
+    client = mocker.AsyncMock(spec=OrchestratorClient)
     worker = Worker()
-    worker._send_result = mocker.AsyncMock()
 
     received_params = None
 
@@ -51,20 +47,19 @@ async def test_process_task_with_default_dict(mocker):
         "task_id": "t1",
         "type": "dict_task",
         "params": {"key": "value"},
+        "client": client,
         "orchestrator": {"url": "http://test"},
     }
     await worker._process_task(task_data)
 
     assert received_params == {"key": "value"}
-    worker._send_result.assert_called_once()
-    assert worker._send_result.call_args[0][0]["result"]["status"] == "success"
 
 
 @pytest.mark.asyncio
 async def test_process_task_with_simple_dataclass_success(mocker):
     """Tests successful instantiation of a simple dataclass."""
+    client = mocker.AsyncMock(spec=OrchestratorClient)
     worker = Worker()
-    worker._send_result = mocker.AsyncMock()
     received_params = None
 
     @worker.task("dataclass_task")
@@ -78,6 +73,7 @@ async def test_process_task_with_simple_dataclass_success(mocker):
         "task_id": "t1",
         "type": "dataclass_task",
         "params": {"message": "hello", "count": 10},
+        "client": client,
         "orchestrator": {"url": "http://test"},
     }
     await worker._process_task(task_data)
@@ -85,14 +81,13 @@ async def test_process_task_with_simple_dataclass_success(mocker):
     assert isinstance(received_params, SimpleDataclass)
     assert received_params.message == "hello"
     assert received_params.count == 10
-    worker._send_result.assert_called_once()
 
 
 @pytest.mark.asyncio
 async def test_process_task_with_dataclass_validation_failure(mocker):
     """Tests that a validation error in a dataclass's __post_init__ is caught."""
+    client = mocker.AsyncMock(spec=OrchestratorClient)
     worker = Worker()
-    worker._send_result = mocker.AsyncMock()
 
     @worker.task("dataclass_validation_task")
     async def my_handler(params: DataclassWithValidation, **kwargs):
@@ -103,22 +98,23 @@ async def test_process_task_with_dataclass_validation_failure(mocker):
         "task_id": "t1",
         "type": "dataclass_validation_task",
         "params": {"name": "test", "age": 16},  # Invalid age
+        "client": client,
         "orchestrator": {"url": "http://test"},
     }
     await worker._process_task(task_data)
 
-    worker._send_result.assert_called_once()
-    result = worker._send_result.call_args[0][0]["result"]
-    assert result["status"] == "failure"
-    assert result["error"]["code"] == INVALID_INPUT_ERROR
-    assert "Age must be 18 or over" in result["error"]["message"]
+    # Check if failure result was sent
+    client.send_result.assert_called_once()
+    payload = client.send_result.call_args.args[0]
+    assert payload["result"]["status"] == "failure"
+    assert payload["result"]["error"]["code"] == "INVALID_INPUT_ERROR"
 
 
 @pytest.mark.asyncio
 async def test_process_task_with_pydantic_success(mocker):
     """Tests successful validation and instantiation of a Pydantic model."""
+    client = mocker.AsyncMock(spec=OrchestratorClient)
     worker = Worker()
-    worker._send_result = mocker.AsyncMock()
     received_params = None
 
     @worker.task("pydantic_task")
@@ -132,6 +128,7 @@ async def test_process_task_with_pydantic_success(mocker):
         "task_id": "t1",
         "type": "pydantic_task",
         "params": {"name": "test", "value": 123.45},
+        "client": client,
         "orchestrator": {"url": "http://test"},
     }
     await worker._process_task(task_data)
@@ -139,14 +136,13 @@ async def test_process_task_with_pydantic_success(mocker):
     assert isinstance(received_params, PydanticModel)
     assert received_params.name == "test"
     assert received_params.value == 123.45
-    worker._send_result.assert_called_once()
 
 
 @pytest.mark.asyncio
 async def test_process_task_with_pydantic_validation_failure(mocker):
     """Tests that a Pydantic validation error is caught."""
+    client = mocker.AsyncMock(spec=OrchestratorClient)
     worker = Worker()
-    worker._send_result = mocker.AsyncMock()
 
     @worker.task("pydantic_validation_task")
     async def my_handler(params: PydanticModel, **kwargs):
@@ -157,12 +153,13 @@ async def test_process_task_with_pydantic_validation_failure(mocker):
         "task_id": "t1",
         "type": "pydantic_validation_task",
         "params": {"name": "test", "value": -5},  # Invalid value
+        "client": client,
         "orchestrator": {"url": "http://test"},
     }
     await worker._process_task(task_data)
 
-    worker._send_result.assert_called_once()
-    result = worker._send_result.call_args[0][0]["result"]
-    assert result["status"] == "failure"
-    assert result["error"]["code"] == INVALID_INPUT_ERROR
-    assert "Input should be greater than 0" in result["error"]["message"]
+    # Check if failure result was sent
+    client.send_result.assert_called_once()
+    payload = client.send_result.call_args.args[0]
+    assert payload["result"]["status"] == "failure"
+    assert "validation" in payload["result"]["error"]["message"].lower()

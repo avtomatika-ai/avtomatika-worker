@@ -1,5 +1,7 @@
 from collections import Counter
+from unittest.mock import MagicMock
 
+from avtomatika_worker.client import OrchestratorClient
 from avtomatika_worker.config import WorkerConfig
 from avtomatika_worker.worker import Worker
 
@@ -22,20 +24,23 @@ def test_wrr_algorithm_distribution():
     worker = Worker()
     worker._config = MockConfig()
 
-    # Re-initialize WRR state in the worker based on the mocked config
+    # Setup clients manually for test
+    worker._clients = []
     worker._total_orchestrator_weight = 0
-    if worker._config.ORCHESTRATORS:
-        for o in worker._config.ORCHESTRATORS:
-            o["current_weight"] = 0
-            worker._total_orchestrator_weight += o.get("weight", 1)
+    for o in worker._config.ORCHESTRATORS:
+        o["current_weight"] = 0
+        worker._total_orchestrator_weight += o.get("weight", 1)
+        client = MagicMock(spec=OrchestratorClient)
+        client.base_url = o["url"]
+        worker._clients.append((o, client))
 
     # --- Run the algorithm for a number of cycles ---
     total_weight = worker._total_orchestrator_weight
     iterations = total_weight * 10  # 80 iterations
     selections = []
     for _ in range(iterations):
-        orchestrator = worker._get_next_orchestrator()
-        selections.append(orchestrator["url"])
+        client = worker._get_next_client()
+        selections.append(client.base_url)
 
     counts = Counter(selections)
 

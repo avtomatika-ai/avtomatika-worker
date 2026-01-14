@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "avtomatika-worker"
-version = "1.0.b2"
+version = "1.0.b3"
 description = "Worker SDK for the Avtomatika orchestrator."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -17,7 +17,7 @@ classifiers = [
 dependencies = [
     "aiohttp~=3.13.2",
     "python-json-logger~=4.0.0",
-    "aioboto3~=15.5.0",
+    "obstore>=0.1",
     "aiofiles~=25.1.0",
 ]
 
@@ -28,6 +28,7 @@ test = [
     "aioresponses",
     "pytest-mock",
     "pydantic",
+    "types-aiofiles",
 ]
 pydantic = ["pydantic"]
 

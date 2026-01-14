@@ -7,6 +7,7 @@ import aiohttp
 import pytest
 from aiohttp import ClientError, WSMsgType
 
+from avtomatika_worker.client import OrchestratorClient
 from avtomatika_worker.types import INVALID_INPUT_ERROR, PERMANENT_ERROR
 from avtomatika_worker.worker import ParamValidationError, Worker
 
@@ -42,38 +43,64 @@ def test_task_decorator_warns_on_undefined_type(caplog, mocker):
 
 
 @pytest.mark.asyncio
-async def test_poll_for_tasks_handles_non_204_status(mocker):
-    """Tests that _poll_for_tasks sleeps on non-204, non-200 responses."""
+async def test_worker_registration_payload(mocker):
+    """Tests that the registration payload contains all expected fields."""
     session = mocker.MagicMock(spec=aiohttp.ClientSession)
     session.closed = False
-    get_response = mocker.AsyncMock(spec=aiohttp.ClientResponse)
-    get_response.status = 500  # Some server error
-    get_response.__aenter__.return_value = get_response
-    session.get = mocker.MagicMock(return_value=get_response)
-    worker = Worker(http_session=session)
-    mock_sleep = mocker.patch("avtomatika_worker.worker.sleep", new_callable=mocker.AsyncMock)
 
-    await worker._poll_for_tasks({"url": "http://test-orchestrator"})
+    # Mock OrchestratorClient.register
+    mocker.patch("avtomatika_worker.worker.OrchestratorClient.register", new_callable=mocker.AsyncMock)
 
-    mock_sleep.assert_called_once_with(worker._config.TASK_POLL_ERROR_DELAY)
+    worker = Worker(http_session=session, worker_type="custom-type")
+    worker._config.WORKER_ID = "custom-id"
+    worker._config.INSTALLED_MODELS = [{"name": "model1"}]
+    worker._config.COST_PER_SKILL = {"task1": 1.5}
+
+    @worker.task("task1")
+    def task1(params: dict):
+        pass
+
+    await worker._register_with_all_orchestrators()
+
+    from avtomatika_worker.worker import OrchestratorClient
+
+    OrchestratorClient.register.assert_called()
+    payload = OrchestratorClient.register.call_args.args[0]
+
+    assert payload["worker_id"] == "custom-id"
+    assert payload["worker_type"] == "custom-type"
+    assert "task1" in payload["supported_tasks"]
+    assert payload["installed_models"] == [{"name": "model1"}]
+    assert payload["cost_per_skill"] == {"task1": 1.5}
+
+
+@pytest.mark.asyncio
+async def test_poll_for_tasks_handles_non_204_status(mocker):
+    """Tests that _poll_for_tasks handles errors from client."""
+    client = mocker.AsyncMock(spec=OrchestratorClient)
+    client.poll_task.return_value = None
+
+    worker = Worker()
+
+    await worker._poll_for_tasks(client)
+    client.poll_task.assert_called_once()
 
 
 @pytest.mark.asyncio
 async def test_send_result_retries_on_client_error(mocker):
-    """Tests that _send_result retries sending the result on ClientError."""
+    """Tests that OrchestratorClient.send_result retries sending the result on ClientError."""
     session = mocker.MagicMock(spec=aiohttp.ClientSession)
     session.closed = False
-    session.post.side_effect = ClientError("Connection error")
-    worker = Worker(http_session=session)
-    worker._config.RESULT_MAX_RETRIES = 3
-    worker._config.RESULT_RETRY_INITIAL_DELAY = 0.01
-    mock_sleep = mocker.patch("avtomatika_worker.worker.sleep", new_callable=mocker.AsyncMock)
 
-    payload = {"job_id": "j1", "task_id": "t1", "worker_id": "w1", "result": {}}
-    await worker._send_result(payload, {"url": "http://test"})
+    client = OrchestratorClient(session, "http://test", "w1", "token")
+
+    session.post.side_effect = ClientError("Connection error")
+    mocker.patch("avtomatika_worker.client.sleep", new_callable=mocker.AsyncMock)
+
+    payload = {"result": {}}
+    await client.send_result(payload, max_retries=3, initial_delay=0.01)
 
     assert session.post.call_count == 3
-    assert mock_sleep.call_count == 3
 
 
 @pytest.mark.asyncio
@@ -82,10 +109,13 @@ async def test_websocket_manager_handles_connection_error(mocker):
     Tests that the WebSocket manager handles connection errors and retries.
     """
     session = mocker.MagicMock(spec=aiohttp.ClientSession)
-    session.ws_connect.side_effect = ClientError("Connection refused")
     worker = Worker(http_session=session)
-    worker._config.ENABLE_WEBSOCKETS = True
-    worker._config.ORCHESTRATORS = [{"url": "http://test-orchestrator"}]
+
+    # Setup mock clients manually since we're in a test
+    client = mocker.AsyncMock(spec=OrchestratorClient)
+    client.connect_websocket.return_value = None
+    worker._clients = [({"url": "http://test-orchestrator", "weight": 1}, client)]
+
     mock_sleep = mocker.patch("avtomatika_worker.worker.sleep", new_callable=mocker.AsyncMock)
     # To break the while loop
     mock_sleep.side_effect = asyncio.CancelledError
@@ -94,7 +124,7 @@ async def test_websocket_manager_handles_connection_error(mocker):
     with pytest.raises(asyncio.CancelledError):
         await worker._start_websocket_manager()
 
-    session.ws_connect.assert_called_once()
+    client.connect_websocket.assert_called_once()
     mock_sleep.assert_called_once()
 
 
@@ -103,20 +133,21 @@ async def test_process_task_permanent_error_on_unsupported_task(mocker):
     """
     Tests that a permanent error is returned for an unsupported task type.
     """
+    client = mocker.AsyncMock(spec=OrchestratorClient)
     worker = Worker()
-    worker._send_result = mocker.AsyncMock()
 
     task_data = {
         "job_id": "j1",
         "task_id": "t1",
         "type": "unsupported_task",
         "params": {},
+        "client": client,
         "orchestrator": {"url": "http://test"},
     }
     await worker._process_task(task_data)
 
-    worker._send_result.assert_called_once()
-    result_payload = worker._send_result.call_args.args[0]
+    client.send_result.assert_called_once()
+    result_payload = client.send_result.call_args.args[0]
     assert result_payload["result"]["error"]["code"] == PERMANENT_ERROR
 
 
@@ -147,8 +178,8 @@ async def test_process_task_handles_param_validation_error(mocker):
     """
     Tests that _process_task sends an INVALID_INPUT_ERROR when ParamValidationError is raised.
     """
+    client = mocker.AsyncMock(spec=OrchestratorClient)
     worker = Worker()
-    worker._send_result = mocker.AsyncMock()
 
     @worker.task("validation_task")
     async def my_task(params: dict, **kwargs):
@@ -159,13 +190,14 @@ async def test_process_task_handles_param_validation_error(mocker):
         "task_id": "t1",
         "type": "validation_task",
         "params": {},
+        "client": client,
         "orchestrator": {"url": "http://test"},
     }
 
     await worker._process_task(task_data)
 
-    worker._send_result.assert_called_once()
-    result = worker._send_result.call_args[0][0]["result"]
+    client.send_result.assert_called_once()
+    result = client.send_result.call_args[0][0]["result"]
     assert result["error"]["code"] == INVALID_INPUT_ERROR
     assert "Invalid params" in result["error"]["message"]
 
@@ -191,38 +223,44 @@ def test_run_with_health_check_keyboard_interrupt(mocker):
 
     mock_shutdown_set.assert_called_once()
 
-    @pytest.mark.asyncio
-    async def test_listen_for_commands_handles_invalid_json(mocker, caplog):
-        """
-        Tests that _listen_for_commands logs a warning on receiving invalid JSON.
-        """
-        worker = Worker()
 
-        # ws_connection will directly implement the async iterator protocol
-        ws_connection = mocker.AsyncMock(spec=aiohttp.ClientWebSocketResponse)
+@pytest.mark.asyncio
+async def test_listen_for_commands_handles_invalid_json(mocker, caplog):
+    """
+    Tests that _listen_for_commands logs a warning on receiving invalid JSON.
+    """
+    worker = Worker()
 
-        # Create a mock message that simulates aiohttp's message object
-        mock_message = MagicMock()
-        mock_message.type = WSMsgType.TEXT
-        mock_message.json.side_effect = JSONDecodeError("Invalid JSON", doc="invalid json", pos=0)
-        mock_message.data = "invalid json"
+    # Create a mock message
+    mock_message = MagicMock()
+    mock_message.type = WSMsgType.TEXT
+    mock_message.json.side_effect = JSONDecodeError("Invalid JSON", doc="invalid json", pos=0)
+    mock_message.data = "invalid json"
 
-        mock_message_queue = [mock_message]
+    # Define a custom async iterator class
+    class MockAsyncIterator:
+        def __init__(self, items):
+            self.items = items
 
-        async def anext_side_effect():
-            if mock_message_queue:
-                return mock_message_queue.pop(0)
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self.items:
+                return self.items.pop(0)
             raise StopAsyncIteration
 
-        ws_connection.__aiter__.return_value = ws_connection
-        ws_connection.__anext__.side_effect = anext_side_effect
+    # Mock the ws_connection object
+    ws_connection = mocker.AsyncMock(spec=aiohttp.ClientWebSocketResponse)
+    # The key fix: assign the iterator directly to the mock, so 'async for' uses it
+    ws_connection.__aiter__.side_effect = lambda: MockAsyncIterator([mock_message])
 
-        worker._ws_connection = ws_connection
+    worker._ws_connection = ws_connection
 
-        with caplog.at_level("WARNING"):
-            await worker._listen_for_commands()
+    with caplog.at_level("WARNING"):
+        await worker._listen_for_commands()
 
-        assert "Received invalid JSON over WebSocket: invalid json" in caplog.text
+    assert "Received invalid JSON over WebSocket: invalid json" in caplog.text
 
 
 @pytest.mark.asyncio

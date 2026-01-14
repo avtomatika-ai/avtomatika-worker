@@ -10,7 +10,7 @@ class WorkerConfig:
     Reads parameters from environment variables and provides default values.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         # --- Basic worker information ---
         self.WORKER_ID: str = getenv("WORKER_ID", f"worker-{uuid4()}")
         self.WORKER_TYPE: str = getenv("WORKER_TYPE", "generic-cpu-worker")
@@ -54,6 +54,7 @@ class WorkerConfig:
         self.S3_ACCESS_KEY: str | None = getenv("S3_ACCESS_KEY")
         self.S3_SECRET_KEY: str | None = getenv("S3_SECRET_KEY")
         self.S3_DEFAULT_BUCKET: str = getenv("S3_DEFAULT_BUCKET", "avtomatika-payloads")
+        self.S3_REGION: str = getenv("S3_REGION", "us-east-1")
 
         # --- Tuning parameters ---
         self.HEARTBEAT_INTERVAL: float = float(getenv("HEARTBEAT_INTERVAL", "15"))
@@ -69,6 +70,18 @@ class WorkerConfig:
         self.IDLE_POLL_DELAY: float = float(getenv("IDLE_POLL_DELAY", "0.01"))
         self.ENABLE_WEBSOCKETS: bool = getenv("WORKER_ENABLE_WEBSOCKETS", "false").lower() == "true"
         self.MULTI_ORCHESTRATOR_MODE: str = getenv("MULTI_ORCHESTRATOR_MODE", "FAILOVER")
+
+    def validate(self) -> None:
+        """Validates critical configuration parameters."""
+        if self.WORKER_TOKEN == "your-secret-worker-token":
+            print("Warning: WORKER_TOKEN is set to the default value. Tasks might fail authentication.")
+
+        if not self.ORCHESTRATORS:
+            raise ValueError("No orchestrators configured.")
+
+        for o in self.ORCHESTRATORS:
+            if not o.get("url"):
+                raise ValueError("Orchestrator configuration missing URL.")
 
     def _get_orchestrators_config(self) -> list[dict[str, Any]]:
         """
