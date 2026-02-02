@@ -1,7 +1,8 @@
 from collections import Counter
 from unittest.mock import MagicMock
 
-from avtomatika_worker.client import OrchestratorClient
+from rxon import Transport
+
 from avtomatika_worker.config import WorkerConfig
 from avtomatika_worker.worker import Worker
 
@@ -30,8 +31,8 @@ def test_wrr_algorithm_distribution():
     for o in worker._config.ORCHESTRATORS:
         o["current_weight"] = 0
         worker._total_orchestrator_weight += o.get("weight", 1)
-        client = MagicMock(spec=OrchestratorClient)
-        client.base_url = o["url"]
+        client = MagicMock(spec=Transport)
+        client.base_url = o["url"]  # Just to identify it in test
         worker._clients.append((o, client))
 
     # --- Run the algorithm for a number of cycles ---

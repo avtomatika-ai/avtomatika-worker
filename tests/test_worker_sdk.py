@@ -1,8 +1,10 @@
 import asyncio
 import contextlib
 
-import aiohttp
 import pytest
+from rxon import WorkerCommand
+from rxon.models import TaskPayload, TaskResult
+from rxon.testing import MockTransport
 
 from avtomatika_worker.config import WorkerConfig
 from avtomatika_worker.worker import Worker
@@ -34,158 +36,119 @@ def test_task_registration():
     assert worker._task_handlers["my_test_task"]["type"] is None
 
 
-# --- Integration Tests ---
-
-
-@pytest.fixture
-def test_worker():
-    """Provides a Worker instance for integration tests."""
-    worker = Worker(worker_type="integration-test-worker")
-
-    @worker.task("successful_task")
-    async def successful_handler(params: dict):
-        await asyncio.sleep(0.01)
-        return {"status": "success", "data": {"result": "it worked"}}
-
-    return worker
+# --- Logical Integration Tests using MockTransport ---
 
 
 @pytest.mark.asyncio
-async def test_worker_polls_executes_and_sends_result(mocker, monkeypatch):
-    """Tests the full PULL cycle using the correct pytest-mock pattern for aiohttp."""
+async def test_worker_polls_executes_and_sends_result(monkeypatch):
+    """Tests the full PULL cycle using MockTransport."""
     monkeypatch.setenv("MAX_CONCURRENT_TASKS", "1")
     monkeypatch.setenv("HEARTBEAT_INTERVAL", "10")
+    monkeypatch.setenv("IDLE_POLL_DELAY", "0.01")
     monkeypatch.setenv("ORCHESTRATOR_URL", "http://test-orchestrator")
     monkeypatch.setenv("COST_PER_SKILL", '{"successful_task": 0.5}')
 
-    task_payload = {
-        "job_id": "job-123",
-        "task_id": "task-456",
-        "type": "successful_task",
-        "params": {"input": "test"},
-    }
+    transport = MockTransport(worker_id="test-worker")
 
-    session = mocker.MagicMock(spec=aiohttp.ClientSession)
-    session.closed = False
-
-    # Mock for GET (polling for tasks)
-    get_response_success = mocker.AsyncMock(spec=aiohttp.ClientResponse)
-    get_response_success.status = 200
-    get_response_success.json = mocker.AsyncMock(return_value=task_payload)
-    get_response_success.__aenter__.return_value = get_response_success
-
-    get_response_no_task = mocker.AsyncMock(spec=aiohttp.ClientResponse)
-    get_response_no_task.status = 204
-    get_response_no_task.__aenter__.return_value = get_response_no_task
-
-    session.get = mocker.MagicMock(
-        side_effect=[get_response_success, get_response_no_task]  # First call gets a task, subsequent get no task
+    # Pre-inject a task into the mock transport
+    transport.push_task(
+        TaskPayload(
+            job_id="job-123", task_id="task-456", type="successful_task", params={"input": "test"}, tracing_context={}
+        )
     )
 
-    # Mock for POST (registration and result sending)
-    post_response_success = mocker.AsyncMock(spec=aiohttp.ClientResponse)
-    post_response_success.status = 200
-    post_response_success.__aenter__.return_value = post_response_success
-
-    # Set side_effect for session.post to return different responses
-    # First POST is registration, second is task result
-    session.post = mocker.MagicMock(side_effect=[post_response_success, post_response_success])
-
-    # Mock for PATCH (heartbeat)
-    patch_response = mocker.AsyncMock(spec=aiohttp.ClientResponse)
-    patch_response.status = 200
-    patch_response.__aenter__.return_value = patch_response
-    session.patch = mocker.MagicMock(return_value=patch_response)
-
-    worker = Worker(worker_type="integration-test-worker", http_session=session)
+    worker = Worker(
+        worker_type="integration-test-worker", clients=[({"url": "http://test-orchestrator", "weight": 1}, transport)]
+    )
 
     @worker.task("successful_task")
     async def successful_handler(params: dict, **kwargs):
-        return {"status": "success"}
+        return {"status": "success", "data": {"output": "ok"}}
 
+    # Run the worker main loop in background
     worker_task = asyncio.create_task(worker.main())
-    await asyncio.sleep(0.5)
+
+    # Wait for task to be processed
+    for _ in range(20):
+        if transport.results:
+            break
+        await asyncio.sleep(0.05)
+
     worker._shutdown_event.set()
     with contextlib.suppress(asyncio.CancelledError):
         await asyncio.wait_for(worker_task, timeout=1.0)
 
     # --- Assertions ---
-    # Assert registration, polling, and result sending were called
-    assert session.get.call_count > 0
+    assert len(transport.registered) > 0
+    assert transport.registered[0].capabilities.cost_per_skill == {"successful_task": 0.5}
 
-    # Check that POST was called for registration and for sending result
-    # The order can vary, so we check using 'any'
-    assert any("register" in call.args[0] for call in session.post.call_args_list)
-    assert any("result" in call.args[0] for call in session.post.call_args_list)
-
-    # Find the registration call and check the payload
-    for call in session.post.call_args_list:
-        if "register" in call.args[0]:
-            assert call.kwargs["json"]["cost_per_skill"] == {"successful_task": 0.5}
-            break
-    else:
-        pytest.fail("Registration call not found")
+    assert len(transport.results) == 1
+    result: TaskResult = transport.results[0]
+    assert result.task_id == "task-456"
+    assert result.status == "success"
+    assert result.data == {"output": "ok"}
 
 
 @pytest.mark.asyncio
-async def test_listen_for_commands_cancels_task(mocker):
-    """Tests that _listen_for_commands correctly cancels a task."""
-    worker = Worker()
+async def test_listen_for_commands_cancels_task():
+    """Tests that commands from transport correctly cancel a task."""
+    transport = MockTransport(worker_id="test-worker")
+    worker = Worker(clients=[({"url": "http://test-orchestrator", "weight": 1}, transport)])
+
     task_id = "task-to-cancel"
-    mock_task = mocker.MagicMock()
+    mock_task = asyncio.create_task(asyncio.sleep(10))
     worker._active_tasks[task_id] = mock_task
 
-    mock_ws = mocker.AsyncMock()
-    cancel_message = mocker.MagicMock()
-    cancel_message.type = aiohttp.WSMsgType.TEXT
-    cancel_message.json.return_value = {"type": "cancel_task", "task_id": task_id}
-    mock_ws.__aiter__.return_value = [cancel_message]
-    worker._ws_connection = mock_ws
+    # Start the command listener
+    await transport.connect()
+    worker._shutdown_event = asyncio.Event()  # Ensure event is clean
+    listener_task = asyncio.create_task(worker._listen_to_single_transport(transport))
 
-    await worker._listen_for_commands()
+    # Inject cancellation command
+    transport.push_command(WorkerCommand(command="cancel_task", task_id=task_id, job_id="job-123"))
 
-    mock_task.cancel.assert_called_once()
+    await asyncio.sleep(0.1)
 
+    assert mock_task.cancelled()
 
-@pytest.mark.asyncio
-async def test_send_progress(mocker):
-    """Tests that send_progress sends a progress update via WebSocket."""
-    worker = Worker()
-    mock_ws = mocker.AsyncMock()
-    mock_ws.closed = False
-    mock_ws.send_json = mocker.AsyncMock()
-    worker._ws_connection = mock_ws
-
-    task_id = "task-123"
-    job_id = "job-456"
-    await worker.send_progress(task_id, job_id, 0.5, "in progress")
-
-    mock_ws.send_json.assert_called_once_with(
-        {
-            "type": "progress_update",
-            "task_id": task_id,
-            "job_id": job_id,
-            "progress": 0.5,
-            "message": "in progress",
-        }
-    )
+    worker._shutdown_event.set()
+    listener_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await listener_task
 
 
 @pytest.mark.asyncio
-async def test_hot_cache_update_and_heartbeat(mocker, monkeypatch):
+async def test_send_progress():
+    """Tests that send_progress sends a progress update via Transport."""
+    transport = MockTransport()
+    worker = Worker(clients=[({"url": "http://test-orchestrator", "weight": 1}, transport)])
+
+    @worker.task("progress_task")
+    async def progress_task(params, send_progress, task_id, job_id, **kwargs):
+        await send_progress(task_id, job_id, 0.5, "halfway")
+
+    task_data = {
+        "job_id": "j1",
+        "task_id": "t1",
+        "type": "progress_task",
+        "params": {},
+        "tracing_context": {},
+        "client": transport,
+    }
+
+    await worker._process_task(task_data)
+
+    assert len(transport.progress_updates) == 1
+    update = transport.progress_updates[0]
+    assert update.progress == 0.5
+    assert update.message == "halfway"
+
+
+@pytest.mark.asyncio
+async def test_hot_cache_update_and_heartbeat():
     """Tests that the hot_cache is correctly updated and sent in the heartbeat."""
-    monkeypatch.setenv("HEARTBEAT_INTERVAL", "0.01")
-    monkeypatch.setenv("ORCHESTRATOR_URL", "http://test-orchestrator")
-
-    # Correctly mock the session and its patch method
-    session = mocker.MagicMock(spec=aiohttp.ClientSession)
-    session.closed = False
-    patch_response = mocker.AsyncMock(spec=aiohttp.ClientResponse)
-    patch_response.status = 200
-    patch_response.__aenter__.return_value = patch_response
-    session.patch = mocker.MagicMock(return_value=patch_response)
-
-    worker = Worker(http_session=session)
+    transport = MockTransport()
+    worker = Worker(clients=[({"url": "http://test-orchestrator", "weight": 1}, transport)])
 
     worker.add_to_hot_cache("model-1")
     worker.add_to_hot_cache("model-2")
@@ -193,54 +156,42 @@ async def test_hot_cache_update_and_heartbeat(mocker, monkeypatch):
 
     await worker._send_heartbeats_to_all()
 
-    # Assert that the patch method was called with the correct hot_cache
-    session.patch.assert_called_once()
-    payload = session.patch.call_args.kwargs["json"]
-    assert sorted(payload["hot_cache"]) == ["model-2"]
+    assert len(transport.heartbeats) == 1
+    heartbeat = transport.heartbeats[0]
+    assert sorted(heartbeat.hot_cache) == ["model-2"]
 
 
 @pytest.mark.asyncio
-async def test_heartbeat_sends_skill_dependencies_and_hot_skills(mocker, monkeypatch):
+async def test_heartbeat_sends_skill_dependencies_and_hot_skills():
     """
-    Tests that the heartbeat correctly sends skill_dependencies and dynamically
-    calculates and sends hot_skills based on the current hot_cache.
+    Tests that the heartbeat correctly sends skill_dependencies and hot_skills.
     """
-    monkeypatch.setenv("HEARTBEAT_INTERVAL", "0.01")
-    monkeypatch.setenv("ORCHESTRATOR_URL", "http://test-orchestrator")
-
     skill_deps = {
         "image_generation": ["sd_v1.5", "vae"],
         "upscaling": ["realesrgan"],
     }
-
-    # Correctly mock the session and its patch method
-    session = mocker.MagicMock(spec=aiohttp.ClientSession)
-    session.closed = False
-    patch_response = mocker.AsyncMock(spec=aiohttp.ClientResponse)
-    patch_response.status = 200
-    patch_response.__aenter__.return_value = patch_response
-    session.patch = mocker.MagicMock(return_value=patch_response)
-
-    worker = Worker(skill_dependencies=skill_deps, http_session=session)
+    transport = MockTransport()
+    worker = Worker(
+        skill_dependencies=skill_deps, clients=[({"url": "http://test-orchestrator", "weight": 1}, transport)]
+    )
 
     # Case 1: One skill fully loaded
     worker.add_to_hot_cache("sd_v1.5")
     worker.add_to_hot_cache("vae")
     await worker._send_heartbeats_to_all()
 
-    session.patch.assert_called_once()
-    payload = session.patch.call_args.kwargs["json"]
-    assert payload["skill_dependencies"] == skill_deps
-    assert sorted(payload["hot_skills"]) == ["image_generation"]
-    session.patch.reset_mock()
+    heartbeat = transport.heartbeats[0]
+    assert heartbeat.skill_dependencies == skill_deps
+    assert sorted(heartbeat.hot_skills) == ["image_generation"]
+
+    transport.heartbeats.clear()
 
     # Case 2: A model is removed, making the skill "cold"
     worker.remove_from_hot_cache("sd_v1.5")
     await worker._send_heartbeats_to_all()
 
-    session.patch.assert_called_once()
-    payload = session.patch.call_args.kwargs["json"]
-    assert "hot_skills" not in payload
+    heartbeat = transport.heartbeats[0]
+    assert heartbeat.hot_skills is None
 
 
 @pytest.mark.asyncio
@@ -312,31 +263,19 @@ def test_get_current_state_with_task_type_limits():
 
 
 @pytest.mark.asyncio
-async def test_run_and_shutdown(mocker):
+async def test_run_and_shutdown():
     """Tests that the worker can start, run, and shut down gracefully."""
-    # This test is more about lifecycle than network calls, but we need
-    # to provide valid mocks for the calls that happen on startup.
-    session = mocker.MagicMock(spec=aiohttp.ClientSession)
-    session.closed = False
+    transport = MockTransport()
+    worker = Worker(clients=[({"url": "http://test-orchestrator", "weight": 1}, transport)])
 
-    # Setup for POST (register)
-    post_cm = mocker.AsyncMock()
-    post_cm.__aenter__.return_value.status = 200
-    session.post.return_value = post_cm
-
-    # Setup for GET (poll)
-    get_cm = mocker.AsyncMock()
-    get_cm.__aenter__.return_value.status = 204  # No tasks
-    session.get.return_value = get_cm
-
-    # Setup for PATCH (heartbeat)
-    patch_cm = mocker.AsyncMock()
-    patch_cm.__aenter__.return_value.status = 200
-    session.patch.return_value = patch_cm
-
-    worker = Worker(http_session=session)
     run_task = asyncio.create_task(worker.main())
-    await asyncio.sleep(0.1)  # Give worker time to start up
+    await asyncio.sleep(0.1)
+
+    assert transport.connected
+    assert len(transport.registered) == 1
+
     worker._shutdown_event.set()
     with contextlib.suppress(asyncio.CancelledError):
         await asyncio.wait_for(run_task, timeout=1.0)
+
+    assert not transport.connected

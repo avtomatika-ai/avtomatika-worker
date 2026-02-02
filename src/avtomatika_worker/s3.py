@@ -4,13 +4,17 @@ from os import walk
 from os.path import basename, dirname, join, relpath
 from shutil import rmtree
 from typing import Any, cast
-from urllib.parse import urlparse
 
-import obstore
 from aiofiles import open as aio_open
 from aiofiles.os import makedirs
-from aiofiles.ospath import exists, isdir
+from aiofiles.ospath import exists, getsize, isdir
+from obstore import get as obstore_get
+from obstore import list as obstore_list
+from obstore import put as obstore_put
 from obstore.store import S3Store
+from rxon.blob import parse_uri
+from rxon.exceptions import IntegrityError
+from rxon.models import FileMetadata
 
 from .config import WorkerConfig
 
@@ -61,12 +65,12 @@ class S3Manager:
         if await exists(task_dir):
             await to_thread(lambda: rmtree(task_dir, ignore_errors=True))
 
-    async def _process_s3_uri(self, uri: str, task_id: str) -> str:
-        """Downloads a file or a folder (if uri ends with /) from S3 and returns the local path."""
+    async def _process_s3_uri(self, uri: str, task_id: str, verify_meta: FileMetadata | None = None) -> str:
+        """Downloads a file or a folder from S3 and returns the local path.
+        If verify_meta is provided, performs integrity checks.
+        """
         try:
-            parsed_url = urlparse(uri)
-            bucket_name = parsed_url.netloc
-            object_key = parsed_url.path.lstrip("/")
+            bucket_name, object_key, is_directory = parse_uri(uri)
             store = self._get_store(bucket_name)
 
             # Use task-specific directory for isolation
@@ -76,36 +80,27 @@ class S3Manager:
             logger.info(f"Starting download from S3: {uri}")
 
             # Handle folder download (prefix)
-            if uri.endswith("/"):
+            if is_directory:
                 folder_name = object_key.rstrip("/").split("/")[-1]
                 local_folder_path = join(local_dir_root, folder_name)
-
-                # List objects with prefix
-                # obstore.list returns an async iterator of ObjectMeta
                 files_to_download = []
 
-                # Note: obstore.list returns an async iterator.
-                async for obj in obstore.list(store, prefix=object_key):
+                async for obj in obstore_list(store, prefix=object_key):
                     key = obj.key
-
                     if key.endswith("/"):
                         continue
-
-                    # Calculate relative path inside the folder
                     rel_path = key[len(object_key) :]
                     local_file_path = join(local_folder_path, rel_path)
-
                     await makedirs(dirname(local_file_path), exist_ok=True)
                     files_to_download.append((key, local_file_path))
 
                 async def _download_file(key: str, path: str) -> None:
                     async with self._semaphore:
-                        result = await obstore.get(store, key)
+                        result = await obstore_get(store, key)
                         async with aio_open(path, "wb") as f:
                             async for chunk in result.stream():
                                 await f.write(chunk)
 
-                # Execute downloads in parallel
                 if files_to_download:
                     await gather(*[_download_file(k, p) for k, p in files_to_download])
 
@@ -115,7 +110,20 @@ class S3Manager:
             # Handle single file download
             local_path = join(local_dir_root, basename(object_key))
 
-            result = await obstore.get(store, object_key)
+            result = await obstore_get(store, object_key)
+
+            # Integrity check before download
+            if verify_meta:
+                if verify_meta.size != result.meta.size:
+                    raise IntegrityError(
+                        f"Size mismatch for {uri}: expected {verify_meta.size}, got {result.meta.size}"
+                    )
+                if verify_meta.etag and result.meta.e_tag:
+                    actual_etag = result.meta.e_tag.strip('"')
+                    expected_etag = verify_meta.etag.strip('"')
+                    if actual_etag != expected_etag:
+                        raise IntegrityError(f"ETag mismatch for {uri}: expected {expected_etag}, got {actual_etag}")
+
             async with aio_open(local_path, "wb") as f:
                 async for chunk in result.stream():
                     await f.write(chunk)
@@ -128,8 +136,8 @@ class S3Manager:
             logger.exception(f"Error during download of {uri}: {e}")
             raise
 
-    async def _upload_to_s3(self, local_path: str) -> str:
-        """Uploads a file or a folder to S3 and returns the S3 URI."""
+    async def _upload_to_s3(self, local_path: str) -> FileMetadata:
+        """Uploads a file or a folder to S3 and returns FileMetadata."""
         bucket_name = self._config.S3_DEFAULT_BUCKET
         store = self._get_store(bucket_name)
 
@@ -141,70 +149,90 @@ class S3Manager:
                 folder_name = basename(local_path.rstrip("/"))
                 s3_prefix = f"{folder_name}/"
 
-                # Use to_thread to avoid blocking event loop during file walk
                 def _get_files_to_upload():
+                    from os.path import getsize as std_getsize
+
                     files_to_upload = []
+                    total_size = 0
                     for root, _, files in walk(local_path):
                         for file in files:
                             f_path = join(root, file)
                             rel = relpath(f_path, local_path)
+                            total_size += std_getsize(f_path)
                             files_to_upload.append((f_path, f"{s3_prefix}{rel}"))
-                    return files_to_upload
+                    return files_to_upload, total_size
 
-                files_list = await to_thread(_get_files_to_upload)
+                files_list, total_size = await to_thread(_get_files_to_upload)
 
                 async def _upload_file(path: str, key: str) -> None:
                     async with self._semaphore:
-                        # obstore.put accepts bytes or file-like objects.
-                        # Since we are in async, reading small files is fine.
                         with open(path, "rb") as f:
-                            await obstore.put(store, key, f)
+                            await obstore_put(store, key, f)
 
                 if files_list:
-                    # Upload in parallel
                     await gather(*[_upload_file(f, k) for f, k in files_list])
 
                 s3_uri = f"s3://{bucket_name}/{s3_prefix}"
                 logger.info(f"Successfully uploaded folder to S3: {local_path} -> {s3_uri} ({len(files_list)} files)")
-                return s3_uri
+                return FileMetadata(uri=s3_uri, size=total_size)
 
             # Handle single file upload
             object_key = basename(local_path)
+            file_size = await getsize(local_path)
             with open(local_path, "rb") as f:
-                await obstore.put(store, object_key, f)
+                put_result = await obstore_put(store, object_key, f)
 
             s3_uri = f"s3://{bucket_name}/{object_key}"
-            logger.info(f"Successfully uploaded file to S3: {local_path} -> {s3_uri}")
-            return s3_uri
+            etag = put_result.e_tag.strip('"') if put_result.e_tag else None
+            logger.info(f"Successfully uploaded file to S3: {local_path} -> {s3_uri} (ETag: {etag})")
+            return FileMetadata(uri=s3_uri, size=file_size, etag=etag)
 
         except Exception as e:
             logger.exception(f"Error during upload of {local_path}: {e}")
             raise
 
-    async def process_params(self, params: dict[str, Any], task_id: str) -> dict[str, Any]:
-        """Recursively searches for S3 URIs in params and downloads the files."""
+    async def process_params(
+        self, params: dict[str, Any], task_id: str, metadata: dict[str, FileMetadata] | None = None
+    ) -> dict[str, Any]:
+        """Recursively searches for S3 URIs in params and downloads the files.
+        Uses metadata for integrity verification if available.
+        """
         if not self._config.S3_ENDPOINT_URL:
             return params
 
-        async def _process(item: Any) -> Any:
+        async def _process(item: Any, key_path: str = "") -> Any:
             if isinstance(item, str) and item.startswith("s3://"):
-                return await self._process_s3_uri(item, task_id)
+                verify_meta = metadata.get(key_path) if metadata else None
+                return await self._process_s3_uri(item, task_id, verify_meta=verify_meta)
             if isinstance(item, dict):
-                return {k: await _process(v) for k, v in item.items()}
-            return [await _process(i) for i in item] if isinstance(item, list) else item
+                return {k: await _process(v, f"{key_path}.{k}" if key_path else k) for k, v in item.items()}
+            if isinstance(item, list):
+                return [await _process(v, f"{key_path}[{i}]") for i, v in enumerate(item)]
+            return item
 
         return cast(dict[str, Any], await _process(params))
 
-    async def process_result(self, result: dict[str, Any]) -> dict[str, Any]:
-        """Recursively searches for local file paths in the result and uploads them to S3."""
+    async def process_result(self, result: dict[str, Any]) -> tuple[dict[str, Any], dict[str, FileMetadata]]:
+        """Recursively searches for local file paths in the result and uploads them to S3.
+        Returns a tuple of (updated_result, metadata_map).
+        """
         if not self._config.S3_ENDPOINT_URL:
-            return result
+            return result, {}
 
-        async def _process(item: Any) -> Any:
+        metadata_map = {}
+
+        async def _process(item: Any, key_path: str = "") -> Any:
             if isinstance(item, str) and item.startswith(self._config.TASK_FILES_DIR):
-                return await self._upload_to_s3(item) if await exists(item) else item
+                if await exists(item):
+                    meta = await self._upload_to_s3(item)
+                    metadata_map[key_path] = meta
+                    return meta.uri
+                return item
             if isinstance(item, dict):
-                return {k: await _process(v) for k, v in item.items()}
-            return [await _process(i) for i in item] if isinstance(item, list) else item
+                return {k: await _process(v, f"{key_path}.{k}" if key_path else k) for k, v in item.items()}
+            if isinstance(item, list):
+                return [await _process(v, f"{key_path}[{i}]") for i, v in enumerate(item)]
+            return item
 
-        return cast(dict[str, Any], await _process(result))
+        updated_result = cast(dict[str, Any], await _process(result))
+        return updated_result, metadata_map

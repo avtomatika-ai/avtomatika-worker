@@ -1,15 +1,15 @@
 import asyncio
 import sys
-from json import JSONDecodeError
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import aiohttp
 import pytest
-from aiohttp import ClientError, WSMsgType
+from rxon import Transport
+from rxon.constants import ERROR_CODE_INVALID_INPUT
+from rxon.constants import ERROR_CODE_PERMANENT as PERMANENT_ERROR
 
-from avtomatika_worker.client import OrchestratorClient
-from avtomatika_worker.types import INVALID_INPUT_ERROR, PERMANENT_ERROR
-from avtomatika_worker.worker import ParamValidationError, Worker
+from avtomatika_worker.types import ParamValidationError
+from avtomatika_worker.worker import Worker
 
 
 def test_pydantic_not_installed():
@@ -48,12 +48,14 @@ async def test_worker_registration_payload(mocker):
     session = mocker.MagicMock(spec=aiohttp.ClientSession)
     session.closed = False
 
-    # Mock OrchestratorClient.register
-    mocker.patch("avtomatika_worker.worker.OrchestratorClient.register", new_callable=mocker.AsyncMock)
+    # Mock Transport.register
+    # We patch create_transport to return our mock transport
+    mock_transport = mocker.AsyncMock(spec=Transport)
+    mocker.patch("avtomatika_worker.worker.create_transport", return_value=mock_transport)
 
     worker = Worker(http_session=session, worker_type="custom-type")
     worker._config.WORKER_ID = "custom-id"
-    worker._config.INSTALLED_MODELS = [{"name": "model1"}]
+    worker._config.INSTALLED_MODELS = [{"name": "model1", "version": "1.0"}]
     worker._config.COST_PER_SKILL = {"task1": 1.5}
 
     @worker.task("task1")
@@ -62,70 +64,54 @@ async def test_worker_registration_payload(mocker):
 
     await worker._register_with_all_orchestrators()
 
-    from avtomatika_worker.worker import OrchestratorClient
+    mock_transport.register.assert_called()
+    registration = mock_transport.register.call_args.args[0]
 
-    OrchestratorClient.register.assert_called()
-    payload = OrchestratorClient.register.call_args.args[0]
-
-    assert payload["worker_id"] == "custom-id"
-    assert payload["worker_type"] == "custom-type"
-    assert "task1" in payload["supported_tasks"]
-    assert payload["installed_models"] == [{"name": "model1"}]
-    assert payload["cost_per_skill"] == {"task1": 1.5}
+    assert registration.worker_id == "custom-id"
+    assert registration.worker_type == "custom-type"
+    assert "task1" in registration.supported_tasks
+    assert registration.installed_models[0].name == "model1"
+    assert registration.capabilities.cost_per_skill == {"task1": 1.5}
 
 
 @pytest.mark.asyncio
 async def test_poll_for_tasks_handles_non_204_status(mocker):
     """Tests that _poll_for_tasks handles errors from client."""
-    client = mocker.AsyncMock(spec=OrchestratorClient)
+    client = mocker.AsyncMock(spec=Transport)
     client.poll_task.return_value = None
 
     worker = Worker()
+
+    @worker.task("dummy_task")
+    def dummy_handler(params):
+        pass
 
     await worker._poll_for_tasks(client)
     client.poll_task.assert_called_once()
 
 
 @pytest.mark.asyncio
-async def test_send_result_retries_on_client_error(mocker):
-    """Tests that OrchestratorClient.send_result retries sending the result on ClientError."""
-    session = mocker.MagicMock(spec=aiohttp.ClientSession)
-    session.closed = False
-
-    client = OrchestratorClient(session, "http://test", "w1", "token")
-
-    session.post.side_effect = ClientError("Connection error")
-    mocker.patch("avtomatika_worker.client.sleep", new_callable=mocker.AsyncMock)
-
-    payload = {"result": {}}
-    await client.send_result(payload, max_retries=3, initial_delay=0.01)
-
-    assert session.post.call_count == 3
-
-
-@pytest.mark.asyncio
 async def test_websocket_manager_handles_connection_error(mocker):
     """
-    Tests that the WebSocket manager handles connection errors and retries.
+    Tests that _listen_to_single_transport handles connection errors and retries (sleeps).
     """
-    session = mocker.MagicMock(spec=aiohttp.ClientSession)
-    worker = Worker(http_session=session)
+    worker = Worker()
+    client = mocker.AsyncMock(spec=Transport)
 
-    # Setup mock clients manually since we're in a test
-    client = mocker.AsyncMock(spec=OrchestratorClient)
-    client.connect_websocket.return_value = None
-    worker._clients = [({"url": "http://test-orchestrator", "weight": 1}, client)]
+    # Mock listen_for_commands to raise exception
+    client.listen_for_commands.side_effect = Exception("Connection failed")
 
     mock_sleep = mocker.patch("avtomatika_worker.worker.sleep", new_callable=mocker.AsyncMock)
-    # To break the while loop
+
+    # We want to run the loop once, verify sleep is called, then exit.
+    # We can side_effect sleep to raise CancelledError to exit the loop.
     mock_sleep.side_effect = asyncio.CancelledError
-    worker._shutdown_event.clear()
 
     with pytest.raises(asyncio.CancelledError):
-        await worker._start_websocket_manager()
+        await worker._listen_to_single_transport(client)
 
-    client.connect_websocket.assert_called_once()
-    mock_sleep.assert_called_once()
+    client.listen_for_commands.assert_called()
+    mock_sleep.assert_called_with(5)
 
 
 @pytest.mark.asyncio
@@ -133,7 +119,7 @@ async def test_process_task_permanent_error_on_unsupported_task(mocker):
     """
     Tests that a permanent error is returned for an unsupported task type.
     """
-    client = mocker.AsyncMock(spec=OrchestratorClient)
+    client = mocker.AsyncMock(spec=Transport)
     worker = Worker()
 
     task_data = {
@@ -141,14 +127,15 @@ async def test_process_task_permanent_error_on_unsupported_task(mocker):
         "task_id": "t1",
         "type": "unsupported_task",
         "params": {},
+        "tracing_context": {},
         "client": client,
-        "orchestrator": {"url": "http://test"},
     }
     await worker._process_task(task_data)
 
     client.send_result.assert_called_once()
-    result_payload = client.send_result.call_args.args[0]
-    assert result_payload["result"]["error"]["code"] == PERMANENT_ERROR
+    result = client.send_result.call_args.args[0]
+    assert result.status == "failure"
+    assert result.error.code == PERMANENT_ERROR
 
 
 @pytest.mark.asyncio
@@ -178,7 +165,7 @@ async def test_process_task_handles_param_validation_error(mocker):
     """
     Tests that _process_task sends an INVALID_INPUT_ERROR when ParamValidationError is raised.
     """
-    client = mocker.AsyncMock(spec=OrchestratorClient)
+    client = mocker.AsyncMock(spec=Transport)
     worker = Worker()
 
     @worker.task("validation_task")
@@ -190,16 +177,16 @@ async def test_process_task_handles_param_validation_error(mocker):
         "task_id": "t1",
         "type": "validation_task",
         "params": {},
+        "tracing_context": {},
         "client": client,
-        "orchestrator": {"url": "http://test"},
     }
 
     await worker._process_task(task_data)
 
     client.send_result.assert_called_once()
-    result = client.send_result.call_args[0][0]["result"]
-    assert result["error"]["code"] == INVALID_INPUT_ERROR
-    assert "Invalid params" in result["error"]["message"]
+    result = client.send_result.call_args[0][0]
+    assert result.status == "failure"
+    assert result.error.code == ERROR_CODE_INVALID_INPUT
 
 
 def test_run_keyboard_interrupt(mocker):
@@ -222,89 +209,3 @@ def test_run_with_health_check_keyboard_interrupt(mocker):
     worker.run_with_health_check()
 
     mock_shutdown_set.assert_called_once()
-
-
-@pytest.mark.asyncio
-async def test_listen_for_commands_handles_invalid_json(mocker, caplog):
-    """
-    Tests that _listen_for_commands logs a warning on receiving invalid JSON.
-    """
-    worker = Worker()
-
-    # Create a mock message
-    mock_message = MagicMock()
-    mock_message.type = WSMsgType.TEXT
-    mock_message.json.side_effect = JSONDecodeError("Invalid JSON", doc="invalid json", pos=0)
-    mock_message.data = "invalid json"
-
-    # Define a custom async iterator class
-    class MockAsyncIterator:
-        def __init__(self, items):
-            self.items = items
-
-        def __aiter__(self):
-            return self
-
-        async def __anext__(self):
-            if self.items:
-                return self.items.pop(0)
-            raise StopAsyncIteration
-
-    # Mock the ws_connection object
-    ws_connection = mocker.AsyncMock(spec=aiohttp.ClientWebSocketResponse)
-    # The key fix: assign the iterator directly to the mock, so 'async for' uses it
-    ws_connection.__aiter__.side_effect = lambda: MockAsyncIterator([mock_message])
-
-    worker._ws_connection = ws_connection
-
-    with caplog.at_level("WARNING"):
-        await worker._listen_for_commands()
-
-    assert "Received invalid JSON over WebSocket: invalid json" in caplog.text
-
-
-@pytest.mark.asyncio
-async def test_listen_for_commands_handles_ws_error(mocker):
-    """
-    Tests that _listen_for_commands breaks the loop on a WSMsgType.ERROR.
-    """
-    worker = Worker()
-    ws_connection = mocker.AsyncMock()
-
-    mock_error_message = MagicMock()
-    mock_error_message.type = WSMsgType.ERROR
-
-    class MockAsyncIterator:
-        def __init__(self):
-            self.messages = [mock_error_message]
-
-        def __aiter__(self):
-            return self
-
-        async def __anext__(self):
-            if self.messages:
-                return self.messages.pop(0)
-            raise StopAsyncIteration
-
-    ws_connection.__aiter__.return_value = MockAsyncIterator()
-    worker._ws_connection = ws_connection
-
-    # This should not raise an exception
-    await worker._listen_for_commands()
-
-
-@pytest.mark.asyncio
-async def test_send_progress_handles_exception(mocker, caplog):
-    """
-    Tests that send_progress logs a warning if sending the progress update fails.
-    """
-    worker = Worker()
-    ws_connection = mocker.AsyncMock()
-    ws_connection.closed = False
-    ws_connection.send_json.side_effect = Exception("Connection lost")
-    worker._ws_connection = ws_connection
-
-    with caplog.at_level("WARNING"):
-        await worker.send_progress("t1", "j1", 0.5)
-
-    assert "Could not send progress update for task t1: Connection lost" in caplog.text

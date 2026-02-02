@@ -1,6 +1,7 @@
 import os
 
 import pytest
+from rxon import Transport
 
 from avtomatika_worker import Worker
 from avtomatika_worker.task_files import TaskFiles
@@ -9,9 +10,7 @@ from avtomatika_worker.task_files import TaskFiles
 @pytest.mark.asyncio
 async def test_task_files_injection(mocker):
     """Tests that TaskFiles object is correctly injected into the handler."""
-    from avtomatika_worker.client import OrchestratorClient
-
-    client = mocker.AsyncMock(spec=OrchestratorClient)
+    client = mocker.AsyncMock(spec=Transport)
 
     worker = Worker()
     worker._s3_manager.process_params = mocker.AsyncMock(return_value={})
@@ -33,8 +32,8 @@ async def test_task_files_injection(mocker):
         "task_id": "t1",
         "type": "di_task",
         "params": {},
+        "tracing_context": {},
         "client": client,
-        "orchestrator": {"url": "http://test"},
     }
 
     await worker._process_task(task_data)

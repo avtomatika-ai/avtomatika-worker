@@ -2,8 +2,8 @@ from dataclasses import dataclass
 
 import pytest
 from pydantic import BaseModel, Field
+from rxon import Transport
 
-from avtomatika_worker.client import OrchestratorClient
 from avtomatika_worker.worker import Worker
 
 
@@ -31,7 +31,7 @@ class PydanticModel(BaseModel):
 @pytest.mark.asyncio
 async def test_process_task_with_default_dict(mocker):
     """Tests that a handler with a standard `dict` annotation receives the raw dict."""
-    client = mocker.AsyncMock(spec=OrchestratorClient)
+    client = mocker.AsyncMock(spec=Transport)
     worker = Worker()
 
     received_params = None
@@ -47,8 +47,8 @@ async def test_process_task_with_default_dict(mocker):
         "task_id": "t1",
         "type": "dict_task",
         "params": {"key": "value"},
+        "tracing_context": {},
         "client": client,
-        "orchestrator": {"url": "http://test"},
     }
     await worker._process_task(task_data)
 
@@ -58,7 +58,7 @@ async def test_process_task_with_default_dict(mocker):
 @pytest.mark.asyncio
 async def test_process_task_with_simple_dataclass_success(mocker):
     """Tests successful instantiation of a simple dataclass."""
-    client = mocker.AsyncMock(spec=OrchestratorClient)
+    client = mocker.AsyncMock(spec=Transport)
     worker = Worker()
     received_params = None
 
@@ -73,8 +73,8 @@ async def test_process_task_with_simple_dataclass_success(mocker):
         "task_id": "t1",
         "type": "dataclass_task",
         "params": {"message": "hello", "count": 10},
+        "tracing_context": {},
         "client": client,
-        "orchestrator": {"url": "http://test"},
     }
     await worker._process_task(task_data)
 
@@ -86,7 +86,7 @@ async def test_process_task_with_simple_dataclass_success(mocker):
 @pytest.mark.asyncio
 async def test_process_task_with_dataclass_validation_failure(mocker):
     """Tests that a validation error in a dataclass's __post_init__ is caught."""
-    client = mocker.AsyncMock(spec=OrchestratorClient)
+    client = mocker.AsyncMock(spec=Transport)
     worker = Worker()
 
     @worker.task("dataclass_validation_task")
@@ -98,22 +98,22 @@ async def test_process_task_with_dataclass_validation_failure(mocker):
         "task_id": "t1",
         "type": "dataclass_validation_task",
         "params": {"name": "test", "age": 16},  # Invalid age
+        "tracing_context": {},
         "client": client,
-        "orchestrator": {"url": "http://test"},
     }
     await worker._process_task(task_data)
 
     # Check if failure result was sent
     client.send_result.assert_called_once()
     payload = client.send_result.call_args.args[0]
-    assert payload["result"]["status"] == "failure"
-    assert payload["result"]["error"]["code"] == "INVALID_INPUT_ERROR"
+    assert payload.status == "failure"
+    assert payload.error.code == "INVALID_INPUT_ERROR"
 
 
 @pytest.mark.asyncio
 async def test_process_task_with_pydantic_success(mocker):
     """Tests successful validation and instantiation of a Pydantic model."""
-    client = mocker.AsyncMock(spec=OrchestratorClient)
+    client = mocker.AsyncMock(spec=Transport)
     worker = Worker()
     received_params = None
 
@@ -128,8 +128,8 @@ async def test_process_task_with_pydantic_success(mocker):
         "task_id": "t1",
         "type": "pydantic_task",
         "params": {"name": "test", "value": 123.45},
+        "tracing_context": {},
         "client": client,
-        "orchestrator": {"url": "http://test"},
     }
     await worker._process_task(task_data)
 
@@ -141,7 +141,7 @@ async def test_process_task_with_pydantic_success(mocker):
 @pytest.mark.asyncio
 async def test_process_task_with_pydantic_validation_failure(mocker):
     """Tests that a Pydantic validation error is caught."""
-    client = mocker.AsyncMock(spec=OrchestratorClient)
+    client = mocker.AsyncMock(spec=Transport)
     worker = Worker()
 
     @worker.task("pydantic_validation_task")
@@ -153,13 +153,13 @@ async def test_process_task_with_pydantic_validation_failure(mocker):
         "task_id": "t1",
         "type": "pydantic_validation_task",
         "params": {"name": "test", "value": -5},  # Invalid value
+        "tracing_context": {},
         "client": client,
-        "orchestrator": {"url": "http://test"},
     }
     await worker._process_task(task_data)
 
     # Check if failure result was sent
     client.send_result.assert_called_once()
     payload = client.send_result.call_args.args[0]
-    assert payload["result"]["status"] == "failure"
-    assert "validation" in payload["result"]["error"]["message"].lower()
+    assert payload.status == "failure"
+    assert "validation" in payload.error.message.lower()

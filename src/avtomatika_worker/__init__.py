@@ -1,4 +1,4 @@
-"""A Python SDK for creating workers for the Py-Orchestrator."""
+"""A Python SDK for creating workers for the Avtomatika Orchestrator."""
 
 from importlib.metadata import PackageNotFoundError, version
 

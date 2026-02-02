@@ -1,16 +1,21 @@
-from .constants import (
+from typing import Any, Awaitable, Callable, Dict
+
+from rxon.constants import (
     ERROR_CODE_INVALID_INPUT as INVALID_INPUT_ERROR,
 )
-from .constants import (
+from rxon.constants import (
     ERROR_CODE_PERMANENT as PERMANENT_ERROR,
 )
-from .constants import (
+from rxon.constants import (
     ERROR_CODE_TRANSIENT as TRANSIENT_ERROR,
 )
 
+Middleware = Callable[[Dict[str, Any], Callable[[], Awaitable[Any]]], Awaitable[Any]]
+CapacityChecker = Callable[[str], bool]
+
 
 class ParamValidationError(Exception):
-    """Custom exception for parameter validation errors."""
+    pass
 
 
 __all__ = [

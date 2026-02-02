@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from obstore.store import S3Store
+from rxon.models import FileMetadata
 
 from avtomatika_worker.config import WorkerConfig
 from avtomatika_worker.s3 import S3Manager
@@ -29,6 +30,7 @@ def s3_manager():
 class MockGetResult:
     def __init__(self, data=b"test content"):
         self.data = data
+        self.meta = MagicMock(size=len(data), e_tag='"hash"')
 
     async def stream(self):
         yield self.data
@@ -74,7 +76,7 @@ async def test_process_s3_uri_file(s3_manager):
     """Tests that _process_s3_uri downloads a single file from S3."""
     task_id = "task-123"
 
-    with patch("avtomatika_worker.s3.obstore.get", new_callable=AsyncMock) as mock_get:
+    with patch("avtomatika_worker.s3.obstore_get", new_callable=AsyncMock) as mock_get:
         mock_get.return_value = MockGetResult()
 
         with patch.object(s3_manager, "_get_store", return_value=MagicMock()) as mock_get_store:
@@ -102,8 +104,8 @@ async def test_process_s3_uri_folder(s3_manager):
     # obstore.list is called as: async for obj in obstore.list(...)
     # So obstore.list itself should return the async iterator.
     with (
-        patch("avtomatika_worker.s3.obstore.list", return_value=MockAsyncIterator(mock_files)) as mock_list,
-        patch("avtomatika_worker.s3.obstore.get", new_callable=AsyncMock) as mock_get,
+        patch("avtomatika_worker.s3.obstore_list", return_value=MockAsyncIterator(mock_files)) as mock_list,
+        patch("avtomatika_worker.s3.obstore_get", new_callable=AsyncMock) as mock_get,
     ):
         mock_get.return_value = MockGetResult()
 
@@ -129,12 +131,14 @@ async def test_upload_to_s3_file(s3_manager):
 
     try:
         with (
-            patch("avtomatika_worker.s3.obstore.put", new_callable=AsyncMock) as mock_put,
+            patch("avtomatika_worker.s3.obstore_put", new_callable=AsyncMock) as mock_put,
             patch.object(s3_manager, "_get_store", return_value=MagicMock()),
         ):
-            s3_uri = await s3_manager._upload_to_s3(local_path)
+            mock_put.return_value = MagicMock(e_tag='"etag"')
+            meta = await s3_manager._upload_to_s3(local_path)
 
-        assert s3_uri == "s3://test-bucket/test-upload.txt"
+        assert meta.uri == "s3://test-bucket/test-upload.txt"
+        assert meta.etag == "etag"
         mock_put.assert_awaited_once()
         args = mock_put.await_args[0]
         assert args[1] == "test-upload.txt"  # key
@@ -157,19 +161,23 @@ async def test_upload_to_s3_folder(s3_manager):
         dirname = os.path.basename(tmpdir)
 
         with (
-            patch("avtomatika_worker.s3.obstore.put", new_callable=AsyncMock) as mock_put,
+            patch("avtomatika_worker.s3.obstore_put", new_callable=AsyncMock) as mock_put,
             patch.object(s3_manager, "_get_store", return_value=MagicMock()),
         ):
-            s3_uri = await s3_manager._upload_to_s3(tmpdir)
+            meta = await s3_manager._upload_to_s3(tmpdir)
 
-        assert s3_uri == f"s3://test-bucket/{dirname}/"
+        assert meta.uri == f"s3://test-bucket/{dirname}/"
         assert mock_put.await_count == 1
 
 
 @pytest.mark.asyncio
 async def test_process_params(s3_manager):
     """Tests that process_params correctly calls _process_s3_uri with task_id."""
-    with patch.object(s3_manager, "_process_s3_uri", side_effect=lambda uri, tid: f"/local/{tid}/{uri.split('/')[-1]}"):
+    with patch.object(
+        s3_manager,
+        "_process_s3_uri",
+        side_effect=lambda uri, tid, verify_meta=None: f"/local/{tid}/{uri.split('/')[-1]}",
+    ):
         params = {"file": "s3://test-bucket/test-file.txt", "other": "value"}
         processed_params = await s3_manager.process_params(params, "task-1")
 
@@ -185,11 +193,13 @@ async def test_process_result(s3_manager):
         f.write("test content")
 
     try:
-        with patch.object(s3_manager, "_upload_to_s3", return_value="s3://bucket/output.txt"):
+        mock_meta = FileMetadata(uri="s3://bucket/output.txt", size=10, etag="hash")
+        with patch.object(s3_manager, "_upload_to_s3", return_value=mock_meta):
             result = {"data": {"output_file": local_path}}
-            processed_result = await s3_manager.process_result(result)
+            processed_result, metadata = await s3_manager.process_result(result)
 
             assert processed_result["data"]["output_file"] == "s3://bucket/output.txt"
+            assert metadata["data.output_file"] == mock_meta
     finally:
         if os.path.exists(local_path):
             os.remove(local_path)

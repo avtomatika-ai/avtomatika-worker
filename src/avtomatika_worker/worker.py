@@ -1,26 +1,46 @@
-from asyncio import CancelledError, Event, Task, create_task, gather, run, sleep
+from asyncio import CancelledError, Event, Task, create_task, gather, run, sleep, to_thread
 from dataclasses import is_dataclass
-from inspect import Parameter, signature
-from json import JSONDecodeError
+from inspect import Parameter, iscoroutinefunction, signature
 from logging import getLogger
 from os.path import join
 from typing import Any, Callable
 
-from aiohttp import ClientSession, ClientWebSocketResponse, WSMsgType, web
-
-from .client import OrchestratorClient
-from .config import WorkerConfig
-from .constants import (
+from aiohttp import ClientSession, TCPConnector, web
+from rxon import Transport, create_transport
+from rxon.blob import calculate_config_hash
+from rxon.constants import (
     COMMAND_CANCEL_TASK,
+    ERROR_CODE_INTEGRITY_MISMATCH,
     ERROR_CODE_INVALID_INPUT,
     ERROR_CODE_PERMANENT,
     ERROR_CODE_TRANSIENT,
+    MSG_TYPE_PROGRESS,
     TASK_STATUS_CANCELLED,
     TASK_STATUS_FAILURE,
+    TASK_STATUS_SUCCESS,
 )
+from rxon.exceptions import RxonError
+from rxon.models import (
+    FileMetadata,
+    GPUInfo,
+    Heartbeat,
+    InstalledModel,
+    ProgressUpdatePayload,
+    Resources,
+    TaskError,
+    TaskPayload,
+    TaskResult,
+    WorkerCapabilities,
+    WorkerRegistration,
+)
+from rxon.security import create_client_ssl_context
+from rxon.utils import to_dict
+from rxon.validators import validate_identifier
+
+from .config import WorkerConfig
 from .s3 import S3Manager
 from .task_files import TaskFiles
-from .types import ParamValidationError
+from .types import CapacityChecker, Middleware, ParamValidationError
 
 try:
     from pydantic import BaseModel, ValidationError
@@ -37,7 +57,7 @@ class Worker:
     """The main class for creating and running a worker.
     Implements a hybrid interaction model with the Orchestrator:
     - PULL model for fetching tasks.
-    - WebSocket for real-time commands (cancellation) and sending progress.
+    - Transport layer for real-time commands (cancellation) and sending progress.
     """
 
     def __init__(
@@ -48,6 +68,8 @@ class Worker:
         http_session: ClientSession | None = None,
         skill_dependencies: dict[str, list[str]] | None = None,
         config: WorkerConfig | None = None,
+        capacity_checker: CapacityChecker | None = None,
+        clients: list[tuple[dict[str, Any], Transport]] | None = None,
     ):
         self._config = config or WorkerConfig()
         self._s3_manager = S3Manager(self._config)
@@ -58,6 +80,8 @@ class Worker:
         self._task_type_limits = task_type_limits or {}
         self._task_handlers: dict[str, dict[str, Any]] = {}
         self._skill_dependencies = skill_dependencies or {}
+        self._middlewares: list[Middleware] = []
+        self._capacity_checker = capacity_checker
 
         # Worker state
         self._current_load = 0
@@ -66,10 +90,10 @@ class Worker:
         self._active_tasks: dict[str, Task] = {}
         self._http_session = http_session
         self._session_is_managed_externally = http_session is not None
-        self._ws_connection: ClientWebSocketResponse | None = None
         self._shutdown_event = Event()
         self._registered_event = Event()
         self._debounce_task: Task | None = None
+        self._ssl_context = None
 
         # --- Weighted Round-Robin State ---
         self._total_orchestrator_weight = 0
@@ -77,23 +101,31 @@ class Worker:
             for o in self._config.ORCHESTRATORS:
                 o["current_weight"] = 0
                 self._total_orchestrator_weight += o.get("weight", 1)
-
-        self._clients: list[tuple[dict[str, Any], OrchestratorClient]] = []
-        if self._http_session:
+        self._clients = clients or []
+        if not self._clients and self._http_session:
             self._init_clients()
 
+    def add_middleware(self, middleware: Middleware) -> None:
+        """Adds a middleware to the execution chain."""
+        self._middlewares.append(middleware)
+
     def _init_clients(self):
-        """Initializes OrchestratorClient instances for each configured orchestrator."""
-        if not self._http_session:
-            return
+        """Initializes Transport instances for each configured orchestrator."""
+        # Even if we don't have an external session, we might create transports
+        # that will create their own sessions. But if we want to share one, we need it here.
+        session_to_use = self._http_session if self._session_is_managed_externally else None
+
         self._clients = [
             (
                 o,
-                OrchestratorClient(
-                    session=self._http_session,
-                    base_url=o["url"],
+                create_transport(
+                    url=o["url"],
                     worker_id=self._config.WORKER_ID,
                     token=o.get("token", self._config.WORKER_TOKEN),
+                    ssl_context=self._ssl_context,
+                    session=session_to_use,
+                    result_retries=self._config.RESULT_MAX_RETRIES,
+                    result_retry_delay=self._config.RESULT_RETRY_INITIAL_DELAY,
                 ),
             )
             for o in self._config.ORCHESTRATORS
@@ -114,6 +146,9 @@ class Worker:
 
     def task(self, name: str, task_type: str | None = None) -> Callable:
         """Decorator to register a function as a task handler."""
+        validate_identifier(name, "task name")
+        if task_type:
+            validate_identifier(task_type, "task type")
 
         def decorator(func: Callable) -> Callable:
             logger.info(f"Registering task: '{name}' (type: {task_type or 'N/A'})")
@@ -164,10 +199,13 @@ class Worker:
             if is_available:
                 supported_tasks.append(name)
 
+        if self._capacity_checker:
+            supported_tasks = [task for task in supported_tasks if self._capacity_checker(task)]
+
         status = "idle" if supported_tasks else "busy"
         return {"status": status, "supported_tasks": supported_tasks}
 
-    def _get_next_client(self) -> OrchestratorClient | None:
+    def _get_next_client(self) -> Transport | None:
         """
         Selects the next orchestrator client using a smooth weighted round-robin algorithm.
         """
@@ -206,27 +244,29 @@ class Worker:
         # Schedule the new debounced call.
         self._debounce_task = create_task(self._debounced_heartbeat_sender())
 
-    async def _poll_for_tasks(self, client: OrchestratorClient):
+    async def _poll_for_tasks(self, client: Transport):
         """Polls a specific Orchestrator for new tasks."""
-        task_data = await client.poll_task(timeout=self._config.TASK_POLL_TIMEOUT)
-        if task_data:
-            task_data["client"] = client
+        current_state = self._get_current_state()
+        if current_state["status"] == "busy":
+            return
 
-            self._current_load += 1
-            if (task_handler_info := self._task_handlers.get(task_data["type"])) and (
-                task_type_for_limit := task_handler_info.get("type")
-            ):
-                self._current_load_by_type[task_type_for_limit] += 1
-            self._schedule_heartbeat_debounce()
+        try:
+            task_data = await client.poll_task(timeout=self._config.TASK_POLL_TIMEOUT)
+            if task_data:
+                task_data_dict = to_dict(task_data)
+                task_data_dict["client"] = client
 
-            task = create_task(self._process_task(task_data))
-            self._active_tasks[task_data["task_id"]] = task
-        else:
-            # If no task but it was a 204 or error, the client already handled/logged it.
-            # We might want a short sleep here if it was an error, but client.poll_task
-            # doesn't distinguish between 204 and error currently.
-            # However, the previous logic only slept on status != 204.
-            pass
+                self._current_load += 1
+                if (task_handler_info := self._task_handlers.get(task_data.type)) and (
+                    task_type_for_limit := task_handler_info.get("type")
+                ):
+                    self._current_load_by_type[task_type_for_limit] += 1
+                self._schedule_heartbeat_debounce()
+
+                task = create_task(self._process_task(task_data_dict))
+                self._active_tasks[task_data.task_id] = task
+        except RxonError as e:
+            logger.error(f"Error polling tasks: {e}")
 
     async def _start_polling(self):
         """The main loop for polling tasks."""
@@ -253,7 +293,6 @@ class Worker:
     def _prepare_task_params(handler: Callable, params: dict[str, Any]) -> Any:
         """
         Inspects the handler's signature to validate and instantiate params.
-        Supports dict, dataclasses, and optional pydantic models.
         """
         sig = signature(handler)
         params_annotation = sig.parameters.get("params").annotation
@@ -271,11 +310,11 @@ class Worker:
         # Dataclass Instantiation
         if isinstance(params_annotation, type) and is_dataclass(params_annotation):
             try:
-                # Filter unknown fields to prevent TypeError on dataclass instantiation
+                # Filter unknown fields
                 known_fields = {f.name for f in params_annotation.__dataclass_fields__.values()}
                 filtered_params = {k: v for k, v in params.items() if k in known_fields}
 
-                # Explicitly check for missing required fields
+                # Check required fields
                 required_fields = [
                     f.name
                     for f in params_annotation.__dataclass_fields__.values()
@@ -287,7 +326,6 @@ class Worker:
 
                 return params_annotation(**filtered_params)
             except (TypeError, ValueError) as e:
-                # TypeError for missing/extra args, ValueError from __post_init__
                 raise ParamValidationError(str(e)) from e
 
         return params
@@ -296,8 +334,7 @@ class Worker:
         """Injects dependencies based on type hints."""
         deps = {}
         task_dir = join(self._config.TASK_FILES_DIR, task_id)
-        # Always create the object, but directory is lazy
-        task_files = TaskFiles(task_dir)
+        task_files = TaskFiles(task_dir, s3_manager=self._s3_manager)
 
         sig = signature(handler)
         for name, param in sig.parameters.items():
@@ -306,66 +343,150 @@ class Worker:
 
         return deps
 
-    async def _process_task(self, task_data: dict[str, Any]):
+    async def _process_task(self, task_data_raw: dict[str, Any]):
         """Executes the task logic."""
-        task_id, job_id, task_name = task_data["task_id"], task_data["job_id"], task_data["type"]
-        params, client = task_data.get("params", {}), task_data["client"]
+        client: Transport = task_data_raw.pop("client")
 
-        result: dict[str, Any] = {}
+        # Parse incoming task data using protocol model
+        if "params_metadata" in task_data_raw and task_data_raw["params_metadata"]:
+            task_data_raw["params_metadata"] = {
+                k: self._from_dict(FileMetadata, v) for k, v in task_data_raw["params_metadata"].items()
+            }
+
+        task_payload = self._from_dict(TaskPayload, task_data_raw)
+        task_id, job_id, task_name = task_payload.task_id, task_payload.job_id, task_payload.type
+        params = task_payload.params
+
         handler_data = self._task_handlers.get(task_name)
         task_type_for_limit = handler_data.get("type") if handler_data else None
 
-        result_sent = False  # Flag to track if result has been sent
+        result_obj: TaskResult | None = None
+
+        # Create a progress sender wrapper attached to this specific client
+        async def send_progress_wrapper(task_id_arg, job_id_arg, progress, message=""):
+            payload = ProgressUpdatePayload(
+                event=MSG_TYPE_PROGRESS, task_id=task_id_arg, job_id=job_id_arg, progress=progress, message=message
+            )
+            await client.send_progress(payload)
 
         try:
             if not handler_data:
                 message = f"Unsupported task: {task_name}"
                 logger.warning(message)
-                result = {"status": TASK_STATUS_FAILURE, "error": {"code": ERROR_CODE_PERMANENT, "message": message}}
-                payload = {"job_id": job_id, "task_id": task_id, "worker_id": self._config.WORKER_ID, "result": result}
-                await client.send_result(
-                    payload, self._config.RESULT_MAX_RETRIES, self._config.RESULT_RETRY_INITIAL_DELAY
+                error = TaskError(code=ERROR_CODE_PERMANENT, message=message)
+                result_obj = TaskResult(
+                    job_id=job_id,
+                    task_id=task_id,
+                    worker_id=self._config.WORKER_ID,
+                    status=TASK_STATUS_FAILURE,
+                    error=error,
                 )
-                result_sent = True  # Mark result as sent
-                return
+            else:
+                # Download files
+                params = await self._s3_manager.process_params(params, task_id, metadata=task_payload.params_metadata)
+                validated_params = self._prepare_task_params(handler_data["func"], params)
+                deps = self._prepare_dependencies(handler_data["func"], task_id)
 
-            params = await self._s3_manager.process_params(params, task_id)
-            validated_params = self._prepare_task_params(handler_data["func"], params)
-            deps = self._prepare_dependencies(handler_data["func"], task_id)
+                handler_kwargs = {
+                    "params": validated_params,
+                    "task_id": task_id,
+                    "job_id": job_id,
+                    "tracing_context": task_payload.tracing_context,
+                    "priority": task_data_raw.get("priority", 0),
+                    "send_progress": send_progress_wrapper,
+                    "add_to_hot_cache": self.add_to_hot_cache,
+                    "remove_from_hot_cache": self.remove_from_hot_cache,
+                    **deps,
+                }
 
-            result = await handler_data["func"](
-                validated_params,
-                task_id=task_id,
-                job_id=job_id,
-                priority=task_data.get("priority", 0),
-                send_progress=self.send_progress,
-                add_to_hot_cache=self.add_to_hot_cache,
-                remove_from_hot_cache=self.remove_from_hot_cache,
-                **deps,
-            )
-            result = await self._s3_manager.process_result(result)
+                middleware_context = {
+                    "task_id": task_id,
+                    "job_id": job_id,
+                    "task_name": task_name,
+                    "params": validated_params,
+                    "handler_kwargs": handler_kwargs,
+                }
+
+                async def _execution_logic():
+                    handler = handler_data["func"]
+                    final_kwargs = middleware_context["handler_kwargs"]
+
+                    if iscoroutinefunction(handler):
+                        return await handler(**final_kwargs)
+                    else:
+                        return await to_thread(handler, **final_kwargs)
+
+                handler_chain = _execution_logic
+                for middleware in reversed(self._middlewares):
+
+                    def make_wrapper(mw: Middleware, next_handler: Callable) -> Callable:
+                        async def wrapper():
+                            return await mw(middleware_context, next_handler)
+
+                        return wrapper
+
+                    handler_chain = make_wrapper(middleware, handler_chain)
+
+                handler_result = await handler_chain()
+
+                updated_data, metadata_map = await self._s3_manager.process_result(handler_result.get("data", {}))
+
+                result_obj = TaskResult(
+                    job_id=job_id,
+                    task_id=task_id,
+                    worker_id=self._config.WORKER_ID,
+                    status=handler_result.get("status", TASK_STATUS_SUCCESS),
+                    data=updated_data,
+                    error=TaskError(**handler_result["error"]) if "error" in handler_result else None,
+                    data_metadata=metadata_map if metadata_map else None,
+                )
+
         except ParamValidationError as e:
             logger.error(f"Task {task_id} failed validation: {e}")
-            result = {"status": TASK_STATUS_FAILURE, "error": {"code": ERROR_CODE_INVALID_INPUT, "message": str(e)}}
+            error = TaskError(code=ERROR_CODE_INVALID_INPUT, message=str(e))
+            result_obj = TaskResult(
+                job_id=job_id,
+                task_id=task_id,
+                worker_id=self._config.WORKER_ID,
+                status=TASK_STATUS_FAILURE,
+                error=error,
+            )
         except CancelledError:
             logger.info(f"Task {task_id} was cancelled.")
-            result = {"status": TASK_STATUS_CANCELLED}
-            # We must re-raise the exception to be handled by the outer gather
+            result_obj = TaskResult(
+                job_id=job_id, task_id=task_id, worker_id=self._config.WORKER_ID, status=TASK_STATUS_CANCELLED
+            )
             raise
+        except ValueError as e:
+            logger.error(f"Data integrity or validation error for task {task_id}: {e}")
+            error = TaskError(code=ERROR_CODE_INTEGRITY_MISMATCH, message=str(e))
+            result_obj = TaskResult(
+                job_id=job_id,
+                task_id=task_id,
+                worker_id=self._config.WORKER_ID,
+                status=TASK_STATUS_FAILURE,
+                error=error,
+            )
         except Exception as e:
             logger.exception(f"An unexpected error occurred while processing task {task_id}:")
-            result = {"status": TASK_STATUS_FAILURE, "error": {"code": ERROR_CODE_TRANSIENT, "message": str(e)}}
+            error = TaskError(code=ERROR_CODE_TRANSIENT, message=str(e))
+            result_obj = TaskResult(
+                job_id=job_id,
+                task_id=task_id,
+                worker_id=self._config.WORKER_ID,
+                status=TASK_STATUS_FAILURE,
+                error=error,
+            )
         finally:
-            # Cleanup task workspace
             await self._s3_manager.cleanup(task_id)
 
-            if not result_sent:  # Only send if not already sent
-                payload = {"job_id": job_id, "task_id": task_id, "worker_id": self._config.WORKER_ID, "result": result}
-                await client.send_result(
-                    payload, self._config.RESULT_MAX_RETRIES, self._config.RESULT_RETRY_INITIAL_DELAY
-                )
-            self._active_tasks.pop(task_id, None)
+            if result_obj:
+                try:
+                    await client.send_result(result_obj)
+                except RxonError as e:
+                    logger.error(f"Failed to send task result: {e}")
 
+            self._active_tasks.pop(task_id, None)
             self._current_load -= 1
             if task_type_for_limit:
                 self._current_load_by_type[task_type_for_limit] -= 1
@@ -383,62 +504,127 @@ class Worker:
             await self._send_heartbeats_to_all()
             await sleep(self._config.HEARTBEAT_INTERVAL)
 
+    @staticmethod
+    def _from_dict(cls: type, data: dict[str, Any]) -> Any:
+        """Safely instantiates a NamedTuple from a dict, ignoring unknown fields."""
+        if not data:
+            return None
+        fields = cls._fields
+        filtered_data = {k: v for k, v in data.items() if k in fields}
+        return cls(**filtered_data)
+
     async def _register_with_all_orchestrators(self):
         """Registers the worker with all orchestrators."""
         state = self._get_current_state()
-        payload = {
-            "worker_id": self._config.WORKER_ID,
-            "worker_type": self._config.WORKER_TYPE,
-            "supported_tasks": state["supported_tasks"],
-            "max_concurrent_tasks": self._config.MAX_CONCURRENT_TASKS,
-            "cost_per_skill": self._config.COST_PER_SKILL,
-            "installed_models": self._config.INSTALLED_MODELS,
-            "hostname": self._config.HOSTNAME,
-            "ip_address": self._config.IP_ADDRESS,
-            "resources": self._config.RESOURCES,
-        }
-        await gather(*[client.register(payload) for _, client in self._clients])
+
+        gpu_info = None
+        if self._config.RESOURCES.get("gpu_info"):
+            gpu_info = GPUInfo(**self._config.RESOURCES["gpu_info"])
+
+        resources = Resources(
+            max_concurrent_tasks=self._config.MAX_CONCURRENT_TASKS,
+            cpu_cores=self._config.RESOURCES["cpu_cores"],
+            gpu_info=gpu_info,
+        )
+
+        s3_hash = calculate_config_hash(
+            self._config.S3_ENDPOINT_URL,
+            self._config.S3_ACCESS_KEY,
+            self._config.S3_DEFAULT_BUCKET,
+        )
+
+        registration = WorkerRegistration(
+            worker_id=self._config.WORKER_ID,
+            worker_type=self._config.WORKER_TYPE,
+            supported_tasks=state["supported_tasks"],
+            resources=resources,
+            installed_software=self._config.INSTALLED_SOFTWARE,
+            installed_models=[InstalledModel(**m) for m in self._config.INSTALLED_MODELS],
+            capabilities=WorkerCapabilities(
+                hostname=self._config.HOSTNAME,
+                ip_address=self._config.IP_ADDRESS,
+                cost_per_skill=self._config.COST_PER_SKILL,
+                s3_config_hash=s3_hash,
+            ),
+        )
+
+        await gather(*[self._safe_register(client, registration) for _, client in self._clients])
+
+    async def _safe_register(self, client: Transport, registration: WorkerRegistration):
+        try:
+            await client.register(registration)
+        except RxonError as e:
+            logger.error(f"Registration failed for {client}: {e}")
 
     async def _send_heartbeats_to_all(self):
         """Sends heartbeat messages to all orchestrators."""
         state = self._get_current_state()
-        payload = {
-            "load": self._current_load,
-            "status": state["status"],
-            "supported_tasks": state["supported_tasks"],
-            "hot_cache": list(self._hot_cache),
-        }
 
+        hot_skills = None
         if self._skill_dependencies:
-            payload["skill_dependencies"] = self._skill_dependencies
             hot_skills = [
                 skill for skill, models in self._skill_dependencies.items() if set(models).issubset(self._hot_cache)
             ]
-            if hot_skills:
-                payload["hot_skills"] = hot_skills
 
-        await gather(*[client.send_heartbeat(payload) for _, client in self._clients])
+        heartbeat = Heartbeat(
+            worker_id=self._config.WORKER_ID,
+            status=state["status"],
+            load=float(self._current_load),
+            current_tasks=list(self._active_tasks.keys()),
+            supported_tasks=state["supported_tasks"],
+            hot_cache=list(self._hot_cache),
+            skill_dependencies=self._skill_dependencies or None,
+            hot_skills=hot_skills or None,
+        )
+
+        await gather(*[self._safe_heartbeat(client, heartbeat) for _, client in self._clients])
+
+    async def _safe_heartbeat(self, client: Transport, heartbeat: Heartbeat):
+        try:
+            await client.send_heartbeat(heartbeat)
+        except RxonError as e:
+            logger.warning(f"Heartbeat failed for {client}: {e}")
 
     async def main(self):
         """The main asynchronous function."""
         self._config.validate()
-        self._validate_task_types()  # Validate config now that all tasks are registered
+        self._validate_task_types()
         if not self._http_session:
-            self._http_session = ClientSession()
-            self._init_clients()
+            if self._config.TLS_CA_PATH or (self._config.TLS_CERT_PATH and self._config.TLS_KEY_PATH):
+                logger.info("Initializing SSL context for mTLS.")
+                self._ssl_context = create_client_ssl_context(
+                    ca_path=self._config.TLS_CA_PATH,
+                    cert_path=self._config.TLS_CERT_PATH,
+                    key_path=self._config.TLS_KEY_PATH,
+                )
+            connector = TCPConnector(ssl=self._ssl_context) if self._ssl_context else None
+            self._http_session = ClientSession(connector=connector)
+            if not self._clients:
+                self._init_clients()
+
+        # Connect transports
+        await gather(*[client.connect() for _, client in self._clients])
 
         comm_task = create_task(self._manage_orchestrator_communications())
+
+        token_rotation_task = None
+        if self._ssl_context:
+            token_rotation_task = create_task(self._manage_token_rotation())
 
         polling_task = create_task(self._start_polling())
         await self._shutdown_event.wait()
 
         for task in [comm_task, polling_task]:
             task.cancel()
+        if token_rotation_task:
+            token_rotation_task.cancel()
+
         if self._active_tasks:
             await gather(*self._active_tasks.values(), return_exceptions=True)
 
-        if self._ws_connection and not self._ws_connection.closed:
-            await self._ws_connection.close()
+        # Close transports
+        await gather(*[client.close() for _, client in self._clients])
+
         if self._http_session and not self._http_session.closed and not self._session_is_managed_externally:
             await self._http_session.close()
 
@@ -448,6 +634,26 @@ class Worker:
             run(self.main())
         except KeyboardInterrupt:
             self._shutdown_event.set()
+
+    async def _manage_token_rotation(self):
+        """Periodically refreshes auth tokens for all clients."""
+        await sleep(5)
+
+        while not self._shutdown_event.is_set():
+            min_expires_in = 3600
+
+            for _, client in self._clients:
+                try:
+                    token_resp = await client.refresh_token()
+                    if token_resp:
+                        self._config.WORKER_TOKEN = token_resp.access_token
+                        min_expires_in = min(min_expires_in, token_resp.expires_in)
+                except Exception as e:
+                    logger.error(f"Error in token rotation loop: {e}")
+
+            refresh_delay = max(60, min_expires_in * 0.8)
+            logger.debug(f"Next token refresh scheduled in {refresh_delay:.1f}s")
+            await sleep(refresh_delay)
 
     async def _run_health_check_server(self):
         app = web.Application()
@@ -473,54 +679,26 @@ class Worker:
             self._shutdown_event.set()
 
     async def _start_websocket_manager(self):
-        """Manages the WebSocket connection to the orchestrator."""
+        """Manages the command listeners."""
+        listeners = []
+        for _, client in self._clients:
+            listeners.append(create_task(self._listen_to_single_transport(client)))
+
+        await self._shutdown_event.wait()
+
+        for listener in listeners:
+            listener.cancel()
+
+    async def _listen_to_single_transport(self, client: Transport):
         while not self._shutdown_event.is_set():
-            # In multi-orchestrator mode, we currently only connect to the first one available
-            for _, client in self._clients:
-                try:
-                    ws = await client.connect_websocket()
-                    if ws:
-                        self._ws_connection = ws
-                        await self._listen_for_commands()
-                finally:
-                    self._ws_connection = None
-                    await sleep(5)  # Reconnection delay
-            if not self._clients:
-                await sleep(5)
-
-    async def _listen_for_commands(self):
-        """Listens for and processes commands from the orchestrator via WebSocket."""
-        if not self._ws_connection:
-            return
-
-        try:
-            async for msg in self._ws_connection:
-                if msg.type == WSMsgType.TEXT:
-                    try:
-                        command = msg.json()
-                        if command.get("type") == COMMAND_CANCEL_TASK:
-                            task_id = command.get("task_id")
-                            if task_id in self._active_tasks:
-                                self._active_tasks[task_id].cancel()
-                                logger.info(f"Cancelled task {task_id} by orchestrator command.")
-                    except JSONDecodeError:
-                        logger.warning(f"Received invalid JSON over WebSocket: {msg.data}")
-                elif msg.type == WSMsgType.ERROR:
-                    break
-        except Exception as e:
-            logger.error(f"Error in WebSocket listener: {e}")
-
-    async def send_progress(self, task_id: str, job_id: str, progress: float, message: str = ""):
-        """Sends a progress update to the orchestrator via WebSocket."""
-        if self._ws_connection and not self._ws_connection.closed:
             try:
-                payload = {
-                    "type": "progress_update",
-                    "task_id": task_id,
-                    "job_id": job_id,
-                    "progress": progress,
-                    "message": message,
-                }
-                await self._ws_connection.send_json(payload)
+                async for command in client.listen_for_commands():
+                    if command.command == COMMAND_CANCEL_TASK:
+                        task_id = command.task_id
+                        job_id = command.job_id
+                        if task_id in self._active_tasks:
+                            self._active_tasks[task_id].cancel()
+                            logger.info(f"Cancelled task {task_id} (Job: {job_id or 'N/A'}) by orchestrator command.")
             except Exception as e:
-                logger.warning(f"Could not send progress update for task {task_id}: {e}")
+                logger.error(f"Error in command listener: {e}")
+            await sleep(5)

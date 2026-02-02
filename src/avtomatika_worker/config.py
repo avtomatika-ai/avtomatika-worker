@@ -4,6 +4,8 @@ from os import getenv
 from typing import Any
 from uuid import uuid4
 
+from rxon.validators import validate_identifier
+
 
 class WorkerConfig:
     """A class for centralized management of worker configuration.
@@ -29,6 +31,9 @@ class WorkerConfig:
             "WORKER_INDIVIDUAL_TOKEN",
             getenv("WORKER_TOKEN", "your-secret-worker-token"),
         )
+        self.TLS_CA_PATH: str | None = getenv("TLS_CA_PATH")
+        self.TLS_CERT_PATH: str | None = getenv("TLS_CERT_PATH")
+        self.TLS_KEY_PATH: str | None = getenv("TLS_KEY_PATH")
 
         # --- Resources and performance ---
         self.COST_PER_SKILL: dict[str, float] = self._load_json_from_env("COST_PER_SKILL", default={})
@@ -73,6 +78,7 @@ class WorkerConfig:
 
     def validate(self) -> None:
         """Validates critical configuration parameters."""
+        validate_identifier(self.WORKER_ID, "WORKER_ID")
         if self.WORKER_TOKEN == "your-secret-worker-token":
             print("Warning: WORKER_TOKEN is set to the default value. Tasks might fail authentication.")
 

@@ -1,6 +1,10 @@
 # Avtomatika Worker SDK
 
-This is the official SDK for creating workers compatible with the **[Avtomatika Orchestrator](https://github.com/avtomatika-ai/avtomatika)**. It implements the **[RCA Protocol](https://github.com/avtomatika-ai/rca)**, handling all communication complexity (polling, heartbeats, S3 offloading) so you can focus on writing your business logic.
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/release/python-3110/)
+[![Code Style: Ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)](https://github.com/astral-sh/ruff)
+
+This is the official SDK for creating workers compatible with the **[Avtomatika Orchestrator](https://github.com/avtomatika-ai/avtomatika)**. It is built upon the **[Avtomatika Protocol](https://github.com/avtomatika-ai/rxon)** and implements the **[HLN Protocol](https://github.com/avtomatika-ai/hln)**, handling all communication complexity (polling, heartbeats, S3 offloading) so you can focus on writing your business logic.
 
 ## Installation
 
@@ -258,13 +262,25 @@ async def image_resizer(params: ResizeParams, **kwargs):
 
 ### 1. Task Handlers
 
-Each handler is an asynchronous function that accepts two arguments:
+Each handler is a function (either `async def` or `def`) that accepts two arguments:
 
 -   `params` (`dict`, `dataclass`, or `pydantic.BaseModel`): The parameters for the task, automatically validated and instantiated based on your type hint.
 -   `**kwargs`: Additional metadata about the task, including:
     -   `task_id` (`str`): The unique ID of the task itself.
     -   `job_id` (`str`): The ID of the parent `Job` to which the task belongs.
     -   `priority` (`int`): The execution priority of the task.
+
+**Synchronous Handlers:**
+If you define your handler as a standard synchronous function (`def handler(...)`), the SDK will automatically execute it in a separate thread using `asyncio.to_thread`. This ensures that CPU-intensive operations (like model inference) do not block the worker's main event loop, allowing heartbeats and other background tasks to continue running smoothly.
+
+```python
+@worker.task("cpu_heavy_task")
+def heavy_computation(params: dict, **kwargs):
+    # This will run in a thread, not blocking the loop
+    import time
+    time.sleep(10) 
+    return {"status": "success"}
+```
 
 ### 2. Concurrency Limiting
 
@@ -493,6 +509,48 @@ This only requires configuring environment variables for S3 access (see Full Con
 
 ### 7. WebSocket Support
 
+For real-time communication (e.g., immediate task cancellation), the worker supports WebSocket connections. This is enabled by setting `WORKER_ENABLE_WEBSOCKETS=true`. When connected, the orchestrator can push commands like `cancel_task` directly to the worker.
+
+### 8. Middleware
+
+The worker supports a middleware system, allowing you to wrap task executions with custom logic. This is particularly useful for resource management (e.g., acquiring GPU locks), logging, error handling, or **Dependency Injection**.
+
+Middleware functions wrap the execution of the task handler (and any subsequent middlewares). They receive a context dictionary and the next handler in the chain.
+
+The `context` dictionary contains:
+- `task_id`, `job_id`, `task_name`: Metadata.
+- `params`: The validated parameters object.
+- `handler_kwargs`: A dictionary of arguments that will be passed to the handler. **Middleware can modify this dictionary to inject dependencies.**
+
+**Example: GPU Resource Manager & Dependency Injection**
+
+```python
+async def gpu_lock_middleware(context: dict, next_handler: callable):
+    # Pre-processing: Acquire resource
+    print(f"Acquiring GPU for task {context['task_id']}...")
+    model_path = await resource_manager.allocate()
+    
+    # Inject the model path into the handler's arguments
+    context["handler_kwargs"]["model_path"] = model_path
+    
+    try:
+        # Execute the next handler in the chain
+        result = await next_handler()
+        return result
+    finally:
+        # Post-processing: Release resource
+        print(f"Releasing GPU for task {context['task_id']}...")
+        resource_manager.release()
+
+# Register the middleware
+worker.add_middleware(gpu_lock_middleware)
+
+# Handler now receives 'model_path' automatically
+@worker.task("generate")
+def generate(params, model_path, **kwargs):
+    print(f"Using model at: {model_path}")
+```
+
 ## Advanced Features
 
 ### Reporting Skill & Model Dependencies
@@ -549,8 +607,11 @@ The worker is fully configured via environment variables.
 | `WORKER_TYPE`                 | A string identifying the type of the worker.                                                            | `generic-cpu-worker`                   |
 | `WORKER_PORT`                 | The port for the worker's health check server.                                                          | `8083`                                 |
 | `WORKER_TOKEN`                | A common authentication token used to connect to orchestrators.                                         | `your-secret-worker-token`             |
-| `WORKER_INDIVIDUAL_TOKEN`     | An individual token for this worker, which overrides `WORKER_TOKEN` if set.                               | -                                      |
-| `ORCHESTRATOR_URL`            | The URL of a single orchestrator (used if `ORCHESTRATORS_CONFIG` is not set).                             | `http://localhost:8080`                |
+-   **`WORKER_INDIVIDUAL_TOKEN`**: An individual token for this worker, which overrides `WORKER_TOKEN` if set.
+-   **`TLS_CA_PATH`**: Path to the CA certificate to verify the orchestrator.
+-   **`TLS_CERT_PATH`**: Path to the client certificate for mTLS.
+-   **`TLS_KEY_PATH`**: Path to the client private key for mTLS.
+-   **`ORCHESTRATOR_URL`**: The address of the Avtomatika orchestrator.
 | `ORCHESTRATORS_CONFIG`        | A JSON string with a list of orchestrators for multi-orchestrator modes.                                | `[]`                                   |
 | `MULTI_ORCHESTRATOR_MODE`     | The mode for handling multiple orchestrators. Possible values: `FAILOVER`, `ROUND_ROBIN`.                  | `FAILOVER`                             |
 | `MAX_CONCURRENT_TASKS`        | The maximum number of tasks the worker can execute simultaneously.                                      | `10`                                   |
@@ -577,8 +638,9 @@ The worker is fully configured via environment variables.
 
 ## Development
 
-To install the necessary dependencies for running tests, use the following command:
+To install the necessary dependencies for running tests (assuming you are in the package root):
 
-```bash
-pip install .[test]
-```
+1.  Install the worker in editable mode with test dependencies:
+    ```bash
+    pip install -e .[test]
+    ```

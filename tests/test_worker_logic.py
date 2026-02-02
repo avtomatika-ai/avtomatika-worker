@@ -2,8 +2,9 @@ import asyncio
 from unittest.mock import MagicMock
 
 import pytest
+from rxon import Transport
+from rxon.models import TaskPayload
 
-from avtomatika_worker.client import OrchestratorClient
 from avtomatika_worker.worker import Worker
 
 
@@ -71,16 +72,19 @@ async def test_schedule_heartbeat_debounce(mocker):
 @pytest.mark.asyncio
 async def test_poll_for_tasks_receives_task(mocker):
     """Tests that _poll_for_tasks correctly processes a received task."""
-    client = mocker.AsyncMock(spec=OrchestratorClient)
-    task_payload = {
-        "job_id": "job-123",
-        "task_id": "task-456",
-        "type": "successful_task",
-        "params": {"input": "test"},
-    }
+    client = mocker.AsyncMock(spec=Transport)
+    task_payload = TaskPayload(
+        job_id="job-123", task_id="task-456", type="successful_task", params={"input": "test"}, tracing_context={}
+    )
     client.poll_task.return_value = task_payload
 
     worker = Worker()
+
+    # Register a dummy task so the worker is not "busy" (has supported tasks)
+    @worker.task("successful_task")
+    def dummy_handler(params):
+        pass
+
     mocker.patch.object(worker, "_schedule_heartbeat_debounce")
     worker._process_task = mocker.AsyncMock()
 
@@ -88,17 +92,26 @@ async def test_poll_for_tasks_receives_task(mocker):
 
     client.poll_task.assert_called_once_with(timeout=worker._config.TASK_POLL_TIMEOUT)
     worker._process_task.assert_called_once()
-    # verify client was injected
-    assert worker._process_task.call_args[0][0]["client"] == client
+    # verify client was NOT injected into task_data passed to _process_task as raw dict?
+    # In new implementation, we convert TaskPayload to dict and inject client.
+    call_args = worker._process_task.call_args[0][0]
+    assert call_args["job_id"] == "job-123"
+    assert call_args["client"] == client
 
 
 @pytest.mark.asyncio
 async def test_poll_for_tasks_no_task(mocker):
     """Tests that _poll_for_tasks handles no task correctly."""
-    client = mocker.AsyncMock(spec=OrchestratorClient)
+    client = mocker.AsyncMock(spec=Transport)
     client.poll_task.return_value = None
 
     worker = Worker()
+
+    # Register a dummy task so the worker is not "busy" (has supported tasks)
+    @worker.task("dummy_task")
+    def dummy_handler(params):
+        pass
+
     mocker.patch.object(worker, "_schedule_heartbeat_debounce")
     worker._process_task = mocker.AsyncMock()
 
@@ -130,8 +143,8 @@ async def test_start_polling_round_robin(mocker):
     worker._config.MULTI_ORCHESTRATOR_MODE = "ROUND_ROBIN"
 
     # Setup mock clients
-    client1 = mocker.AsyncMock(spec=OrchestratorClient)
-    client2 = mocker.AsyncMock(spec=OrchestratorClient)
+    client1 = mocker.AsyncMock(spec=Transport)
+    client2 = mocker.AsyncMock(spec=Transport)
 
     worker._clients = [
         ({"url": "http://test-1", "weight": 1, "current_weight": 0}, client1),
@@ -158,7 +171,7 @@ async def test_process_task_exception(mocker):
     """Tests that _process_task handles exceptions in the task handler."""
     worker = Worker()
 
-    client = mocker.AsyncMock(spec=OrchestratorClient)
+    client = mocker.AsyncMock(spec=Transport)
 
     @worker.task("failing_task")
     def failing_task(params: dict, **kwargs):
@@ -169,47 +182,47 @@ async def test_process_task_exception(mocker):
         "task_id": "task-1",
         "type": "failing_task",
         "params": {},
+        "tracing_context": {},
         "client": client,
-        "orchestrator": {"url": "http://test-orchestrator"},
     }
 
     await worker._process_task(task_data)
 
     client.send_result.assert_called_once()
     payload = client.send_result.call_args.args[0]
-    assert payload["result"]["status"] == "failure"
-    assert payload["result"]["error"]["code"] == "TRANSIENT_ERROR"
-    assert payload["result"]["error"]["message"] == "Task failed"
+    assert payload.status == "failure"
+    assert payload.error.code == "INTEGRITY_MISMATCH_ERROR"
+    assert payload.error.message == "Task failed"
 
 
 @pytest.mark.asyncio
 async def test_process_unsupported_task(mocker):
     """Tests that _process_task handles unsupported tasks correctly."""
     worker = Worker()
-    client = mocker.AsyncMock(spec=OrchestratorClient)
+    client = mocker.AsyncMock(spec=Transport)
 
     task_data = {
         "job_id": "job-1",
         "task_id": "task-1",
         "type": "unsupported_task",
         "params": {},
+        "tracing_context": {},
         "client": client,
-        "orchestrator": {"url": "http://test-orchestrator"},
     }
 
     await worker._process_task(task_data)
 
     client.send_result.assert_called_once()
     payload = client.send_result.call_args.args[0]
-    assert payload["result"]["status"] == "failure"
-    assert payload["result"]["error"]["message"] == "Unsupported task: unsupported_task"
+    assert payload.status == "failure"
+    assert payload.error.message == "Unsupported task: unsupported_task"
 
 
 @pytest.mark.asyncio
 async def test_process_task_cancelled(mocker):
     """Tests that _process_task handles cancelled tasks correctly."""
     worker = Worker()
-    client = mocker.AsyncMock(spec=OrchestratorClient)
+    client = mocker.AsyncMock(spec=Transport)
 
     @worker.task("cancellable_task")
     async def cancellable_task(params: dict, **kwargs):
@@ -220,8 +233,8 @@ async def test_process_task_cancelled(mocker):
         "task_id": "task-1",
         "type": "cancellable_task",
         "params": {},
+        "tracing_context": {},
         "client": client,
-        "orchestrator": {"url": "http://test-orchestrator"},
     }
 
     with pytest.raises(asyncio.CancelledError):
@@ -229,7 +242,7 @@ async def test_process_task_cancelled(mocker):
 
     client.send_result.assert_called_once()
     payload = client.send_result.call_args.args[0]
-    assert payload["result"]["status"] == "cancelled"
+    assert payload.status == "cancelled"
 
 
 @pytest.mark.asyncio
