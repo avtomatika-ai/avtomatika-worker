@@ -269,6 +269,7 @@ Each handler is a function (either `async def` or `def`) that accepts two argume
     -   `task_id` (`str`): The unique ID of the task itself.
     -   `job_id` (`str`): The ID of the parent `Job` to which the task belongs.
     -   `priority` (`int`): The execution priority of the task.
+    -   `send_progress` (`callable`): An async function `await send_progress(progress_float, message_string)` to report task execution progress (0.0 to 1.0) to the orchestrator.
 
 **Synchronous Handlers:**
 If you define your handler as a standard synchronous function (`def handler(...)`), the SDK will automatically execute it in a separate thread using `asyncio.to_thread`. This ensures that CPU-intensive operations (like model inference) do not block the worker's main event loop, allowing heartbeats and other background tasks to continue running smoothly.
@@ -371,7 +372,7 @@ return {
 
 #### Error Handling
 
-To control the orchestrator's fault tolerance mechanism, you can return standardized error types.
+To control the orchestrator's fault tolerance mechanism, you can return standardized error types. All error constants can be imported from `avtomatika_worker.typing`.
 
 -   **Transient Error (`TRANSIENT_ERROR`)**: For issues that might be resolved on a retry (e.g., a network failure).
     ```python
@@ -384,17 +385,10 @@ To control the orchestrator's fault tolerance mechanism, you can return standard
         }
     }
     ```
--   **Permanent Error (`PERMANENT_ERROR`)**: For unresolvable problems (e.g., an invalid file format).
-    ```python
-    from avtomatika_worker.typing import PERMANENT_ERROR
-    return {
-        "status": "failure",
-        "error": {
-            "code": PERMANENT_ERROR,
-            "message": "Corrupted input file"
-        }
-    }
-    ```
+-   **Permanent Error (`PERMANENT_ERROR`)**: For unresolvable problems (e.g., an invalid file format). Causes immediate quarantine.
+-   **Security Error (`SECURITY_ERROR`)**: For security violations. Causes immediate quarantine.
+-   **Dependency Error (`DEPENDENCY_ERROR`)**: For missing models or tools. Causes immediate quarantine.
+-   **Resource Exhausted (`RESOURCE_EXHAUSTED_ERROR`)**: When resources are temporarily unavailable. Treated as transient (retried).
 
 ### 4. Failover and Load Balancing
 
