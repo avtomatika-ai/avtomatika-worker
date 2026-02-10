@@ -1,7 +1,7 @@
 from contextlib import asynccontextmanager
 from json import dumps, loads
 from os.path import dirname, join
-from typing import TYPE_CHECKING, Any, AsyncGenerator
+from typing import TYPE_CHECKING, Any, AsyncGenerator, cast
 
 from aiofiles import open as aiopen
 from aiofiles.os import listdir, makedirs
@@ -20,7 +20,7 @@ class TaskFiles:
     within an isolated workspace for each task.
     """
 
-    def __init__(self, task_dir: str, s3_manager: "S3Manager" = None):
+    def __init__(self, task_dir: str, s3_manager: "S3Manager | None" = None):
         """
         Initializes TaskFiles with a specific task directory.
         The directory is not created until needed.
@@ -49,9 +49,9 @@ class TaskFiles:
         Synchronously returns the root directory for the task.
         Creates the directory on disk if it doesn't exist.
         """
-        import os
+        from os import makedirs as std_makedirs
 
-        os.makedirs(self._task_dir, exist_ok=True)
+        std_makedirs(self._task_dir, exist_ok=True)
         return self._task_dir
 
     def path_to_sync(self, filename: str) -> str:
@@ -78,10 +78,10 @@ class TaskFiles:
         if file_dir != self._task_dir:
             await makedirs(file_dir, exist_ok=True)
 
-        async with aiopen(path, mode) as f:
+        async with cast(Any, aiopen)(path, mode) as f:
             yield f
 
-    async def read(self, filename: str, mode: str = "r") -> str | bytes:
+    async def read(self, filename: str, mode: str = "r") -> str:
         """
         Asynchronously reads the entire content of a file.
 
@@ -90,7 +90,8 @@ class TaskFiles:
             mode: Mode to open the file in (defaults to 'r').
         """
         async with self.open(filename, mode) as f:
-            return await f.read()
+            content = await f.read()
+            return cast(str, content)
 
     async def write(self, filename: str, data: str | bytes, mode: str = "w") -> None:
         """

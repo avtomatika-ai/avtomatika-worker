@@ -2,11 +2,11 @@ import asyncio
 import sys
 from unittest.mock import patch
 
-import aiohttp
 import pytest
 from rxon import Transport
 from rxon.constants import ERROR_CODE_INVALID_INPUT
 from rxon.constants import ERROR_CODE_PERMANENT as PERMANENT_ERROR
+from rxon.testing import MockTransport
 
 from avtomatika_worker.types import ParamValidationError
 from avtomatika_worker.worker import Worker
@@ -27,33 +27,30 @@ def test_pydantic_not_installed():
 
 
 @pytest.mark.filterwarnings("ignore:coroutine 'AsyncMockMixin._execute_mock_call' was never awaited:RuntimeWarning")
-def test_task_decorator_warns_on_undefined_type(caplog, mocker):
+def test_task_decorator_warns_on_undefined_type(mocker):
     """
     Tests that the task decorator logs a warning if a task_type is not in task_type_limits.
     """
     mocker.patch("avtomatika_worker.worker.S3Manager")
+    logger_mock = mocker.patch("avtomatika_worker.worker.logger")
     worker = Worker(task_type_limits={"gpu": 1})
-    with caplog.at_level("WARNING"):
 
-        @worker.task("test_task", task_type="cpu")
-        def my_task(params: dict):
-            pass
+    @worker.task("test_task", task_type="cpu")
+    def my_task(params: dict):
+        pass
 
-    assert "Task 'test_task' has a type 'cpu' which is not defined in 'task_type_limits'" in caplog.text
+    logger_mock.warning.assert_called_with(
+        "Task 'test_task' has a type 'cpu' which is not defined in 'task_type_limits'. "
+        "No concurrency limit will be applied for this type."
+    )
 
 
 @pytest.mark.asyncio
 async def test_worker_registration_payload(mocker):
     """Tests that the registration payload contains all expected fields."""
-    session = mocker.MagicMock(spec=aiohttp.ClientSession)
-    session.closed = False
+    mock_transport = MockTransport(worker_id="test-worker")
 
-    # Mock Transport.register
-    # We patch create_transport to return our mock transport
-    mock_transport = mocker.AsyncMock(spec=Transport)
-    mocker.patch("avtomatika_worker.worker.create_transport", return_value=mock_transport)
-
-    worker = Worker(http_session=session, worker_type="custom-type")
+    worker = Worker(worker_type="custom-type", clients=[({"url": "http://test", "weight": 1}, mock_transport)])
     worker._config.WORKER_ID = "custom-id"
     worker._config.INSTALLED_MODELS = [{"name": "model1", "version": "1.0"}]
     worker._config.COST_PER_SKILL = {"task1": 1.5}
@@ -64,8 +61,8 @@ async def test_worker_registration_payload(mocker):
 
     await worker._register_with_all_orchestrators()
 
-    mock_transport.register.assert_called()
-    registration = mock_transport.register.call_args.args[0]
+    assert len(mock_transport.registered) == 1
+    registration = mock_transport.registered[0]
 
     assert registration.worker_id == "custom-id"
     assert registration.worker_type == "custom-type"

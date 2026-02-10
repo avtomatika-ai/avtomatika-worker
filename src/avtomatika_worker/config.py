@@ -1,10 +1,14 @@
 from _socket import gaierror, gethostbyname, gethostname
+from contextlib import suppress
 from json import JSONDecodeError, loads
+from logging import getLogger
 from os import getenv
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 from rxon.validators import validate_identifier
+
+logger = getLogger(__name__)
 
 
 class WorkerConfig:
@@ -18,10 +22,9 @@ class WorkerConfig:
         self.WORKER_TYPE: str = getenv("WORKER_TYPE", "generic-cpu-worker")
         self.WORKER_PORT: int = int(getenv("WORKER_PORT", "8083"))
         self.HOSTNAME: str = gethostname()
-        try:
-            self.IP_ADDRESS: str = gethostbyname(self.HOSTNAME)
-        except gaierror:
-            self.IP_ADDRESS: str = "127.0.0.1"
+        self.IP_ADDRESS: str = "127.0.0.1"
+        with suppress(gaierror):
+            self.IP_ADDRESS = gethostbyname(self.HOSTNAME)
 
         # --- Orchestrator settings ---
         self.ORCHESTRATORS: list[dict[str, Any]] = self._get_orchestrators_config()
@@ -73,6 +76,7 @@ class WorkerConfig:
             getenv("TASK_POLL_ERROR_DELAY", "5.0"),
         )
         self.IDLE_POLL_DELAY: float = float(getenv("IDLE_POLL_DELAY", "0.01"))
+        self.SHUTDOWN_TIMEOUT: float = float(getenv("WORKER_SHUTDOWN_TIMEOUT", "30.0"))
         self.ENABLE_WEBSOCKETS: bool = getenv("WORKER_ENABLE_WEBSOCKETS", "false").lower() == "true"
         self.MULTI_ORCHESTRATOR_MODE: str = getenv("MULTI_ORCHESTRATOR_MODE", "FAILOVER")
 
@@ -80,7 +84,7 @@ class WorkerConfig:
         """Validates critical configuration parameters."""
         validate_identifier(self.WORKER_ID, "WORKER_ID")
         if self.WORKER_TOKEN == "your-secret-worker-token":
-            print("Warning: WORKER_TOKEN is set to the default value. Tasks might fail authentication.")
+            logger.warning("WORKER_TOKEN is set to the default value. Tasks might fail authentication.")
 
         if not self.ORCHESTRATORS:
             raise ValueError("No orchestrators configured.")
@@ -98,16 +102,16 @@ class WorkerConfig:
             try:
                 orchestrators = loads(orchestrators_json)
                 if getenv("ORCHESTRATOR_URL"):
-                    print("Info: Both ORCHESTRATORS_CONFIG and ORCHESTRATOR_URL are set. Using ORCHESTRATORS_CONFIG.")
+                    logger.info("Both ORCHESTRATORS_CONFIG and ORCHESTRATOR_URL are set. Using ORCHESTRATORS_CONFIG.")
                 for o in orchestrators:
                     if "priority" not in o:
                         o["priority"] = 10
                     if "weight" not in o:
                         o["weight"] = 1
                 orchestrators.sort(key=lambda x: (x.get("priority", 10), x.get("url")))
-                return orchestrators
+                return cast(list[dict[str, Any]], orchestrators)
             except JSONDecodeError:
-                print("Warning: Could not decode JSON from ORCHESTRATORS_CONFIG. Falling back to default.")
+                logger.warning("Could not decode JSON from ORCHESTRATORS_CONFIG. Falling back to default.")
 
         orchestrator_url = getenv("ORCHESTRATOR_URL", "http://localhost:8080")
         return [{"url": orchestrator_url, "priority": 1, "weight": 1}]
@@ -132,8 +136,6 @@ class WorkerConfig:
             try:
                 return loads(value)
             except JSONDecodeError:
-                print(
-                    f"Warning: Could not decode JSON from environment variable {key}.",
-                )
+                logger.warning("Could not decode JSON from environment variable %s.", key)
                 return default
         return default

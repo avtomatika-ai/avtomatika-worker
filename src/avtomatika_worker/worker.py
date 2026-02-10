@@ -1,9 +1,22 @@
-from asyncio import CancelledError, Event, Task, create_task, gather, run, sleep, to_thread
+from asyncio import (
+    CancelledError,
+    Event,
+    Task,
+    create_task,
+    gather,
+    get_running_loop,
+    run,
+    sleep,
+    to_thread,
+    wait_for,
+)
+from contextlib import suppress
 from dataclasses import is_dataclass
 from inspect import Parameter, iscoroutinefunction, signature
 from logging import getLogger
 from os.path import join
-from typing import Any, Callable
+from signal import SIGINT, SIGTERM
+from typing import Any, Callable, cast
 
 from aiohttp import ClientSession, TCPConnector, web
 from rxon import Transport, create_transport
@@ -38,6 +51,7 @@ from rxon.utils import to_dict
 from rxon.validators import validate_identifier
 
 from .config import WorkerConfig
+from .logging import clear_context, set_context, setup_logging
 from .s3 import S3Manager
 from .task_files import TaskFiles
 from .types import CapacityChecker, Middleware, ParamValidationError
@@ -72,6 +86,7 @@ class Worker:
         clients: list[tuple[dict[str, Any], Transport]] | None = None,
     ):
         self._config = config or WorkerConfig()
+        setup_logging(worker_id=self._config.WORKER_ID)
         self._s3_manager = S3Manager(self._config)
         self._config.WORKER_TYPE = worker_type  # Allow overriding worker_type
         if max_concurrent_tasks is not None:
@@ -109,12 +124,9 @@ class Worker:
         """Adds a middleware to the execution chain."""
         self._middlewares.append(middleware)
 
-    def _init_clients(self):
+    def _init_clients(self) -> None:
         """Initializes Transport instances for each configured orchestrator."""
-        # Even if we don't have an external session, we might create transports
-        # that will create their own sessions. But if we want to share one, we need it here.
         session_to_use = self._http_session if self._session_is_managed_externally else None
-
         self._clients = [
             (
                 o,
@@ -131,7 +143,7 @@ class Worker:
             for o in self._config.ORCHESTRATORS
         ]
 
-    def _validate_task_types(self):
+    def _validate_task_types(self) -> None:
         """Checks for unused task type limits and warns the user."""
         registered_task_types = {
             handler_data["type"] for handler_data in self._task_handlers.values() if handler_data["type"]
@@ -164,12 +176,12 @@ class Worker:
 
         return decorator
 
-    def add_to_hot_cache(self, model_name: str):
+    def add_to_hot_cache(self, model_name: str) -> None:
         """Adds a model to the hot cache."""
         self._hot_cache.add(model_name)
         self._schedule_heartbeat_debounce()
 
-    def remove_from_hot_cache(self, model_name: str):
+    def remove_from_hot_cache(self, model_name: str) -> None:
         """Removes a model from the hot cache."""
         self._hot_cache.discard(model_name)
         self._schedule_heartbeat_debounce()
@@ -231,12 +243,12 @@ class Worker:
 
         return selected_client
 
-    async def _debounced_heartbeat_sender(self):
+    async def _debounced_heartbeat_sender(self) -> None:
         """Waits for the debounce delay then sends a heartbeat."""
         await sleep(self._config.HEARTBEAT_DEBOUNCE_DELAY)
         await self._send_heartbeats_to_all()
 
-    def _schedule_heartbeat_debounce(self):
+    def _schedule_heartbeat_debounce(self) -> None:
         """Schedules a debounced heartbeat, cancelling any pending one."""
         # Cancel the previously scheduled task, if it exists and is not done.
         if self._debounce_task and not self._debounce_task.done():
@@ -244,7 +256,7 @@ class Worker:
         # Schedule the new debounced call.
         self._debounce_task = create_task(self._debounced_heartbeat_sender())
 
-    async def _poll_for_tasks(self, client: Transport):
+    async def _poll_for_tasks(self, client: Transport) -> None:
         """Polls a specific Orchestrator for new tasks."""
         current_state = self._get_current_state()
         if current_state["status"] == "busy":
@@ -268,7 +280,7 @@ class Worker:
         except RxonError as e:
             logger.error(f"Error polling tasks: {e}")
 
-    async def _start_polling(self):
+    async def _start_polling(self) -> None:
         """The main loop for polling tasks."""
         await self._registered_event.wait()
 
@@ -295,7 +307,10 @@ class Worker:
         Inspects the handler's signature to validate and instantiate params.
         """
         sig = signature(handler)
-        params_annotation = sig.parameters.get("params").annotation
+        params_param = sig.parameters.get("params")
+        if params_param is None:
+            return params
+        params_annotation = params_param.annotation
 
         if params_annotation is sig.empty or params_annotation is dict:
             return params
@@ -303,7 +318,7 @@ class Worker:
         # Pydantic Model Validation
         if _PYDANTIC_INSTALLED and isinstance(params_annotation, type) and issubclass(params_annotation, BaseModel):
             try:
-                return params_annotation.model_validate(params)
+                return cast(Any, params_annotation).model_validate(params)
             except ValidationError as e:
                 raise ParamValidationError(str(e)) from e
 
@@ -343,7 +358,7 @@ class Worker:
 
         return deps
 
-    async def _process_task(self, task_data_raw: dict[str, Any]):
+    async def _process_task(self, task_data_raw: dict[str, Any]) -> None:
         """Executes the task logic."""
         client: Transport = task_data_raw.pop("client")
 
@@ -356,6 +371,8 @@ class Worker:
         task_payload = self._from_dict(TaskPayload, task_data_raw)
         task_id, job_id, task_name = task_payload.task_id, task_payload.job_id, task_payload.type
         params = task_payload.params
+
+        set_context(task_id=task_id, job_id=job_id)
 
         handler_data = self._task_handlers.get(task_name)
         task_type_for_limit = handler_data.get("type") if handler_data else None
@@ -407,7 +424,7 @@ class Worker:
                     "handler_kwargs": handler_kwargs,
                 }
 
-                async def _execution_logic():
+                async def _execution_logic() -> Any:
                     handler = handler_data["func"]
                     final_kwargs = middleware_context["handler_kwargs"]
 
@@ -486,13 +503,14 @@ class Worker:
                 except RxonError as e:
                     logger.error(f"Failed to send task result: {e}")
 
+            clear_context("task_id", "job_id")
             self._active_tasks.pop(task_id, None)
             self._current_load -= 1
             if task_type_for_limit:
                 self._current_load_by_type[task_type_for_limit] -= 1
             self._schedule_heartbeat_debounce()
 
-    async def _manage_orchestrator_communications(self):
+    async def _manage_orchestrator_communications(self) -> None:
         """Registers the worker and sends heartbeats."""
         await self._register_with_all_orchestrators()
 
@@ -509,11 +527,11 @@ class Worker:
         """Safely instantiates a NamedTuple from a dict, ignoring unknown fields."""
         if not data:
             return None
-        fields = cls._fields
+        fields = cast(Any, cls)._fields
         filtered_data = {k: v for k, v in data.items() if k in fields}
         return cls(**filtered_data)
 
-    async def _register_with_all_orchestrators(self):
+    async def _register_with_all_orchestrators(self) -> None:
         """Registers the worker with all orchestrators."""
         state = self._get_current_state()
 
@@ -550,13 +568,14 @@ class Worker:
 
         await gather(*[self._safe_register(client, registration) for _, client in self._clients])
 
-    async def _safe_register(self, client: Transport, registration: WorkerRegistration):
+    @staticmethod
+    async def _safe_register(client: Transport, registration: WorkerRegistration) -> None:
         try:
             await client.register(registration)
         except RxonError as e:
             logger.error(f"Registration failed for {client}: {e}")
 
-    async def _send_heartbeats_to_all(self):
+    async def _send_heartbeats_to_all(self) -> None:
         """Sends heartbeat messages to all orchestrators."""
         state = self._get_current_state()
 
@@ -579,16 +598,23 @@ class Worker:
 
         await gather(*[self._safe_heartbeat(client, heartbeat) for _, client in self._clients])
 
-    async def _safe_heartbeat(self, client: Transport, heartbeat: Heartbeat):
+    @staticmethod
+    async def _safe_heartbeat(client: Transport, heartbeat: Heartbeat) -> None:
         try:
             await client.send_heartbeat(heartbeat)
         except RxonError as e:
             logger.warning(f"Heartbeat failed for {client}: {e}")
 
-    async def main(self):
+    async def main(self) -> None:
         """The main asynchronous function."""
         self._config.validate()
         self._validate_task_types()
+
+        loop = get_running_loop()
+        for sig in (SIGINT, SIGTERM):
+            with suppress(NotImplementedError):
+                loop.add_signal_handler(sig, self._shutdown_event.set)
+
         if not self._http_session:
             if self._config.TLS_CA_PATH or (self._config.TLS_CERT_PATH and self._config.TLS_KEY_PATH):
                 logger.info("Initializing SSL context for mTLS.")
@@ -612,30 +638,45 @@ class Worker:
             token_rotation_task = create_task(self._manage_token_rotation())
 
         polling_task = create_task(self._start_polling())
-        await self._shutdown_event.wait()
 
-        for task in [comm_task, polling_task]:
-            task.cancel()
+        # Wait for shutdown signal
+        await self._shutdown_event.wait()
+        logger.info("Shutdown signal received. Starting graceful shutdown...")
+
+        # 1. Stop polling and communications
+        polling_task.cancel()
+        comm_task.cancel()
         if token_rotation_task:
             token_rotation_task.cancel()
 
+        # 2. Wait for active tasks with timeout (Drain Mode)
         if self._active_tasks:
-            await gather(*self._active_tasks.values(), return_exceptions=True)
+            timeout = self._config.SHUTDOWN_TIMEOUT
+            logger.info(f"Waiting for {len(self._active_tasks)} active tasks to complete (timeout: {timeout}s)...")
+            try:
+                await wait_for(
+                    gather(*self._active_tasks.values(), return_exceptions=True), timeout=self._config.SHUTDOWN_TIMEOUT
+                )
+            except TimeoutError:
+                logger.warning("Shutdown timeout reached. Some tasks may be interrupted.")
+            except CancelledError:
+                pass
 
+        # 3. Final cleanup
         # Close transports
         await gather(*[client.close() for _, client in self._clients])
 
         if self._http_session and not self._http_session.closed and not self._session_is_managed_externally:
             await self._http_session.close()
 
-    def run(self):
+    def run(self) -> None:
         """Runs the worker."""
         try:
             run(self.main())
         except KeyboardInterrupt:
             self._shutdown_event.set()
 
-    async def _manage_token_rotation(self):
+    async def _manage_token_rotation(self) -> None:
         """Periodically refreshes auth tokens for all clients."""
         await sleep(5)
 
@@ -655,7 +696,7 @@ class Worker:
             logger.debug(f"Next token refresh scheduled in {refresh_delay:.1f}s")
             await sleep(refresh_delay)
 
-    async def _run_health_check_server(self):
+    async def _run_health_check_server(self) -> None:
         app = web.Application()
 
         async def health_handler(_):
@@ -669,8 +710,8 @@ class Worker:
         await self._shutdown_event.wait()
         await runner.cleanup()
 
-    def run_with_health_check(self):
-        async def _main_wrapper():
+    def run_with_health_check(self) -> None:
+        async def _main_wrapper() -> None:
             await gather(self._run_health_check_server(), self.main())
 
         try:
@@ -678,7 +719,7 @@ class Worker:
         except KeyboardInterrupt:
             self._shutdown_event.set()
 
-    async def _start_websocket_manager(self):
+    async def _start_websocket_manager(self) -> None:
         """Manages the command listeners."""
         listeners = []
         for _, client in self._clients:
@@ -689,7 +730,7 @@ class Worker:
         for listener in listeners:
             listener.cancel()
 
-    async def _listen_to_single_transport(self, client: Transport):
+    async def _listen_to_single_transport(self, client: Transport) -> None:
         while not self._shutdown_event.is_set():
             try:
                 async for command in client.listen_for_commands():

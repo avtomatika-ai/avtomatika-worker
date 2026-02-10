@@ -85,34 +85,30 @@ def test_worker_config_custom_values():
         assert config.MULTI_ORCHESTRATOR_MODE == "ROUND_ROBIN"
 
 
-def test_get_orchestrators_config_invalid_json(capsys):
-    """Tests that _get_orchestrators_config handles invalid JSON correctly and prints a warning."""
-    with patch.dict(os.environ, {"ORCHESTRATORS_CONFIG": "invalid-json"}, clear=True):
+def test_get_orchestrators_config_invalid_json(caplog):
+    """Tests that _get_orchestrators_config handles invalid JSON correctly and logs a warning."""
+    with patch.dict(os.environ, {"ORCHESTRATORS_CONFIG": "invalid-json"}, clear=True), caplog.at_level("WARNING"):
         config = WorkerConfig()
         assert config.ORCHESTRATORS == [{"url": "http://localhost:8080", "priority": 1, "weight": 1}]
-        captured = capsys.readouterr()
-        assert "Warning: Could not decode JSON from ORCHESTRATORS_CONFIG" in captured.out
+        assert "Could not decode JSON from ORCHESTRATORS_CONFIG" in caplog.text
 
 
-def test_load_json_from_env_invalid_json(capsys):
-    """Tests that _load_json_from_env handles invalid JSON correctly and prints a warning."""
-    with patch.dict(os.environ, {"INSTALLED_SOFTWARE": "invalid-json"}, clear=True):
+def test_load_json_from_env_invalid_json(caplog):
+    """Tests that _load_json_from_env handles invalid JSON correctly and logs a warning."""
+    with patch.dict(os.environ, {"INSTALLED_SOFTWARE": "invalid-json"}, clear=True), caplog.at_level("WARNING"):
         config = WorkerConfig()
         assert config.INSTALLED_SOFTWARE == {"python": "3.9"}
-        captured = capsys.readouterr()
-        assert "Warning: Could not decode JSON from environment variable INSTALLED_SOFTWARE" in captured.out
+        assert "Could not decode JSON from environment variable INSTALLED_SOFTWARE" in caplog.text
 
 
-def test_orchestrator_config_precedence_message(capsys):
+def test_orchestrator_config_precedence_message(caplog):
     """
-    Tests that an info message is printed when both ORCHESTRATORS_CONFIG and ORCHESTRATOR_URL are set.
+    Tests that an info message is logged when both ORCHESTRATORS_CONFIG and ORCHESTRATOR_URL are set.
     """
     env_vars = {
         "ORCHESTRATORS_CONFIG": '[{"url": "http://config.com"}]',
         "ORCHESTRATOR_URL": "http://url.com",
     }
-    with patch.dict(os.environ, env_vars, clear=True):
+    with patch.dict(os.environ, env_vars, clear=True), caplog.at_level("INFO"):
         WorkerConfig()
-        captured = capsys.readouterr()
-        expected_message = "Info: Both ORCHESTRATORS_CONFIG and ORCHESTRATOR_URL are set. Using ORCHESTRATORS_CONFIG.\n"
-        assert captured.out == expected_message
+        assert "Both ORCHESTRATORS_CONFIG and ORCHESTRATOR_URL are set. Using ORCHESTRATORS_CONFIG." in caplog.text

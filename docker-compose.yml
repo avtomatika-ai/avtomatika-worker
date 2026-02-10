@@ -1,0 +1,11 @@
+services:
+  worker:
+    build: .
+    environment:
+      - WORKER_ID=docker-test-worker
+      - ORCHESTRATOR_URL=http://orchestrator:8080
+      - WORKER_TOKEN=your-secret-token
+      - LOG_FORMAT=json
+    restart: unless-stopped
+    # Replace with your worker script or command
+    # command: worker run --app my_module:worker

@@ -2,10 +2,11 @@
 
 from importlib.metadata import PackageNotFoundError, version
 
+from .logging import setup_logging
 from .task_files import TaskFiles
 from .worker import Worker
 
-__all__ = ["Worker", "TaskFiles"]
+__all__ = ["Worker", "TaskFiles", "setup_logging"]
 
 try:
     __version__ = version("avtomatika-worker")

@@ -1,3 +1,5 @@
+EN | [ES](https://github.com/avtomatika-ai/avtomatika-worker/blob/main/docs/es/DEVELOPMENT.md) | [RU](https://github.com/avtomatika-ai/avtomatika-worker/blob/main/docs/ru/DEVELOPMENT.md)
+
 # Worker Development Guide
 
 This document describes how to create a custom Worker compatible with the Orchestrator using `avtomatika-worker`.
@@ -195,14 +197,17 @@ This hybrid model ensures both fast cancellation via WebSocket and a reliable fa
 
 ### Step 5: Running
 
-Simply run your Python file:
+You can run the worker using the built-in `worker` CLI command. This is the recommended way for both development and production.
+
 ```bash
-python my_worker.py
+# Standard run
+worker run --app my_worker:worker
+
+# Development mode (auto-restarts on code changes)
+worker run --app my_worker:worker --reload
 ```
 
-The worker will automatically connect to the Orchestrator, register itself, establish a WebSocket connection (if enabled), and start polling for new tasks.
-
----
+The `--reload` feature requires the `watchdog` package (install via `pip install avtomatika-worker[dev]`). It monitors the current directory for changes in `.py` files and restarts the worker process automatically.
 
 ### Step 6 (Optional): Working with Large Files via "Payload Offloading"
 
