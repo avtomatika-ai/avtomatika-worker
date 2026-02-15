@@ -11,7 +11,7 @@ from avtomatika_worker.task_files import TaskFiles
 @pytest.mark.asyncio
 async def test_task_files_json_operations():
     with tempfile.TemporaryDirectory() as tmpdir:
-        tf = TaskFiles(tmpdir)
+        tf = TaskFiles(tmpdir, job_id="job1", task_id="task1")
         data = {"hello": "world", "nested": [1, 2, 3]}
 
         # Test write_json
@@ -31,7 +31,7 @@ async def test_task_files_s3_proxy_methods():
         mock_s3._upload_to_s3 = AsyncMock(return_value=mock_meta)
         mock_s3._process_s3_uri = AsyncMock(return_value="/local/path")
 
-        tf = TaskFiles(tmpdir, s3_manager=mock_s3)
+        tf = TaskFiles(tmpdir, job_id="job1", task_id="task1", s3_manager=mock_s3)
 
         # Test upload_file
         await tf.write("hello.txt", "content")
@@ -52,9 +52,9 @@ async def test_task_files_upload_dir():
         mock_meta = FileMetadata(uri="s3://test/dir/", size=1000)
         mock_s3._upload_to_s3 = AsyncMock(return_value=mock_meta)
 
-        tf = TaskFiles(tmpdir, s3_manager=mock_s3)
+        tf = TaskFiles(tmpdir, job_id="job1", task_id="task1", s3_manager=mock_s3)
 
         meta = await tf.upload_dir()
         assert meta == mock_meta
-        # Verify it passed the task root directory
-        mock_s3._upload_to_s3.assert_called_with(tmpdir)
+        # Verify it passed the task root directory and prefix
+        mock_s3._upload_to_s3.assert_called_with(tmpdir, s3_prefix="job1")

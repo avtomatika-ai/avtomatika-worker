@@ -15,6 +15,7 @@ pip install avtomatika-worker
 ```
 
 Дополнительно:
+- `pip install "avtomatika-worker[s3]"` — для S3-оффлоадинга (требует `obstore`).
 - `pip install "avtomatika-worker[pydantic]"` — для валидации параметров через Pydantic.
 - `pip install "avtomatika-worker[dev]"` — для функций разработки, таких как `--reload`.
 
@@ -34,24 +35,25 @@ async def resize_image(params: dict, **kwargs):
     return {"status": "success", "data": {"result": "ok"}}
 ```
 
-Запустите его с помощью встроенной команды `worker`:
+### Вариант 2: Динамическая загрузка скиллов (без изменения кода)
 
-```bash
-export ORCHESTRATOR_URL="http://localhost:8080"
-export WORKER_TOKEN="your-secret-token"
-
-# Обычный запуск
-worker run --app app.main:worker
-
-# Режим разработки с автоперезагрузкой при изменении кода
-worker run --app app.main:worker --reload
-```
-
-### Вариант 2: Программный запуск
+Просто поместите ваши обработчики задач в папку `skills/` (например, `skills/my_tasks.py`):
 
 ```python
-if __name__ == "__main__":
-    worker.run_with_health_check()
+from avtomatika_worker import SkillBlueprint
+
+bp = SkillBlueprint()
+
+@bp.task("generate_preview")
+async def generate_preview(params: dict, **kwargs):
+    return {"status": "success"}
+```
+
+Запустите воркер, и он автоматически подхватит все задачи из этой папки. Вы можете указать путь через переменную окружения `WORKER_SKILLS_DIR` или параметр конструктора `Worker(skills_dir=...)` (значение из конструктора имеет приоритет, если указаны оба варианта):
+
+```bash
+# По умолчанию поиск идет в папке ./skills
+worker run --app app.main:worker
 ```
 
 ## Ключевые возможности
@@ -70,7 +72,7 @@ SDK поддерживает текстовый и JSON форматы лого�
 
 ### 3. Работа с файлами и S3
 - **TaskFiles**: Асинхронный помощник для работы в изолированной директории задачи.
-- **S3 Payload Offloading**: Автоматическое скачивание и загрузка тяжелых файлов, если в параметрах указаны `s3://` ссылки.
+- **S3 Payload Offloading**: Автоматическое скачивание и загрузка тяжелых файлов, если в параметрах указаны `s3://` ссылки (требует `[s3]` экстру).
 
 ## Справочник по конфигурации
 
@@ -83,6 +85,7 @@ SDK поддерживает текстовый и JSON форматы лого�
 | `WORKER_SHUTDOWN_TIMEOUT`| Макс. время ожидания задач при выключении (сек). | `30.0` |
 | `WORKER_ENABLE_WEBSOCKETS`| Включить WebSocket для команд (напр. отмена). | `false` |
 | `TASK_FILES_DIR` | Локальная директория для временных данных S3. | `/tmp/payloads` |
+| `WORKER_SKILLS_DIR` | Папка для динамической загрузки скиллов. | `skills` |
 
 ## Документация
 

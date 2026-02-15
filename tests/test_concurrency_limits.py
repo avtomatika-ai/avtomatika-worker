@@ -34,7 +34,7 @@ def test_get_current_state_initial():
 
     state = worker._get_current_state()
     assert state["status"] == "idle"
-    assert set(state["supported_tasks"]) == {
+    assert set(state["supported_skills"]) == {
         "process_video",
         "process_audio",
         "unlimited_task",
@@ -55,7 +55,7 @@ def test_get_current_state_global_limit_reached():
 
     state = worker._get_current_state()
     assert state["status"] == "busy"
-    assert state["supported_tasks"] == []
+    assert state["supported_skills"] == []
 
 
 def test_get_current_state_type_limit_reached():
@@ -72,7 +72,7 @@ def test_get_current_state_type_limit_reached():
 
     state = worker._get_current_state()
     assert state["status"] == "idle"
-    assert set(state["supported_tasks"]) == {"process_audio"}
+    assert set(state["supported_skills"]) == {"process_audio"}
 
 
 def test_get_current_state_all_type_limits_reached():
@@ -91,4 +91,4 @@ def test_get_current_state_all_type_limits_reached():
 
     state = worker._get_current_state()
     assert state["status"] == "busy"
-    assert state["supported_tasks"] == []
+    assert state["supported_skills"] == []

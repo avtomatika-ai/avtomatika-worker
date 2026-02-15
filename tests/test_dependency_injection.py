@@ -52,7 +52,7 @@ async def test_task_files_injection(mocker):
 async def test_task_files_read_write(tmp_path):
     """Tests high-level read/write methods of TaskFiles."""
     target_dir = tmp_path / "task_dir"
-    tf = TaskFiles(str(target_dir))
+    tf = TaskFiles(str(target_dir), job_id="job1", task_id="task1")
 
     filename = "hello.txt"
     content = "Hello, World!"
@@ -68,7 +68,7 @@ async def test_task_files_read_write(tmp_path):
 async def test_task_files_list_exists(tmp_path):
     """Tests list() and exists() methods."""
     target_dir = tmp_path / "task_dir"
-    tf = TaskFiles(str(target_dir))
+    tf = TaskFiles(str(target_dir), job_id="job1", task_id="task1")
 
     await tf.write("file1.txt", "data1")
     await tf.write("file2.txt", "data2")
@@ -84,7 +84,7 @@ async def test_task_files_list_exists(tmp_path):
 async def test_task_files_open_context(tmp_path):
     """Tests the async with files.open(...) context manager."""
     target_dir = tmp_path / "task_dir"
-    tf = TaskFiles(str(target_dir))
+    tf = TaskFiles(str(target_dir), job_id="job1", task_id="task1")
 
     async with tf.open("stream.txt", mode="w") as f:
         await f.write("line1\n")
@@ -98,7 +98,7 @@ async def test_task_files_open_context(tmp_path):
 async def test_task_files_nested_creation(tmp_path):
     """Tests that nested directories are created automatically."""
     target_dir = tmp_path / "task_dir"
-    tf = TaskFiles(str(target_dir))
+    tf = TaskFiles(str(target_dir), job_id="job1", task_id="task1")
 
     # Path with subdirectories
     nested_path = "sub/dir/test.txt"
@@ -112,7 +112,7 @@ async def test_task_files_nested_creation(tmp_path):
 async def test_task_files_path_to(tmp_path):
     """Tests path_to method."""
     target_dir = tmp_path / "task_dir"
-    tf = TaskFiles(str(target_dir))
+    tf = TaskFiles(str(target_dir), job_id="job1", task_id="task1")
 
     file_path = await tf.path_to("output.txt")
 

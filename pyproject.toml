@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "avtomatika-worker"
-version = "1.0b6"
+version = "1.0b7"
 description = "Worker SDK for the Avtomatika orchestrator."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -21,10 +21,9 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "rxon==1.0b2",
+    "rxon==1.0b3",
     "aiohttp~=3.13.2",
     "python-json-logger~=4.0.0",
-    "obstore>=0.1",
     "aiofiles~=25.1.0",
 ]
 
@@ -32,15 +31,17 @@ dependencies = [
 worker = "avtomatika_worker.__main__:main"
 
 [project.optional-dependencies]
+s3 = ["obstore~=0.8"]
 test = [
     "pytest",
     "pytest-asyncio",
     "aioresponses",
     "pytest-mock",
-    "pydantic",
+    "pydantic~=2.12",
     "types-aiofiles",
+    "obstore~=0.8",
 ]
-pydantic = ["pydantic"]
+pydantic = ["pydantic~=2.12"]
 dev = ["watchdog"]
 
 [project.urls]

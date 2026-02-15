@@ -1,4 +1,4 @@
-from typing import Any, Awaitable, Callable, Dict
+from typing import Any, Awaitable, Callable
 
 from rxon.constants import (
     ERROR_CODE_DEPENDENCY as DEPENDENCY_ERROR,
@@ -25,7 +25,7 @@ from rxon.constants import (
     ERROR_CODE_TRANSIENT as TRANSIENT_ERROR,
 )
 
-Middleware = Callable[[Dict[str, Any], Callable[[], Awaitable[Any]]], Awaitable[Any]]
+Middleware = Callable[[dict[str, Any], Callable[[], Awaitable[Any]]], Awaitable[Any]]
 CapacityChecker = Callable[[str], bool]
 
 

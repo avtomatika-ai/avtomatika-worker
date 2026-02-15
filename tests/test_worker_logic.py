@@ -244,37 +244,33 @@ async def test_process_task_cancelled(mocker):
     payload = client.send_result.call_args.args[0]
     assert payload.status == "cancelled"
 
+    @pytest.mark.asyncio
+    async def test_run_with_health_check(mocker):
+        """
+        Tests that run_with_health_check runs the health check server and the main worker loop.
+        """
+        worker = Worker()
+        mock_run = mocker.patch("avtomatika_worker.worker.run")
+        worker._run_health_check_server = mocker.AsyncMock()
+        worker.main = mocker.AsyncMock()
 
-@pytest.mark.asyncio
-async def test_run_with_health_check(mocker):
-    """
-    Tests that run_with_health_check runs the health check server and the main worker loop.
-    """
-    worker = Worker()
-    mock_run = mocker.patch("avtomatika_worker.worker.run")
-    mock_gather = mocker.patch("avtomatika_worker.worker.gather", new_callable=mocker.AsyncMock)
-    worker._run_health_check_server = mocker.AsyncMock()
-    worker.main = mocker.AsyncMock()
+        # Create a separate async function to call the method
+        async def run_test():
+            worker.run_with_health_check()
 
-    # Create a separate async function to call the method
-    async def run_test():
-        worker.run_with_health_check()
+        # Run the test function
+        await run_test()
 
-    # Run the test function
-    await run_test()
+        # Check that asyncio.run was called
+        mock_run.assert_called_once()
 
-    # Check that asyncio.run was called
-    mock_run.assert_called_once()
+        # To check the inner calls, we need to get the coroutine passed to asyncio.run
+        wrapper_coro = mock_run.call_args[0][0]
+        await wrapper_coro
 
-    # To check the inner calls, we need to get the coroutine passed to asyncio.run
-    # This is a bit tricky, but we can inspect the call arguments
-    wrapper_coro = mock_run.call_args[0][0]
-    await wrapper_coro
-
-    # Now check that gather was called with the correct coroutines
-    mock_gather.assert_called_once()
-    worker._run_health_check_server.assert_called_once()
-    worker.main.assert_called_once()
+        # Verify that both server and main were called
+        worker._run_health_check_server.assert_called_once()
+        worker.main.assert_called_once()
 
 
 @pytest.mark.asyncio

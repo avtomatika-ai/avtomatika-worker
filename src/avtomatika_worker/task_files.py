@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from contextlib import asynccontextmanager
 from json import dumps, loads
 from os.path import dirname, join
@@ -20,12 +22,13 @@ class TaskFiles:
     within an isolated workspace for each task.
     """
 
-    def __init__(self, task_dir: str, s3_manager: "S3Manager | None" = None):
+    def __init__(self, task_dir: str, job_id: str, task_id: str, s3_manager: S3Manager | None = None):
         """
-        Initializes TaskFiles with a specific task directory.
-        The directory is not created until needed.
+        Initializes TaskFiles with specific directory and identifiers.
         """
         self._task_dir = task_dir
+        self._job_id = job_id
+        self._task_id = task_id
         self._s3_manager = s3_manager
 
     async def get_root(self) -> str:
@@ -105,7 +108,7 @@ class TaskFiles:
         async with self.open(filename, mode) as f:
             await f.write(data)
 
-    async def write_json(self, filename: str, data: Any) -> "FileMetadata | None":
+    async def write_json(self, filename: str, data: Any) -> FileMetadata | None:
         """Writes data as JSON and optionally uploads to S3 if manager is available."""
         content = dumps(data, indent=2)
         await self.write(filename, content)
@@ -118,25 +121,25 @@ class TaskFiles:
         content = await self.read(filename)
         return loads(content)
 
-    async def upload_file(self, filename: str) -> "FileMetadata":
+    async def upload_file(self, filename: str) -> FileMetadata:
         """Uploads a specific file to S3 and returns its metadata."""
         if not self._s3_manager:
             raise RuntimeError("S3Manager not configured for this TaskFiles instance.")
         path = await self.path_to(filename)
-        return await self._s3_manager._upload_to_s3(path)
+        return await self._s3_manager._upload_to_s3(path, s3_prefix=self._job_id)
 
-    async def upload_dir(self, dirname: str = "") -> "FileMetadata":
+    async def upload_dir(self, dirname: str = "") -> FileMetadata:
         """Uploads the entire task directory or a subdirectory to S3."""
         if not self._s3_manager:
             raise RuntimeError("S3Manager not configured for this TaskFiles instance.")
         path = join(self._task_dir, dirname) if dirname else self._task_dir
-        return await self._s3_manager._upload_to_s3(path)
+        return await self._s3_manager._upload_to_s3(path, s3_prefix=self._job_id)
 
-    async def download_file(self, uri: str, filename: str, verify_meta: "FileMetadata" = None) -> str:
+    async def download_file(self, uri: str, filename: str, verify_meta: FileMetadata | None = None) -> str:
         """Downloads a file from S3 to the task directory with optional integrity check."""
         if not self._s3_manager:
             raise RuntimeError("S3Manager not configured for this TaskFiles instance.")
-        return await self._s3_manager._process_s3_uri(uri, self._task_dir.split("/")[-1], verify_meta=verify_meta)
+        return await self._s3_manager._process_s3_uri(uri, self._task_id, verify_meta=verify_meta)
 
     async def list(self) -> list[str]:
         """

@@ -1,8 +1,10 @@
+from __future__ import annotations
+
 from _socket import gaierror, gethostbyname, gethostname
 from contextlib import suppress
 from json import JSONDecodeError, loads
 from logging import getLogger
-from os import getenv
+from os import environ, getenv
 from typing import Any, cast
 from uuid import uuid4
 
@@ -49,7 +51,7 @@ class WorkerConfig:
         # --- Installed software and models (read as JSON strings) ---
         self.INSTALLED_SOFTWARE: dict[str, str] = self._load_json_from_env(
             "INSTALLED_SOFTWARE",
-            default={"python": "3.9"},
+            default={"python": "3.11"},
         )
         self.INSTALLED_MODELS: list[dict[str, str]] = self._load_json_from_env(
             "INSTALLED_MODELS",
@@ -79,6 +81,29 @@ class WorkerConfig:
         self.SHUTDOWN_TIMEOUT: float = float(getenv("WORKER_SHUTDOWN_TIMEOUT", "30.0"))
         self.ENABLE_WEBSOCKETS: bool = getenv("WORKER_ENABLE_WEBSOCKETS", "false").lower() == "true"
         self.MULTI_ORCHESTRATOR_MODE: str = getenv("MULTI_ORCHESTRATOR_MODE", "FAILOVER")
+        self.WORKER_SKILLS_DIR: str = getenv("WORKER_SKILLS_DIR", "skills")
+
+        # --- Custom Extra Capabilities ---
+        # Automatically pick up environment variables starting with WORKER_EXTRA_
+        self.EXTRA_CAPABILITIES: dict[str, Any] = self._load_extra_from_env()
+
+    def _load_extra_from_env(self) -> dict[str, Any]:
+        """Loads all environment variables starting with WORKER_EXTRA_ into a dictionary."""
+        extra = {}
+        prefix = "WORKER_EXTRA_"
+        for key, value in environ.items():
+            if key.startswith(prefix):
+                # Convert WORKER_EXTRA_REGION to region
+                name = key[len(prefix) :].lower()
+                # Try to parse as JSON if it looks like it, otherwise keep as string
+                if value.startswith(("{", "[")):
+                    try:
+                        extra[name] = loads(value)
+                    except (JSONDecodeError, TypeError):
+                        extra[name] = value
+                else:
+                    extra[name] = value
+        return extra
 
     def validate(self) -> None:
         """Validates critical configuration parameters."""

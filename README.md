@@ -15,6 +15,7 @@ pip install avtomatika-worker
 ```
 
 Extras:
+- `pip install "avtomatika-worker[s3]"` — for S3 payload offloading (requires `obstore`).
 - `pip install "avtomatika-worker[pydantic]"` — for Pydantic-based parameter validation.
 - `pip install "avtomatika-worker[dev]"` — for development features like CLI `--reload`.
 
@@ -34,24 +35,25 @@ async def resize_image(params: dict, **kwargs):
     return {"status": "success", "data": {"result": "ok"}}
 ```
 
-Run it using the built-in `worker` command:
+### Option 2: Dynamic Skill Loading (No code changes)
 
-```bash
-export ORCHESTRATOR_URL="http://localhost:8080"
-export WORKER_TOKEN="your-secret-token"
-
-# Standard run
-worker run --app app.main:worker
-
-# Development mode with auto-reload
-worker run --app app.main:worker --reload
-```
-
-### Option 2: Programmatic Run
+Place your task handlers in the `skills/` directory (e.g., `skills/my_tasks.py`):
 
 ```python
-if __name__ == "__main__":
-    worker.run_with_health_check()
+from avtomatika_worker import SkillBlueprint
+
+bp = SkillBlueprint()
+
+@bp.task("generate_preview")
+async def generate_preview(params: dict, **kwargs):
+    return {"status": "success"}
+```
+
+Run the worker, and it will automatically load all skills from the directory. You can specify the path via the `WORKER_SKILLS_DIR` environment variable or the `Worker(skills_dir=...)` constructor parameter (which takes precedence if both are provided):
+
+```bash
+# It will look into ./skills by default
+worker run --app app.main:worker
 ```
 
 ## Key Features
@@ -70,7 +72,7 @@ Built-in handling of `SIGTERM` and `SIGINT`. When a signal is received, the work
 
 ### 3. File System & S3 Offloading
 - **TaskFiles**: Async helper for isolated task workspaces.
-- **S3 Payload Offloading**: Automatic download/upload of large files via S3 URIs in task parameters.
+- **S3 Payload Offloading**: Automatic download/upload of large files via S3 URIs in task parameters (requires `[s3]` extra).
 
 ## Configuration Reference
 
@@ -83,6 +85,7 @@ Built-in handling of `SIGTERM` and `SIGINT`. When a signal is received, the work
 | `WORKER_SHUTDOWN_TIMEOUT`| Max seconds to wait for tasks during shutdown. | `30.0` |
 | `WORKER_ENABLE_WEBSOCKETS`| Enable real-time commands (e.g., cancellation). | `false` |
 | `TASK_FILES_DIR` | Local directory for temporary S3 payloads. | `/tmp/payloads` |
+| `WORKER_SKILLS_DIR` | Directory to dynamically load skills from. | `skills` |
 
 ## Documentation
 

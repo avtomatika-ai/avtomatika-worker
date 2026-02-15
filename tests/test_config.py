@@ -17,7 +17,7 @@ def test_worker_config_defaults():
         assert config.MAX_CONCURRENT_TASKS == 10
         assert config.RESOURCES["cpu_cores"] == 4
         assert config.RESOURCES["gpu_info"] is None
-        assert config.INSTALLED_SOFTWARE == {"python": "3.9"}
+        assert config.INSTALLED_SOFTWARE == {"python": "3.11"}
         assert config.INSTALLED_MODELS == []
         assert config.TASK_FILES_DIR == "/tmp/payloads"
         assert config.HEARTBEAT_INTERVAL == 15
@@ -97,7 +97,7 @@ def test_load_json_from_env_invalid_json(caplog):
     """Tests that _load_json_from_env handles invalid JSON correctly and logs a warning."""
     with patch.dict(os.environ, {"INSTALLED_SOFTWARE": "invalid-json"}, clear=True), caplog.at_level("WARNING"):
         config = WorkerConfig()
-        assert config.INSTALLED_SOFTWARE == {"python": "3.9"}
+        assert config.INSTALLED_SOFTWARE == {"python": "3.11"}
         assert "Could not decode JSON from environment variable INSTALLED_SOFTWARE" in caplog.text
 
 

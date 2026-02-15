@@ -1,4 +1,6 @@
-from asyncio import Semaphore, gather, to_thread
+from __future__ import annotations
+
+from asyncio import Semaphore, gather, sleep, to_thread
 from logging import getLogger
 from os import walk
 from os.path import basename, dirname, join, relpath
@@ -8,17 +10,27 @@ from typing import Any, cast
 from aiofiles import open as aio_open
 from aiofiles.os import makedirs
 from aiofiles.ospath import exists, getsize, isdir
-from obstore import get as obstore_get
-from obstore import list as obstore_list
-from obstore import put as obstore_put
-from obstore.store import S3Store
 from rxon.blob import parse_uri
-from rxon.exceptions import IntegrityError
+from rxon.exceptions import IntegrityError, RxonError
 from rxon.models import FileMetadata
 
 from .config import WorkerConfig
 
 logger = getLogger(__name__)
+
+try:
+    from obstore import get as obstore_get
+    from obstore import list as obstore_list
+    from obstore import put as obstore_put
+    from obstore.store import S3Store
+
+    _HAS_S3 = True
+except ImportError:
+    _HAS_S3 = False
+    S3Store = Any
+    obstore_get = None
+    obstore_list = None
+    obstore_put = None
 
 # Limit concurrent S3 operations to avoid "Too many open files"
 MAX_S3_CONCURRENCY = 50
@@ -32,15 +44,22 @@ class S3Manager:
         self._stores: dict[str, S3Store] = {}
         self._semaphore = Semaphore(MAX_S3_CONCURRENCY)
 
+    def _check_availability(self) -> None:
+        if not _HAS_S3:
+            raise RuntimeError(
+                "S3 support is not installed. Please install 'avtomatika-worker[s3]' to use S3 features."
+            )
+
     def _get_store(self, bucket_name: str) -> S3Store:
         """Creates or returns a cached S3Store for a specific bucket."""
+        self._check_availability()
         if bucket_name in self._stores:
             return self._stores[bucket_name]
 
         config_kwargs = {
             "aws_access_key_id": self._config.S3_ACCESS_KEY,
             "aws_secret_access_key": self._config.S3_SECRET_KEY,
-            "region": "us-east-1",  # Default region if not specified, required by some clients
+            "region": self._config.S3_REGION,
         }
 
         if self._config.S3_ENDPOINT_URL:
@@ -69,6 +88,7 @@ class S3Manager:
         """Downloads a file or a folder from S3 and returns the local path.
         If verify_meta is provided, performs integrity checks.
         """
+        self._check_availability()
         try:
             bucket_name, object_key, is_directory = parse_uri(uri)
             store = self._get_store(bucket_name)
@@ -110,23 +130,26 @@ class S3Manager:
             # Handle single file download
             local_path = join(local_dir_root, basename(object_key))
 
-            result = await obstore_get(store, object_key)
+            async with self._semaphore:
+                result = await obstore_get(store, object_key)
 
-            # Integrity check before download
-            if verify_meta:
-                if verify_meta.size != result.meta.size:
-                    raise IntegrityError(
-                        f"Size mismatch for {uri}: expected {verify_meta.size}, got {result.meta.size}"
-                    )
-                if verify_meta.etag and result.meta.e_tag:
-                    actual_etag = result.meta.e_tag.strip('"')
-                    expected_etag = verify_meta.etag.strip('"')
-                    if actual_etag != expected_etag:
-                        raise IntegrityError(f"ETag mismatch for {uri}: expected {expected_etag}, got {actual_etag}")
+                # Integrity check before download
+                if verify_meta:
+                    if verify_meta.size != result.meta.size:
+                        raise IntegrityError(
+                            f"Size mismatch for {uri}: expected {verify_meta.size}, got {result.meta.size}"
+                        )
+                    if verify_meta.etag and result.meta.e_tag:
+                        actual_etag = result.meta.e_tag.strip('"')
+                        expected_etag = verify_meta.etag.strip('"')
+                        if actual_etag != expected_etag:
+                            raise IntegrityError(
+                                f"ETag mismatch for {uri}: expected {expected_etag}, got {actual_etag}"
+                            )
 
-            async with aio_open(local_path, "wb") as f:
-                async for chunk in result.stream():
-                    await f.write(chunk)
+                async with aio_open(local_path, "wb") as f:
+                    async for chunk in result.stream():
+                        await f.write(chunk)
 
             logger.info(f"Successfully downloaded file from S3: {uri} -> {local_path}")
             return local_path
@@ -136,18 +159,48 @@ class S3Manager:
             logger.exception(f"Error during download of {uri}: {e}")
             raise
 
-    async def _upload_to_s3(self, local_path: str) -> FileMetadata:
-        """Uploads a file or a folder to S3 and returns FileMetadata."""
+    async def _upload_to_s3(self, local_path: str, s3_prefix: str = "", max_retries: int = 3) -> FileMetadata:
+        """Uploads a file or a folder to S3 with retries and returns FileMetadata."""
+        self._check_availability()
         bucket_name = self._config.S3_DEFAULT_BUCKET
         store = self._get_store(bucket_name)
 
-        logger.info(f"Starting upload to S3 from local path: {local_path}")
+        logger.info(f"Starting upload to S3 from local path: {local_path} (prefix: {s3_prefix})")
+
+        async def _do_upload_with_retry(path: str, key: str) -> Any:
+            # Ensure key includes prefix
+            full_key = join(s3_prefix, key).lstrip("/")
+            last_err = None
+            for attempt in range(max_retries):
+                try:
+                    async with self._semaphore:
+                        # Passing a file object to obstore_put allows Rust to read it in chunks
+                        # without blocking the Python event loop and without loading it all into RAM.
+                        with open(path, "rb") as f:
+                            return await obstore_put(store, full_key, f)
+                except Exception as e:
+                    last_err = e
+                    # Check for permanent errors (Auth/Permissions)
+                    err_str = str(e).lower()
+                    if "403" in err_str or "forbidden" in err_str or "credential" in err_str:
+                        logger.error(f"Permanent S3 error during upload: {e}")
+                        raise RxonError(f"S3 Access Denied: {e}") from e
+
+                    if attempt < max_retries - 1:
+                        wait = 0.5 * (2**attempt)
+                        logger.warning(
+                            f"S3 upload failed (attempt {attempt + 1}/{max_retries}), retrying in {wait}s: {e}"
+                        )
+                        await sleep(wait)
+            if last_err:
+                raise last_err
+            raise RxonError("S3 upload failed for unknown reason")
 
         try:
             # Handle folder upload
             if await isdir(local_path):
                 folder_name = basename(local_path.rstrip("/"))
-                s3_prefix = f"{folder_name}/"
+                s3_folder_prefix = join(s3_prefix, folder_name)
 
                 def _get_files_to_upload():
                     from os.path import getsize as std_getsize
@@ -159,36 +212,33 @@ class S3Manager:
                             f_path = join(root, file)
                             rel = relpath(f_path, local_path)
                             total_size += std_getsize(f_path)
-                            files_to_upload.append((f_path, f"{s3_prefix}{rel}"))
+                            files_to_upload.append((f_path, rel))
                     return files_to_upload, total_size
 
                 files_list, total_size = await to_thread(_get_files_to_upload)
 
-                async def _upload_file(path: str, key: str) -> None:
-                    async with self._semaphore:
-                        with open(path, "rb") as f:
-                            await obstore_put(store, key, f)
-
                 if files_list:
-                    await gather(*[_upload_file(f, k) for f, k in files_list])
+                    # We pass folder_prefix to do_upload_with_retry
+                    await gather(*[_do_upload_with_retry(f, join(folder_name, k)) for f, k in files_list])
 
-                s3_uri = f"s3://{bucket_name}/{s3_prefix}"
+                s3_uri = f"s3://{bucket_name}/{s3_folder_prefix}/"
                 logger.info(f"Successfully uploaded folder to S3: {local_path} -> {s3_uri} ({len(files_list)} files)")
                 return FileMetadata(uri=s3_uri, size=total_size)
 
             # Handle single file upload
-            object_key = basename(local_path)
+            filename = basename(local_path)
             file_size = await getsize(local_path)
-            with open(local_path, "rb") as f:
-                put_result = await obstore_put(store, object_key, f)
 
-            s3_uri = f"s3://{bucket_name}/{object_key}"
+            put_result = await _do_upload_with_retry(local_path, filename)
+
+            full_s3_key = join(s3_prefix, filename).lstrip("/")
+            s3_uri = f"s3://{bucket_name}/{full_s3_key}"
             etag = put_result.e_tag.strip('"') if put_result.e_tag else None
             logger.info(f"Successfully uploaded file to S3: {local_path} -> {s3_uri} (ETag: {etag})")
             return FileMetadata(uri=s3_uri, size=file_size, etag=etag)
 
         except Exception as e:
-            logger.exception(f"Error during upload of {local_path}: {e}")
+            logger.exception(f"Fatal error during S3 upload of {local_path}: {e}")
             raise
 
     async def process_params(
@@ -197,8 +247,11 @@ class S3Manager:
         """Recursively searches for S3 URIs in params and downloads the files.
         Uses metadata for integrity verification if available.
         """
+        # Only check availability if we actually need to process S3 URIs
         if not self._config.S3_ENDPOINT_URL:
             return params
+
+        self._check_availability()
 
         async def _process(item: Any, key_path: str = "") -> Any:
             if isinstance(item, str) and item.startswith("s3://"):
@@ -212,19 +265,23 @@ class S3Manager:
 
         return cast(dict[str, Any], await _process(params))
 
-    async def process_result(self, result: dict[str, Any]) -> tuple[dict[str, Any], dict[str, FileMetadata]]:
+    async def process_result(
+        self, result: dict[str, Any], s3_prefix: str = ""
+    ) -> tuple[dict[str, Any], dict[str, FileMetadata]]:
         """Recursively searches for local file paths in the result and uploads them to S3.
         Returns a tuple of (updated_result, metadata_map).
         """
         if not self._config.S3_ENDPOINT_URL:
             return result, {}
 
+        self._check_availability()
+
         metadata_map = {}
 
         async def _process(item: Any, key_path: str = "") -> Any:
             if isinstance(item, str) and item.startswith(self._config.TASK_FILES_DIR):
                 if await exists(item):
-                    meta = await self._upload_to_s3(item)
+                    meta = await self._upload_to_s3(item, s3_prefix=s3_prefix)
                     metadata_map[key_path] = meta
                     return meta.uri
                 return item

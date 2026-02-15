@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from logging import Filter, Formatter, LogRecord, StreamHandler, getLogger
 from os import getenv
 from sys import stdout

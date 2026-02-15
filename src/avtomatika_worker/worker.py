@@ -1,7 +1,10 @@
+from __future__ import annotations
+
 from asyncio import (
     CancelledError,
     Event,
     Task,
+    TaskGroup,
     create_task,
     gather,
     get_running_loop,
@@ -11,13 +14,16 @@ from asyncio import (
     wait_for,
 )
 from contextlib import suppress
-from dataclasses import is_dataclass
+from dataclasses import fields, is_dataclass
+from importlib.util import module_from_spec, spec_from_file_location
 from inspect import Parameter, iscoroutinefunction, signature
 from logging import getLogger
 from os.path import join
 from signal import SIGINT, SIGTERM
-from typing import Any, Callable, cast
+from typing import Any, Callable, cast, get_args, get_origin, get_type_hints
 
+from aiofiles.os import listdir
+from aiofiles.ospath import abspath, exists
 from aiohttp import ClientSession, TCPConnector, web
 from rxon import Transport, create_transport
 from rxon.blob import calculate_config_hash
@@ -67,6 +73,25 @@ except ImportError:
 logger = getLogger(__name__)
 
 
+class SkillBlueprint:
+    """
+    A collection of tasks that can be registered on a Worker.
+    Allows defining tasks in separate files without a worker instance.
+    """
+
+    def __init__(self) -> None:
+        self._tasks: list[tuple[str, str | None, Callable]] = []
+
+    def task(self, name: str, task_type: str | None = None) -> Callable:
+        """Decorator to register a task handler on the blueprint."""
+
+        def decorator(func: Callable) -> Callable:
+            self._tasks.append((name, task_type, func))
+            return func
+
+        return decorator
+
+
 class Worker:
     """The main class for creating and running a worker.
     Implements a hybrid interaction model with the Orchestrator:
@@ -84,8 +109,12 @@ class Worker:
         config: WorkerConfig | None = None,
         capacity_checker: CapacityChecker | None = None,
         clients: list[tuple[dict[str, Any], Transport]] | None = None,
+        skills_dir: str | None = None,
     ):
         self._config = config or WorkerConfig()
+        if skills_dir:
+            self._config.WORKER_SKILLS_DIR = skills_dir
+
         setup_logging(worker_id=self._config.WORKER_ID)
         self._s3_manager = S3Manager(self._config)
         self._config.WORKER_TYPE = worker_type  # Allow overriding worker_type
@@ -123,6 +152,51 @@ class Worker:
     def add_middleware(self, middleware: Middleware) -> None:
         """Adds a middleware to the execution chain."""
         self._middlewares.append(middleware)
+
+    def include_blueprint(self, blueprint: SkillBlueprint) -> None:
+        """Registers all tasks from a blueprint."""
+        for name, task_type, func in blueprint._tasks:
+            self.task(name, task_type)(func)
+
+    async def load_skills(self, skills_dir: str | None = None) -> None:
+        """
+        Dynamically loads skills from the specified directory.
+        Scans for .py files and looks for 'SkillBlueprint' instances or 'setup(worker)' functions.
+        """
+        skills_dir = skills_dir or self._config.WORKER_SKILLS_DIR
+        if not await exists(skills_dir):
+            return
+
+        logger.info(f"Scanning for skills in: {await abspath(skills_dir)}")
+        for filename in await listdir(skills_dir):
+            if filename.endswith(".py") and not filename.startswith("_"):
+                module_name = filename[:-3]
+                file_path = join(skills_dir, filename)
+
+                try:
+                    spec = spec_from_file_location(module_name, file_path)
+                    if spec is None or spec.loader is None:
+                        continue
+                    module = module_from_spec(spec)
+                    spec.loader.exec_module(module)
+
+                    # 1. Look for SkillBlueprint instances
+                    found_anything = False
+                    for attr_name in dir(module):
+                        attr = getattr(module, attr_name)
+                        if isinstance(attr, SkillBlueprint):
+                            self.include_blueprint(attr)
+                            found_anything = True
+
+                    # 2. Look for setup(worker) function
+                    if hasattr(module, "setup") and callable(module.setup):
+                        module.setup(self)
+                        found_anything = True
+
+                    if found_anything:
+                        logger.info(f"Loaded skills from: {filename}")
+                except Exception as e:
+                    logger.error(f"Failed to load skills from {filename}: {e}")
 
     def _init_clients(self) -> None:
         """Initializes Transport instances for each configured orchestrator."""
@@ -192,12 +266,12 @@ class Worker:
 
     def _get_current_state(self) -> dict[str, Any]:
         """
-        Calculates the current worker state including status and available tasks.
+        Calculates the current worker state including status and available skills.
         """
         if self._current_load >= self._config.MAX_CONCURRENT_TASKS:
-            return {"status": "busy", "supported_tasks": []}
+            return {"status": "busy", "supported_skills": []}
 
-        supported_tasks = []
+        supported_skills = []
         for name, handler_data in self._task_handlers.items():
             is_available = True
             task_type = handler_data.get("type")
@@ -209,13 +283,13 @@ class Worker:
                     is_available = False
 
             if is_available:
-                supported_tasks.append(name)
+                supported_skills.append(name)
 
         if self._capacity_checker:
-            supported_tasks = [task for task in supported_tasks if self._capacity_checker(task)]
+            supported_skills = [skill for skill in supported_skills if self._capacity_checker(skill)]
 
-        status = "idle" if supported_tasks else "busy"
-        return {"status": status, "supported_tasks": supported_tasks}
+        status = "idle" if supported_skills else "busy"
+        return {"status": status, "supported_skills": supported_skills}
 
     def _get_next_client(self) -> Transport | None:
         """
@@ -326,13 +400,13 @@ class Worker:
         if isinstance(params_annotation, type) and is_dataclass(params_annotation):
             try:
                 # Filter unknown fields
-                known_fields = {f.name for f in params_annotation.__dataclass_fields__.values()}
+                known_fields = {f.name for f in fields(params_annotation)}
                 filtered_params = {k: v for k, v in params.items() if k in known_fields}
 
                 # Check required fields
                 required_fields = [
                     f.name
-                    for f in params_annotation.__dataclass_fields__.values()
+                    for f in fields(params_annotation)
                     if f.default is Parameter.empty and f.default_factory is Parameter.empty
                 ]
 
@@ -345,15 +419,23 @@ class Worker:
 
         return params
 
-    def _prepare_dependencies(self, handler: Callable, task_id: str) -> dict[str, Any]:
+    def _prepare_dependencies(self, handler: Callable, job_id: str, task_id: str) -> dict[str, Any]:
         """Injects dependencies based on type hints."""
         deps = {}
         task_dir = join(self._config.TASK_FILES_DIR, task_id)
-        task_files = TaskFiles(task_dir, s3_manager=self._s3_manager)
+        task_files = TaskFiles(task_dir, job_id=job_id, task_id=task_id, s3_manager=self._s3_manager)
 
-        sig = signature(handler)
-        for name, param in sig.parameters.items():
-            if param.annotation is TaskFiles:
+        try:
+            hints = get_type_hints(handler)
+        except Exception:
+            # Fallback for handlers where hints can't be resolved
+            hints = {}
+
+        for name, annotation in hints.items():
+            origin = get_origin(annotation)
+            types = get_args(annotation) if origin else (annotation,)
+
+            if TaskFiles in types:
                 deps[name] = task_files
 
         return deps
@@ -402,7 +484,7 @@ class Worker:
                 # Download files
                 params = await self._s3_manager.process_params(params, task_id, metadata=task_payload.params_metadata)
                 validated_params = self._prepare_task_params(handler_data["func"], params)
-                deps = self._prepare_dependencies(handler_data["func"], task_id)
+                deps = self._prepare_dependencies(handler_data["func"], job_id, task_id)
 
                 handler_kwargs = {
                     "params": validated_params,
@@ -446,7 +528,20 @@ class Worker:
 
                 handler_result = await handler_chain()
 
-                updated_data, metadata_map = await self._s3_manager.process_result(handler_result.get("data", {}))
+                updated_data, metadata_map = await self._s3_manager.process_result(
+                    handler_result.get("data", {}), s3_prefix=job_id
+                )
+
+                # Prepare error object safely
+                task_error = None
+                if "error" in handler_result:
+                    err_data = handler_result["error"]
+                    if isinstance(err_data, dict):
+                        # Ensure we only pass valid fields to TaskError
+                        valid_err_fields = {k: v for k, v in err_data.items() if k in TaskError._fields}
+                        task_error = TaskError(**valid_err_fields)
+                    else:
+                        task_error = TaskError(code=ERROR_CODE_TRANSIENT, message=str(err_data))
 
                 result_obj = TaskResult(
                     job_id=job_id,
@@ -454,7 +549,7 @@ class Worker:
                     worker_id=self._config.WORKER_ID,
                     status=handler_result.get("status", TASK_STATUS_SUCCESS),
                     data=updated_data,
-                    error=TaskError(**handler_result["error"]) if "error" in handler_result else None,
+                    error=task_error,
                     data_metadata=metadata_map if metadata_map else None,
                 )
 
@@ -499,7 +594,11 @@ class Worker:
 
             if result_obj:
                 try:
-                    await client.send_result(result_obj)
+                    accepted = await client.send_result(result_obj)
+                    if not accepted:
+                        logger.warning(
+                            f"Task {task_id} result was IGNORED by orchestrator (possibly deadline exceeded)."
+                        )
                 except RxonError as e:
                     logger.error(f"Failed to send task result: {e}")
 
@@ -523,10 +622,14 @@ class Worker:
             await sleep(self._config.HEARTBEAT_INTERVAL)
 
     @staticmethod
-    def _from_dict(cls: type, data: dict[str, Any]) -> Any:
+    def _from_dict(cls: type, data: Any) -> Any:
         """Safely instantiates a NamedTuple from a dict, ignoring unknown fields."""
         if not data:
             return None
+        if isinstance(data, cls):
+            return data
+        if not isinstance(data, dict):
+            return data
         fields = cast(Any, cls)._fields
         filtered_data = {k: v for k, v in data.items() if k in fields}
         return cls(**filtered_data)
@@ -551,10 +654,14 @@ class Worker:
             self._config.S3_DEFAULT_BUCKET,
         )
 
+        # Merge default extra fields with dynamic ones from ENV
+        combined_extra = {"websockets": self._config.ENABLE_WEBSOCKETS}
+        combined_extra.update(self._config.EXTRA_CAPABILITIES)
+
         registration = WorkerRegistration(
             worker_id=self._config.WORKER_ID,
             worker_type=self._config.WORKER_TYPE,
-            supported_tasks=state["supported_tasks"],
+            supported_skills=state["supported_skills"],
             resources=resources,
             installed_software=self._config.INSTALLED_SOFTWARE,
             installed_models=[InstalledModel(**m) for m in self._config.INSTALLED_MODELS],
@@ -563,6 +670,7 @@ class Worker:
                 ip_address=self._config.IP_ADDRESS,
                 cost_per_skill=self._config.COST_PER_SKILL,
                 s3_config_hash=s3_hash,
+                extra=combined_extra,
             ),
         )
 
@@ -571,7 +679,9 @@ class Worker:
     @staticmethod
     async def _safe_register(client: Transport, registration: WorkerRegistration) -> None:
         try:
-            await client.register(registration)
+            resp = await client.register(registration)
+            if isinstance(resp, dict) and (warning := resp.get("warning")):
+                logger.warning(f"Registration warning from {client}: {warning}")
         except RxonError as e:
             logger.error(f"Registration failed for {client}: {e}")
 
@@ -590,7 +700,7 @@ class Worker:
             status=state["status"],
             load=float(self._current_load),
             current_tasks=list(self._active_tasks.keys()),
-            supported_tasks=state["supported_tasks"],
+            supported_skills=state["supported_skills"],
             hot_cache=list(self._hot_cache),
             skill_dependencies=self._skill_dependencies or None,
             hot_skills=hot_skills or None,
@@ -598,10 +708,14 @@ class Worker:
 
         await gather(*[self._safe_heartbeat(client, heartbeat) for _, client in self._clients])
 
-    @staticmethod
-    async def _safe_heartbeat(client: Transport, heartbeat: Heartbeat) -> None:
+    async def _safe_heartbeat(self, client: Transport, heartbeat: Heartbeat) -> None:
         try:
-            await client.send_heartbeat(heartbeat)
+            resp = await client.send_heartbeat(heartbeat)
+            if resp and "cancel_task_ids" in resp:
+                for task_id in resp["cancel_task_ids"]:
+                    if task_id in self._active_tasks:
+                        logger.warning(f"Task {task_id} marked for cancellation via heartbeat feedback loop.")
+                        self._active_tasks[task_id].cancel()
         except RxonError as e:
             logger.warning(f"Heartbeat failed for {client}: {e}")
 
@@ -609,6 +723,11 @@ class Worker:
         """The main asynchronous function."""
         self._config.validate()
         self._validate_task_types()
+
+        await self.load_skills()
+
+        if self._config.EXTRA_CAPABILITIES:
+            logger.info(f"Loaded custom capabilities from environment: {self._config.EXTRA_CAPABILITIES}")
 
         loop = get_running_loop()
         for sig in (SIGINT, SIGTERM):
@@ -645,6 +764,21 @@ class Worker:
 
         # 1. Stop polling and communications
         polling_task.cancel()
+
+        # HLN RELIABILITY: Explicitly tell orchestrators we are going offline
+        # This prevents new tasks from being dispatched to us during the drain period.
+        logger.info("Sending final 'offline' heartbeat to all orchestrators...")
+        with suppress(Exception):
+            heartbeat = Heartbeat(
+                worker_id=self._config.WORKER_ID,
+                status="offline",
+                load=float(self._current_load),
+                current_tasks=list(self._active_tasks.keys()),
+                supported_skills=[],
+                hot_cache=list(self._hot_cache),
+            )
+            await gather(*[client.send_heartbeat(heartbeat) for _, client in self._clients], return_exceptions=True)
+
         comm_task.cancel()
         if token_rotation_task:
             token_rotation_task.cancel()
@@ -712,12 +846,20 @@ class Worker:
 
     def run_with_health_check(self) -> None:
         async def _main_wrapper() -> None:
-            await gather(self._run_health_check_server(), self.main())
+            async with TaskGroup() as tg:
+                tg.create_task(self._run_health_check_server())
+                tg.create_task(self.main())
 
         try:
             run(_main_wrapper())
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, CancelledError):
             self._shutdown_event.set()
+        except ExceptionGroup as eg:
+            # Check if all exceptions in the group are related to shutdown
+            if all(isinstance(e, (KeyboardInterrupt, CancelledError)) for e in eg.exceptions):
+                self._shutdown_event.set()
+            else:
+                raise
 
     async def _start_websocket_manager(self) -> None:
         """Manages the command listeners."""

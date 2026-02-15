@@ -15,6 +15,7 @@ pip install avtomatika-worker
 ```
 
 Extras:
+- `pip install "avtomatika-worker[s3]"` — para descarga de S3 (requiere `obstore`).
 - `pip install "avtomatika-worker[pydantic]"` — para validación de parámetros basada en Pydantic.
 - `pip install "avtomatika-worker[dev]"` — para funciones de desarrollo como CLI `--reload`.
 
@@ -34,24 +35,25 @@ async def resize_image(params: dict, **kwargs):
     return {"status": "success", "data": {"result": "ok"}}
 ```
 
-Ejecútalo usando el comando `worker` integrado:
+### Opción 2: Carga Dinámica de Skills (Sin cambios de código)
 
-```bash
-export ORCHESTRATOR_URL="http://localhost:8080"
-export WORKER_TOKEN="tu-token-secreto"
-
-# Ejecución estándar
-worker run --app app.main:worker
-
-# Modo de desarrollo con recarga automática
-worker run --app app.main:worker --reload
-```
-
-### Opción 2: Ejecución Programática
+Coloque sus manejadores de tareas en el directorio `skills/` (ej., `skills/my_tasks.py`):
 
 ```python
-if __name__ == "__main__":
-    worker.run_with_health_check()
+from avtomatika_worker import SkillBlueprint
+
+bp = SkillBlueprint()
+
+@bp.task("generate_preview")
+async def generate_preview(params: dict, **kwargs):
+    return {"status": "success"}
+```
+
+Ejecute el worker y cargará automáticamente todos los skills del directorio. Puede especificar la ruta mediante la variable de entorno `WORKER_SKILLS_DIR` o el parámetro del constructor `Worker(skills_dir=...)` (el valor del constructor tiene prioridad si se proporcionan ambos):
+
+```bash
+# Buscará en ./skills por defecto
+worker run --app app.main:worker
 ```
 
 ## Características Clave
@@ -68,9 +70,9 @@ Manejo integrado de `SIGTERM` y `SIGINT`. Cuando se recibe una señal, el worker
 2. Espera a que se completen las tareas activas (configurable mediante `WORKER_SHUTDOWN_TIMEOUT`).
 3. Envía los latidos finales y cierra las conexiones.
 
-### 3. Sistema de Archivos y Descarga de S3
+### 3. Sistema de Archivos и Descarga de S3
 - **TaskFiles**: Asistente asíncrono para espacios de trabajo de tareas aislados.
-- **S3 Payload Offloading**: Descarga/carga automática de archivos grandes mediante URIs de S3 en los parámetros de la tarea.
+- **S3 Payload Offloading**: Descarga/carga automática de archivos grandes mediante URIs de S3 en los parámetros de la tarea (requiere extra `[s3]`).
 
 ## Referencia de Configuración
 
@@ -83,6 +85,7 @@ Manejo integrado de `SIGTERM` y `SIGINT`. Cuando se recibe una señal, el worker
 | `WORKER_SHUTDOWN_TIMEOUT`| Segundos máx. para esperar tareas durante el cierre. | `30.0` |
 | `WORKER_ENABLE_WEBSOCKETS`| Habilitar comandos en tiempo real (ej. cancelación). | `false` |
 | `TASK_FILES_DIR` | Directorio local para cargas útiles temporales de S3. | `/tmp/payloads` |
+| `WORKER_SKILLS_DIR` | Directorio para cargar skills dinámicamente. | `skills` |
 
 ## Documentación
 

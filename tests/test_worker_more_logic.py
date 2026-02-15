@@ -66,7 +66,7 @@ async def test_worker_registration_payload(mocker):
 
     assert registration.worker_id == "custom-id"
     assert registration.worker_type == "custom-type"
-    assert "task1" in registration.supported_tasks
+    assert "task1" in registration.supported_skills
     assert registration.installed_models[0].name == "model1"
     assert registration.capabilities.cost_per_skill == {"task1": 1.5}
 

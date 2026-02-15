@@ -214,7 +214,7 @@ def test_get_current_state_busy():
     worker._config.MAX_CONCURRENT_TASKS = 10
     state = worker._get_current_state()
     assert state["status"] == "busy"
-    assert state["supported_tasks"] == []
+    assert state["supported_skills"] == []
 
 
 def test_get_current_state_idle():
@@ -231,7 +231,7 @@ def test_get_current_state_idle():
 
     state = worker._get_current_state()
     assert state["status"] == "idle"
-    assert sorted(state["supported_tasks"]) == ["task-1", "task-2"]
+    assert sorted(state["supported_skills"]) == ["task-1", "task-2"]
 
 
 def test_get_current_state_with_task_type_limits():
@@ -253,13 +253,13 @@ def test_get_current_state_with_task_type_limits():
     # No GPU tasks running, so all tasks are available
     state = worker._get_current_state()
     assert state["status"] == "idle"
-    assert sorted(state["supported_tasks"]) == ["cpu_task", "gpu_task_1", "gpu_task_2"]
+    assert sorted(state["supported_skills"]) == ["cpu_task", "gpu_task_1", "gpu_task_2"]
 
     # One GPU task is running, so no more GPU tasks can be started
     worker._current_load_by_type["gpu"] = 1
     state = worker._get_current_state()
     assert state["status"] == "idle"
-    assert state["supported_tasks"] == ["cpu_task"]
+    assert state["supported_skills"] == ["cpu_task"]
 
 
 @pytest.mark.asyncio

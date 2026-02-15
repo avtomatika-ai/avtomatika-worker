@@ -4,9 +4,9 @@ from importlib.metadata import PackageNotFoundError, version
 
 from .logging import setup_logging
 from .task_files import TaskFiles
-from .worker import Worker
+from .worker import SkillBlueprint, Worker
 
-__all__ = ["Worker", "TaskFiles", "setup_logging"]
+__all__ = ["Worker", "SkillBlueprint", "TaskFiles", "setup_logging"]
 
 try:
     __version__ = version("avtomatika-worker")

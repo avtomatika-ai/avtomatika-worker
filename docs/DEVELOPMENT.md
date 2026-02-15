@@ -4,6 +4,8 @@ EN | [ES](https://github.com/avtomatika-ai/avtomatika-worker/blob/main/docs/es/D
 
 This document describes how to create a custom Worker compatible with the Orchestrator using `avtomatika-worker`.
 
+**Requirements:** Python 3.11 or higher.
+
 ## Core Concept
 
 Workers created with the SDK implement a hybrid interaction model with the Orchestrator:
@@ -17,6 +19,11 @@ Workers created with the SDK implement a hybrid interaction model with the Orche
 Ensure the SDK is installed in your environment. If you are working in the main repository, you can install it in editable mode:
 ```bash
 pip install -e .
+```
+
+To enable S3 support, install the `s3` extra:
+```bash
+pip install "avtomatika-worker[s3]"
 ```
 
 ### Step 2: Create a Worker File
@@ -209,7 +216,45 @@ worker run --app my_worker:worker --reload
 
 The `--reload` feature requires the `watchdog` package (install via `pip install avtomatika-worker[dev]`). It monitors the current directory for changes in `.py` files and restarts the worker process automatically.
 
-### Step 6 (Optional): Working with Large Files via "Payload Offloading"
+### Step 6: Dynamic Skill Loading (Modular Architecture)
+
+Instead of defining all tasks in a single file, you can organize them into modules and place them in a specific directory (default: `skills/`).
+
+#### Using SkillBlueprint
+
+`SkillBlueprint` allows you to define tasks without needing a `Worker` instance immediately. This is useful for creating portable "skill packs".
+
+Create a file `skills/image_skills.py`:
+```python
+from avtomatika_worker import SkillBlueprint
+
+# 1. Create a blueprint
+bp = SkillBlueprint()
+
+# 2. Register tasks on the blueprint
+@bp.task("resize_image")
+async def resize_handler(params: dict, **kwargs):
+    return {"status": "success"}
+
+@bp.task("convert_format")
+async def convert_handler(params: dict, **kwargs):
+    return {"status": "success"}
+```
+
+#### Loading Skills into Worker
+
+When you initialize the `Worker`, it automatically scans the directory specified in `WORKER_SKILLS_DIR` (defaulting to `skills/` in the current working directory).
+
+If you want to manually include a blueprint:
+```python
+from avtomatika_worker import Worker
+from skills.image_skills import bp
+
+worker = Worker()
+worker.include_blueprint(bp)
+```
+
+### Step 7 (Optional): Working with Large Files via "Payload Offloading"
 
 If your tasks require processing large volumes of data (video, HD images, large text files), passing them directly through the Orchestrator is inefficient. The SDK supports a **"Payload Offloading"** mechanism, which allows transferring "heavy" data via S3-compatible storage. It uses the high-performance **`obstore`** library (Rust-based) for these operations.
 
