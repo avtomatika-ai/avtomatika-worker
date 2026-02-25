@@ -27,20 +27,20 @@ def test_pydantic_not_installed():
 
 
 @pytest.mark.filterwarnings("ignore:coroutine 'AsyncMockMixin._execute_mock_call' was never awaited:RuntimeWarning")
-def test_task_decorator_warns_on_undefined_type(mocker):
+def test_skill_decorator_warns_on_undefined_type(mocker):
     """
-    Tests that the task decorator logs a warning if a task_type is not in task_type_limits.
+    Tests that the skill decorator logs a warning if a skill_type is not in skill_type_limits.
     """
     mocker.patch("avtomatika_worker.worker.S3Manager")
     logger_mock = mocker.patch("avtomatika_worker.worker.logger")
-    worker = Worker(task_type_limits={"gpu": 1})
+    worker = Worker(skill_type_limits={"gpu": 1})
 
-    @worker.task("test_task", task_type="cpu")
+    @worker.skill("test_task", type="cpu")
     def my_task(params: dict):
         pass
 
     logger_mock.warning.assert_called_with(
-        "Task 'test_task' has a type 'cpu' which is not defined in 'task_type_limits'. "
+        "Skill 'test_task' has a type 'cpu' which is not defined in 'skill_type_limits'. "
         "No concurrency limit will be applied for this type."
     )
 
@@ -52,10 +52,10 @@ async def test_worker_registration_payload(mocker):
 
     worker = Worker(worker_type="custom-type", clients=[({"url": "http://test", "weight": 1}, mock_transport)])
     worker._config.WORKER_ID = "custom-id"
-    worker._config.INSTALLED_MODELS = [{"name": "model1", "version": "1.0"}]
+    worker._config.INSTALLED_ARTIFACTS = [{"name": "model1", "version": "1.0"}]
     worker._config.COST_PER_SKILL = {"task1": 1.5}
 
-    @worker.task("task1")
+    @worker.skill("task1")
     def task1(params: dict):
         pass
 
@@ -66,8 +66,9 @@ async def test_worker_registration_payload(mocker):
 
     assert registration.worker_id == "custom-id"
     assert registration.worker_type == "custom-type"
-    assert "task1" in registration.supported_skills
-    assert registration.installed_models[0].name == "model1"
+    # Skill registration returns a list of SkillInfo objects, check name
+    assert any(s.name == "task1" for s in registration.supported_skills)
+    assert registration.installed_artifacts[0].name == "model1"
     assert registration.capabilities.cost_per_skill == {"task1": 1.5}
 
 
@@ -79,7 +80,7 @@ async def test_poll_for_tasks_handles_non_204_status(mocker):
 
     worker = Worker()
 
-    @worker.task("dummy_task")
+    @worker.skill("dummy_task")
     def dummy_handler(params):
         pass
 
@@ -149,7 +150,7 @@ async def test_prepare_task_params_raises_validation_error_for_dataclass():
         a: int
         b: str
 
-    @worker.task("test_task")
+    @worker.skill("test_task")
     async def my_handler(params: MyDataclass):
         pass
 
@@ -165,7 +166,7 @@ async def test_process_task_handles_param_validation_error(mocker):
     client = mocker.AsyncMock(spec=Transport)
     worker = Worker()
 
-    @worker.task("validation_task")
+    @worker.skill("validation_task")
     async def my_task(params: dict, **kwargs):
         raise ParamValidationError("Invalid params")
 

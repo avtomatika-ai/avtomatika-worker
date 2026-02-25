@@ -16,9 +16,9 @@ def test_worker_config_defaults():
         assert config.COST_PER_SKILL == {}
         assert config.MAX_CONCURRENT_TASKS == 10
         assert config.RESOURCES["cpu_cores"] == 4
-        assert config.RESOURCES["gpu_info"] is None
+        assert config.RESOURCES["devices"] is None
         assert config.INSTALLED_SOFTWARE == {"python": "3.11"}
-        assert config.INSTALLED_MODELS == []
+        assert config.INSTALLED_ARTIFACTS == []
         assert config.TASK_FILES_DIR == "/tmp/payloads"
         assert config.HEARTBEAT_INTERVAL == 15
         assert config.RESULT_MAX_RETRIES == 5
@@ -47,7 +47,7 @@ def test_worker_config_custom_values():
             "GPU_MODEL": "RTX 4090",
             "GPU_VRAM_GB": "24",
             "INSTALLED_SOFTWARE": '{"python": "3.10"}',
-            "INSTALLED_MODELS": '[{"name": "test-model"}]',
+            "INSTALLED_ARTIFACTS": '[{"name": "test-model"}]',
             "HEARTBEAT_INTERVAL": "30",
             "RESULT_MAX_RETRIES": "10",
             "RESULT_RETRY_INITIAL_DELAY": "2.0",
@@ -70,9 +70,9 @@ def test_worker_config_custom_values():
         assert config.COST_PER_SKILL == {"skill1": 0.5}
         assert config.MAX_CONCURRENT_TASKS == 20
         assert config.RESOURCES["cpu_cores"] == 8
-        assert config.RESOURCES["gpu_info"] == {"model": "RTX 4090", "vram_gb": 24}
+        assert config.RESOURCES["devices"] == [{"type": "gpu", "model": "RTX 4090", "memory_gb": 24}]
         assert config.INSTALLED_SOFTWARE == {"python": "3.10"}
-        assert config.INSTALLED_MODELS == [{"name": "test-model"}]
+        assert config.INSTALLED_ARTIFACTS == [{"name": "test-model"}]
         assert config.TASK_FILES_DIR == "/custom/path"
         assert config.HEARTBEAT_INTERVAL == 30
         assert config.RESULT_MAX_RETRIES == 10

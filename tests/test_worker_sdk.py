@@ -24,16 +24,16 @@ def test_worker_config_loads_from_env(monkeypatch):
 
 
 def test_task_registration():
-    """Tests that the @worker.task decorator correctly registers a task handler."""
+    """Tests that the @worker.skill decorator correctly registers a task handler."""
     worker = Worker(worker_type="test-worker")
 
-    @worker.task("my_test_task")
+    @worker.skill("my_test_task")
     def my_handler(params: dict):
         return {"status": "success"}
 
-    assert "my_test_task" in worker._task_handlers
-    assert worker._task_handlers["my_test_task"]["func"] == my_handler
-    assert worker._task_handlers["my_test_task"]["type"] is None
+    assert "my_test_task" in worker._skill_handlers
+    assert worker._skill_handlers["my_test_task"]["func"] == my_handler
+    assert worker._skill_handlers["my_test_task"]["type"] == "my_test_task"
 
 
 # --- Logical Integration Tests using MockTransport ---
@@ -61,7 +61,7 @@ async def test_worker_polls_executes_and_sends_result(monkeypatch):
         worker_type="integration-test-worker", clients=[({"url": "http://test-orchestrator", "weight": 1}, transport)]
     )
 
-    @worker.task("successful_task")
+    @worker.skill("successful_task")
     async def successful_handler(params: dict, **kwargs):
         return {"status": "success", "data": {"output": "ok"}}
 
@@ -123,9 +123,10 @@ async def test_send_progress():
     transport = MockTransport()
     worker = Worker(clients=[({"url": "http://test-orchestrator", "weight": 1}, transport)])
 
-    @worker.task("progress_task")
+    @worker.skill("progress_task")
     async def progress_task(params, send_progress, task_id, job_id, **kwargs):
         await send_progress(task_id, job_id, 0.5, "halfway")
+        return {"status": "success"}
 
     task_data = {
         "job_id": "j1",
@@ -138,10 +139,11 @@ async def test_send_progress():
 
     await worker._process_task(task_data)
 
-    assert len(transport.progress_updates) == 1
-    update = transport.progress_updates[0]
-    assert update.progress == 0.5
-    assert update.message == "halfway"
+    assert len(transport.emitted_events) == 1
+    event = transport.emitted_events[0]
+    assert event.event_type == "progress"
+    assert event.payload["progress"] == 0.5
+    assert event.payload["message"] == "halfway"
 
 
 @pytest.mark.asyncio
@@ -182,7 +184,8 @@ async def test_heartbeat_sends_skill_dependencies_and_hot_skills():
 
     heartbeat = transport.heartbeats[0]
     assert heartbeat.skill_dependencies == skill_deps
-    assert sorted(heartbeat.hot_skills) == ["image_generation"]
+    hot_skill_names = [s.name for s in heartbeat.hot_skills]
+    assert sorted(hot_skill_names) == ["image_generation"]
 
     transport.heartbeats.clear()
 
@@ -221,45 +224,47 @@ def test_get_current_state_idle():
     """Tests that _get_current_state returns 'idle' and a list of tasks when not busy."""
     worker = Worker()
 
-    @worker.task("task-1")
+    @worker.skill("task-1")
     def task_1(params: dict):
         pass
 
-    @worker.task("task-2")
+    @worker.skill("task-2")
     def task_2(params: dict):
         pass
 
     state = worker._get_current_state()
     assert state["status"] == "idle"
-    assert sorted(state["supported_skills"]) == ["task-1", "task-2"]
+    skill_names = [s.name for s in state["supported_skills"]]
+    assert sorted(skill_names) == ["task-1", "task-2"]
 
 
-def test_get_current_state_with_task_type_limits():
+def test_get_current_state_with_skill_type_limits():
     """Tests that _get_current_state correctly filters tasks based on type limits."""
-    worker = Worker(task_type_limits={"gpu": 1})
+    worker = Worker(skill_type_limits={"gpu": 1})
 
-    @worker.task("gpu_task_1", task_type="gpu")
+    @worker.skill("gpu_task_1", type="gpu")
     def gpu_task_1(params: dict):
         pass
 
-    @worker.task("gpu_task_2", task_type="gpu")
+    @worker.skill("gpu_task_2", type="gpu")
     def gpu_task_2(params: dict):
         pass
 
-    @worker.task("cpu_task")
+    @worker.skill("cpu_task")
     def cpu_task(params: dict):
         pass
 
     # No GPU tasks running, so all tasks are available
     state = worker._get_current_state()
     assert state["status"] == "idle"
-    assert sorted(state["supported_skills"]) == ["cpu_task", "gpu_task_1", "gpu_task_2"]
+    skill_names = [s.name for s in state["supported_skills"]]
+    assert sorted(skill_names) == ["cpu_task", "gpu_task_1", "gpu_task_2"]
 
     # One GPU task is running, so no more GPU tasks can be started
     worker._current_load_by_type["gpu"] = 1
     state = worker._get_current_state()
     assert state["status"] == "idle"
-    assert state["supported_skills"] == ["cpu_task"]
+    assert [s.name for s in state["supported_skills"]] == ["cpu_task"]
 
 
 @pytest.mark.asyncio

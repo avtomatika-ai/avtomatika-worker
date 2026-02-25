@@ -28,9 +28,9 @@ def test_task_decorator_validation_invalid_name(monkeypatch):
     monkeypatch.setenv("ORCHESTRATOR_URL", "http://localhost:8080")
     worker = Worker()
 
-    with pytest.raises(ValueError, match="Invalid task name"):
+    with pytest.raises(ValueError, match="Invalid skill name"):
 
-        @worker.task(name="invalid/task name")
+        @worker.skill(name="invalid/task name")
         async def my_task(params, **kwargs):
             pass
 
@@ -39,9 +39,9 @@ def test_task_decorator_validation_invalid_type(monkeypatch):
     monkeypatch.setenv("ORCHESTRATOR_URL", "http://localhost:8080")
     worker = Worker()
 
-    with pytest.raises(ValueError, match="Invalid task type"):
+    with pytest.raises(ValueError, match="Invalid skill type"):
 
-        @worker.task(name="valid_task", task_type="invalid type!")
+        @worker.skill(name="valid_task", type="invalid type!")
         async def my_task(params, **kwargs):
             pass
 
@@ -50,8 +50,8 @@ def test_task_decorator_validation_success(monkeypatch):
     monkeypatch.setenv("ORCHESTRATOR_URL", "http://localhost:8080")
     worker = Worker()
 
-    @worker.task(name="valid_task", task_type="valid_type")
+    @worker.skill(name="valid_task", type="valid_type")
     async def my_task(params, **kwargs):
         pass
 
-    assert "valid_task" in worker._task_handlers
+    assert "valid_task" in worker._skill_handlers

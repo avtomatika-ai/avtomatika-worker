@@ -2,9 +2,9 @@ EN | [ES](https://github.com/avtomatika-ai/avtomatika-worker/blob/main/docs/es/R
 
 # Avtomatika Worker SDK
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License: MPL 2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](https://opensource.org/licenses/MPL-2.0)
+[![PyPI version](https://img.shields.io/pypi/v/avtomatika-worker.svg)](https://pypi.org/project/avtomatika-worker/)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/release/python-3110/)
-[![Code Style: Ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)](https://github.com/astral-sh/ruff)
 
 The official SDK for creating workers compatible with the **[Avtomatika Orchestrator](https://github.com/avtomatika-ai/avtomatika)**. It handles polling, heartbeats, S3 payload offloading, and graceful shutdown so you can focus on your business logic.
 
@@ -23,33 +23,42 @@ Extras:
 
 ### Option 1: CLI Usage (Recommended)
 
-Define your worker in a Python module (e.g., `app/main.py`):
+Define your worker in a Python module (e.g., `app/main.py`). The SDK automatically infers skill names and schemas from your code!
 
 ```python
 from avtomatika_worker import Worker
+from pydantic import BaseModel
 
 worker = Worker(worker_type="image-processor")
 
-@worker.task("resize")
-async def resize_image(params: dict, **kwargs):
+class ResizeParams(BaseModel):
+    width: int
+    height: int
+    url: str
+
+# Automatic: name="resize", schema from ResizeParams
+@worker.skill()
+async def resize(params: ResizeParams):
+    print(f"Resizing to {params.width}px")
     return {"status": "success", "data": {"result": "ok"}}
 ```
 
-### Option 2: Dynamic Skill Loading (No code changes)
+### Option 2: Dynamic Skill Loading
 
-Place your task handlers in the `skills/` directory (e.g., `skills/my_tasks.py`):
+Place your skill handlers in the `skills/` directory (e.g., `skills/my_skills.py`):
 
 ```python
 from avtomatika_worker import SkillBlueprint
 
 bp = SkillBlueprint()
 
-@bp.task("generate_preview")
-async def generate_preview(params: dict, **kwargs):
+# Add metadata for the Marketplace (optional)
+@bp.skill(price=0.5, category="AI")
+async def generate_preview(params: dict):
     return {"status": "success"}
 ```
 
-Run the worker, and it will automatically load all skills from the directory. You can specify the path via the `WORKER_SKILLS_DIR` environment variable or the `Worker(skills_dir=...)` constructor parameter (which takes precedence if both are provided):
+Run the worker, and it will automatically load all skills from the directory:
 
 ```bash
 # It will look into ./skills by default
@@ -58,19 +67,30 @@ worker run --app app.main:worker
 
 ## Key Features
 
-### 1. Structured Logging
+### 1. Smart Skill Registration
+- **Zero Configuration:** Names and schemas are inferred from function names and type hints.
+- **Auto-Contracts:** Both `input_schema` and `output_schema` are automatically generated from Pydantic models or standard Dataclasses.
+- **Generic Events:** Declare custom events via `@worker.skill(events={"alert": Schema})` and emit them using the `send_event` helper. Progress is also a system event.
+- **Dynamic Extensions:** Pass any custom fields (like `price` or `tier`) directly to the decorator.
+
+### 2. Optimized Network Traffic
+- **Skills Hashing:** Workers only send the full skill list when it actually changes. Periodic heartbeats use a lightweight `skills_hash`.
+- **Self-Healing Sync:** If the orchestrator loses worker metadata, it can trigger a `Full Sync` via heartbeat response, ensuring seamless recovery.
+- **Intelligent Transports:** Events are sent via WebSocket if available, falling back to HTTP automatically.
+
+### 3. Fail-Fast Validation
+- **Local Enforcement:** The SDK validates task results and events against their declared schemas locally. Errors are logged immediately, preventing the transmission of "broken" data.
+
+### 4. Structured Logging
 The SDK supports both human-readable and JSON logging.
 - `LOG_FORMAT=json` — for production (ELK, Grafana Loki).
 - `LOG_FORMAT=text` — for development (default).
 - All logs automatically include `worker_id`, `task_id`, and `job_id` context.
 
-### 2. Graceful Shutdown
-Built-in handling of `SIGTERM` and `SIGINT`. When a signal is received, the worker:
-1. Enters "Drain Mode" (stops taking new tasks).
-2. Waits for active tasks to complete (configurable via `WORKER_SHUTDOWN_TIMEOUT`).
-3. Sends final heartbeats and closes connections.
+### 5. Graceful Shutdown
+Built-in handling of `SIGTERM` and `SIGINT`.
 
-### 3. File System & S3 Offloading
+### 4. File System & S3 Offloading
 - **TaskFiles**: Async helper for isolated task workspaces.
 - **S3 Payload Offloading**: Automatic download/upload of large files via S3 URIs in task parameters (requires `[s3]` extra).
 

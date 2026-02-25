@@ -28,68 +28,53 @@ pip install "avtomatika-worker[s3]"
 
 ### Step 2: Create a Worker File
 
-Create a Python file (e.g., `my_worker.py`) and import the `Worker` class.
+Create a Python file (e.g., `my_worker.py`) and import the `Worker` class. The SDK uses **Automatic Inference** to reduce boilerplate code.
 
 ```python
 import asyncio
 from avtomatika_worker import Worker
+from pydantic import BaseModel
 
 # 1. Initialize the Worker class
-# You can specify a unique type for your worker.
 worker = Worker(worker_type="my-custom-worker")
 
-# 2. Define task handlers using the @worker.task decorator
-@worker.task("generate_report")
-async def generate_report_handler(params: dict, **kwargs) -> dict:
-    """
-    This function will be called when the Orchestrator sends
-    a task of type "generate_report".
+# 2. Define data models for your skills
+class ReportParams(BaseModel):
+    data_source: str
+    format: str = "pdf"
 
-    - `params` (dict): Positional argument containing task execution parameters.
-    - `**kwargs`: Keyword arguments with task metadata:
-        - `task_id` (str): Unique ID of the task.
-        - `job_id` (str): ID of the parent Job.
-        - `priority` (float): Task priority.
+# 3. Define skill handlers using the @worker.skill decorator
+# The SDK automatically infers:
+# - name: "generate_report" (from function name)
+# - input_schema: generated from ReportParams
+@worker.skill(description="Generates complex reports")
+async def generate_report(params: ReportParams, send_progress, send_event, **kwargs) -> dict:
+    """
+    - `params` (ReportParams): Validated and typed parameters. 
+      IMPORTANT: The argument MUST be named 'params' for automatic schema inference to work.
+    - `send_progress`: Async function to send progress updates.
+    - `send_event`: Async function to emit custom events.
+    - `**kwargs`: Metadata: task_id, job_id, etc.
     """
     task_id = kwargs.get("task_id")
-    job_id = kwargs.get("job_id")
-    priority = kwargs.get("priority", 0.0)
 
-    print(f"Received parameters: {params}")
+    print(f"Generating {params.format} report from {params.data_source}")
 
-    # Simulate long work with progress reporting
-    print("Starting report generation...")
-    await asyncio.sleep(2)
-    # Use worker.send_progress to send an update to the Orchestrator
-    await worker.send_progress(task_id, job_id, progress=0.5, message="Analyzed 50% of data")
-    await asyncio.sleep(2)
-    print("Report generation completed.")
+    # Send progress (standard event)
+    await send_progress(progress=0.5, message="Processing data...")
+    
+    # Send custom event
+    await send_event("milestone", {"name": "data_parsed"})
 
-
-    # 3. Return the result
-    #    - 'status' (required): "success", "failure", or a custom status.
-    #    - 'data' (optional): Dictionary with data to be added to the Job context.
-    #    - 'error' (optional when status="failure"): Dictionary with error details.
-    #      - 'code': "TRANSIENT_ERROR", "PERMANENT_ERROR", or "INVALID_INPUT_ERROR".
-    #      - 'message': Human-readable error description.
     return {
         "status": "success",
-        "data": {"report_url": "/path/to/report.pdf"}
+        "data": {"report_url": f"s3://bucket/reports/{task_id}.pdf"}
     }
 
-    # Example of returning an error
-    # return {
-    #     "status": "failure",
-    #     "error": {
-    #         "code": "TRANSIENT_ERROR",
-    #         "message": "Could not connect to external service."
-    #     }
-    # }
-
-@worker.task("send_email")
-async def send_email_handler(params: dict, **kwargs) -> dict:
-    print(f"Sending email with parameters: {params}")
-    await asyncio.sleep(1)
+# Dynamic Field Extension: add 'price' for the Marketplace
+@worker.skill(name="send_email", price=0.01)
+async def send_email(params: dict, **kwargs) -> dict:
+    print(f"Sending email: {params}")
     return {"status": "success"}
 
 # 4. Run the worker
@@ -101,260 +86,92 @@ if __name__ == "__main__":
 
 #### Option 1: Simple Connection (Single Orchestrator)
 
-This is the simplest method, suitable for most cases.
-
 ```dotenv
-# Your Orchestrator's address
 ORCHESTRATOR_URL=http://localhost:8080
-
-# Recommended authentication method
 WORKER_ID=report-worker-01
 WORKER_INDIVIDUAL_TOKEN=a-super-secret-token-for-this-worker
-
-# (Optional) Deprecated shared token authentication method
-# WORKER_TOKEN=your-secret-worker-token
 ```
 
 #### Option 2: Advanced Connection (Multiple Orchestrators)
 
-This method is used for High Availability (failover) or Load Balancing (round robin).
-
--   `ORCHESTRATORS_CONFIG`: Instead of `ORCHESTRATOR_URL`, this variable is used. It contains a JSON string with a list of all Orchestrators.
--   `MULTI_ORCHESTRATOR_MODE`: Defines how the Worker will interact with this list.
-
-**Example for High Availability (Failover):**
-In this mode, the Worker will work with `main-orchestrator`. If it becomes unavailable, the Worker automatically switches to `backup-orchestrator`.
-
 ```dotenv
-# The worker will poll 'main-orchestrator'. If it goes down,
-# the SDK automatically switches to 'backup-orchestrator'.
 ORCHESTRATORS_CONFIG='[
-    {"url": "http://main-orchestrator:8080"},
-    {"url": "http://backup-orchestrator:8080"}
+    {"url": "http://main-orchestrator:8080", "priority": 1},
+    {"url": "http://backup-orchestrator:8080", "priority": 2}
 ]'
-
-# FAILOVER mode is used by default, but can be specified explicitly.
 MULTI_ORCHESTRATOR_MODE=FAILOVER
-
-# Authentication settings remain the same
-WORKER_ID=report-worker-01
-WORKER_INDIVIDUAL_TOKEN=a-super-secret-token-for-this-worker
 ```
-
-**Example for Load Balancing (Round Robin):**
-In this mode, the Worker will alternately send task fetch requests to `orchestrator-1` and `orchestrator-2`, distributing the load.
-
-```dotenv
-# The worker will alternately poll both Orchestrators.
-ORCHESTRATORS_CONFIG='[
-    {"url": "http://orchestrator-1:8080"},
-    {"url": "http://orchestrator-2:8080"}
-]'
-
-MULTI_ORCHESTRATOR_MODE=ROUND_ROBIN
-
-WORKER_ID=report-worker-01
-WORKER_INDIVIDUAL_TOKEN=a-super-secret-token-for-this-worker
-```
-*Note: When using `ORCHESTRATORS_CONFIG`, the `ORCHESTRATOR_URL` variable is ignored.*
 
 ### Step 4: Real-time Communication (WebSocket)
 
-To enable this functionality, set the environment variable `WORKER_ENABLE_WEBSOCKETS=true`. Two new capabilities will then be available:
+To enable this functionality, set `WORKER_ENABLE_WEBSOCKETS=true`. This allows you to:
+1.  **Send Progress and Events:** Use the injected `send_progress` and `send_event` functions.
+2.  **Task Cancellation:** The Orchestrator can send a command that will instantly raise an `asyncio.CancelledError` in your handler.
 
-#### Sending Progress
 
-Inside your task handler, you can call the `worker.send_progress()` method to inform the Orchestrator about the progress of a long-running operation.
+### Step 5: Modular Skills (SkillBlueprint)
 
-```python
-await worker.send_progress(
-    task_id="...",      # Current task ID
-    job_id="...",       # Parent Job ID
-    progress=0.75,      # Float between 0.0 and 1.0
-    message="Processed 75% of video"  # Optional message
-)
-```
-> **Important:** `task_id` and `job_id` are now always passed to your handler as keyword arguments, along with `params`. See the example in Step 2.
+Organize tasks into modules in the `skills/` directory.
 
-#### Task Cancellation
-
-The SDK provides two task cancellation mechanisms:
-
-1.  **WebSocket (Push Model):** If WebSocket is enabled, the Orchestrator can send an immediate cancellation command. This raises an `asyncio.CancelledError` in your handler. This method provides the fastest reaction.
-
-2.  **Redis (Pull Model):** Even without WebSocket, you can implement "cooperative" cancellation for very long tasks. The SDK provides an async function `worker.check_for_cancellation(task_id)`. You should periodically call it inside your processing loop. If the function returns `True`, it means the Orchestrator requested cancellation. Your code should gracefully interrupt execution, perform cleanup, and return a `cancelled` status.
-
-**Example using `check_for_cancellation`:**
-```python
-@worker.task("train_model")
-async def train_model_handler(params: dict, task_id: str, job_id: str) -> dict:
-    for epoch in range(params.get("epochs", 100)):
-        # ... model training logic here ...
-
-        # Check cancellation flag at the end of each epoch
-        if await worker.check_for_cancellation(task_id):
-            print("Cancellation detected. Stopping training...")
-            # ... cleanup code (e.g., removing temporary files) ...
-            return {"status": "cancelled", "message": "Training was cancelled by user."}
-
-    return {"status": "success"}
-```
-
-This hybrid model ensures both fast cancellation via WebSocket and a reliable fallback mechanism via Redis that doesn't require a persistent connection.
-
-### Step 5: Running
-
-You can run the worker using the built-in `worker` CLI command. This is the recommended way for both development and production.
-
-```bash
-# Standard run
-worker run --app my_worker:worker
-
-# Development mode (auto-restarts on code changes)
-worker run --app my_worker:worker --reload
-```
-
-The `--reload` feature requires the `watchdog` package (install via `pip install avtomatika-worker[dev]`). It monitors the current directory for changes in `.py` files and restarts the worker process automatically.
-
-### Step 6: Dynamic Skill Loading (Modular Architecture)
-
-Instead of defining all tasks in a single file, you can organize them into modules and place them in a specific directory (default: `skills/`).
-
-#### Using SkillBlueprint
-
-`SkillBlueprint` allows you to define tasks without needing a `Worker` instance immediately. This is useful for creating portable "skill packs".
-
-Create a file `skills/image_skills.py`:
+`skills/image_skills.py`:
 ```python
 from avtomatika_worker import SkillBlueprint
+from pydantic import BaseModel
 
-# 1. Create a blueprint
+class ResizeParams(BaseModel):
+    w: int
+    h: int
+
 bp = SkillBlueprint()
 
-# 2. Register tasks on the blueprint
-@bp.task("resize_image")
-async def resize_handler(params: dict, **kwargs):
-    return {"status": "success"}
-
-@bp.task("convert_format")
-async def convert_handler(params: dict, **kwargs):
+@bp.skill() # name="resize", schema from ResizeParams
+async def resize(params: ResizeParams):
     return {"status": "success"}
 ```
 
-#### Loading Skills into Worker
+The Worker will automatically load all skills from the directory specified in `WORKER_SKILLS_DIR`.
 
-When you initialize the `Worker`, it automatically scans the directory specified in `WORKER_SKILLS_DIR` (defaulting to `skills/` in the current working directory).
+### Step 6: Advanced Skill Registration
 
-If you want to manually include a blueprint:
-```python
-from avtomatika_worker import Worker
-from skills.image_skills import bp
+The `.skill()` decorator is highly flexible:
 
-worker = Worker()
-worker.include_blueprint(bp)
-```
+1.  **Zero-config:** `@worker.skill()` (Infers everything from code).
+2.  **Metadata:** `@worker.skill(price=0.5, category="ML")` (Creates dynamic extensions for the Marketplace).
+3.  **Strict Contract:** 
+    ```python
+    @dataclass(frozen=True)
+    class MyContract(SkillInfo):
+        price: float
+        
+    @worker.skill(MyContract(name="pro_render", price=1.0))
+    async def render(params: RenderModel): ...
+    ```
 
-### Step 7 (Optional): Working with Large Files via "Payload Offloading"
+### Step 7: Working with Large Files (S3 Offloading)
 
-If your tasks require processing large volumes of data (video, HD images, large text files), passing them directly through the Orchestrator is inefficient. The SDK supports a **"Payload Offloading"** mechanism, which allows transferring "heavy" data via S3-compatible storage. It uses the high-performance **`obstore`** library (Rust-based) for these operations.
+The SDK supports **"Payload Offloading"** via S3-compatible storage using the high-performance **`obstore`** library.
 
-#### How It Works:
-
-1.  **Client** uploads input files to S3 before creating a Job and passes only URIs like `s3://my-bucket/path/to/file.mp4` in the task parameters.
-2.  **Worker SDK** automatically detects such URIs in task parameters.
-3.  Before calling your handler, the SDK **downloads the file** from S3 to a temporary directory and replaces the `s3://` URI with the local file path.
-4.  Your handler code works with the file as a regular local file.
-5.  If your handler **returns a local file path** in the result, the SDK automatically **uploads this file to S3** and replaces the local path with an `s3://` URI.
-6.  The SDK also **automatically cleans up** all downloaded temporary files after the task completes.
-
-#### S3 Usage Example
-
-If the Orchestrator sends a task with parameter `{"video_path": "s3://bucket/input.mp4"}`, your code would look like this:
-
-```python
-import os
-from avtomatika_worker import Worker
-
-worker = Worker(worker_type="video-processor")
-
-@worker.task("resize_video")
-async def resize_video(params: dict, **kwargs):
-    # SDK has already downloaded the file. In params['video_path'] is now a local path
-    input_file = params["video_path"]
-    output_file = os.path.join(os.path.dirname(input_file), "resized.mp4")
-
-    # You work with files as regular local data
-    print(f"Processing file {input_file}...")
-    # ... processing logic (e.g., calling ffmpeg) ...
-
-    # Return the path to the created file.
-    # Important: the file must be inside TASK_FILES_DIR (default /tmp/payloads)
-    return {
-        "status": "success",
-        "data": {
-            "result_url": output_file
-        }
-    }
-```
-
-#### Working with File System (TaskFiles)
-
-For convenient path and temporary file management, the SDK provides the `TaskFiles` class. It allows you to ignore manual directory creation and provides an async interface for file operations. Just add an argument with type `TaskFiles` to your function:
+1.  **Auto-Download:** If `params` contains an `s3://` URI, the SDK downloads it to a local temporary folder before calling your handler.
+2.  **Auto-Upload:** If your handler returns a local path, the SDK uploads it to S3 and returns the URI to the Orchestrator.
+3.  **TaskFiles:** Use the `TaskFiles` class for easy async file operations in the task's isolated directory.
 
 ```python
 from avtomatika_worker import Worker, TaskFiles
 
-@worker.task("generate_file")
-async def generate_file(params: dict, files: TaskFiles, **kwargs):
-    # 1. Fast read/write
-    await files.write("report.txt", "Some data")
-    content = await files.read("report.txt")
+@worker.skill()
+async def process_video(params: dict, files: TaskFiles):
+    # 'video_url' in params might be an S3 URI, now replaced with local path
+    local_path = params["video_url"]
     
-    # 2. Get path (directory created automatically)
-    output_path = await files.path_to("result.mp4")
+    # Create result file
+    result_path = await files.path_to("output.mp4")
+    # ... process ...
     
-    # 3. Check and list files
-    if await files.exists("input.jpg"):
-        all_files = await files.list()
-        
-    return {"data": {"file": output_path}}
+    return {"status": "success", "data": {"result": result_path}}
 ```
 
-**Available Methods (all async):**
-- `await path_to(name)` — returns full path to file (creates task folder).
-- `await read(name, mode='r')` — reads entire file.
-- `await write(name, data, mode='w')` — writes data to file.
-- `await list()` — lists filenames in task folder.
-- `await exists(name)` — checks existence.
-- `async with open(name, mode)` — context manager for advanced usage.
-
-#### Working with Folders
-
-The SDK also supports recursive directory transfer:
-
-1.  **Download:** If an S3 link ends with `/` (e.g., `s3://bucket/dataset/`), the SDK downloads all contents of this prefix to a local folder. The task parameters will contain the path to this folder.
-2.  **Upload:** If you return a path to a local directory, the SDK recursively uploads all its contents to S3, preserving file structure. The result link will look like `s3://bucket/directory_name/`.
-
 #### S3 Configuration
+- `S3_ENDPOINT_URL`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_DEFAULT_BUCKET`.
+- `TASK_FILES_DIR`: Local root for temporary data (default: `/tmp/payloads`).
 
-To enable this functionality, you need to configure the following environment variables:
-
--   `S3_ENDPOINT_URL`: URL of your S3-compatible storage (e.g., `https://s3.amazonaws.com` or `http://localhost:9000` for MinIO).
--   `S3_ACCESS_KEY`: Access key for S3.
--   `S3_SECRET_KEY`: Secret key for S3.
--   `S3_DEFAULT_BUCKET`: Bucket name where results will be uploaded.
--   `S3_REGION`: The region for S3 storage (required by some providers, e.g., `us-east-1`).
--   `TASK_FILES_DIR`: **(Important for security)** Local directory where isolated workspaces for tasks are created. The SDK uploads to S3 only those files that are inside this directory. Default: `/tmp/payloads`.
-
-With these settings, the "Payload Offloading" mechanism will work completely automatically, requiring no changes to your handler code.
-
-> **Important: Automatic Cleanup**
->
-> The SDK automatically deletes the entire task directory (including all files downloaded and created via `TaskFiles`) immediately after processing completes and the result is sent. You don't need to worry about deleting temporary files.
-
-> **Important: S3 Consistency**
->
-> The SDK **does not automatically verify** that the Worker and Orchestrator use the same storage. You must manually ensure that:
-> 1. The Worker has access to the same `S3_ENDPOINT_URL` as the Orchestrator (or has network access to it).
-> 2. The Worker's credentials (`S3_ACCESS_KEY`/`S3_SECRET_KEY`) have read permissions for buckets linked by the Orchestrator.
-> 3. The Worker's credentials have write permissions to `S3_DEFAULT_BUCKET` for uploading results.
+> **Note:** The SDK automatically cleans up the entire task directory after the task completes.

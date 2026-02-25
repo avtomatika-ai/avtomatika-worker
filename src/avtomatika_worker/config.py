@@ -19,7 +19,6 @@ class WorkerConfig:
     """
 
     def __init__(self) -> None:
-        # --- Basic worker information ---
         self.WORKER_ID: str = getenv("WORKER_ID", f"worker-{uuid4()}")
         self.WORKER_TYPE: str = getenv("WORKER_TYPE", "generic-cpu-worker")
         self.WORKER_PORT: int = int(getenv("WORKER_PORT", "8083"))
@@ -28,10 +27,8 @@ class WorkerConfig:
         with suppress(gaierror):
             self.IP_ADDRESS = gethostbyname(self.HOSTNAME)
 
-        # --- Orchestrator settings ---
         self.ORCHESTRATORS: list[dict[str, Any]] = self._get_orchestrators_config()
 
-        # --- Security ---
         self.WORKER_TOKEN: str = getenv(
             "WORKER_INDIVIDUAL_TOKEN",
             getenv("WORKER_TOKEN", "your-secret-worker-token"),
@@ -40,25 +37,22 @@ class WorkerConfig:
         self.TLS_CERT_PATH: str | None = getenv("TLS_CERT_PATH")
         self.TLS_KEY_PATH: str | None = getenv("TLS_KEY_PATH")
 
-        # --- Resources and performance ---
         self.COST_PER_SKILL: dict[str, float] = self._load_json_from_env("COST_PER_SKILL", default={})
         self.MAX_CONCURRENT_TASKS: int = int(getenv("MAX_CONCURRENT_TASKS", "10"))
         self.RESOURCES: dict[str, Any] = {
             "cpu_cores": int(getenv("CPU_CORES", "4")),
-            "gpu_info": self._get_gpu_info(),
+            "devices": self._get_devices(),
         }
 
-        # --- Installed software and models (read as JSON strings) ---
         self.INSTALLED_SOFTWARE: dict[str, str] = self._load_json_from_env(
             "INSTALLED_SOFTWARE",
             default={"python": "3.11"},
         )
-        self.INSTALLED_MODELS: list[dict[str, str]] = self._load_json_from_env(
-            "INSTALLED_MODELS",
+        self.INSTALLED_ARTIFACTS: list[dict[str, str]] = self._load_json_from_env(
+            "INSTALLED_ARTIFACTS",
             default=[],
         )
 
-        # --- S3 Settings for payload offloading ---
         self.TASK_FILES_DIR: str = getenv("TASK_FILES_DIR", "/tmp/payloads")
         self.S3_ENDPOINT_URL: str | None = getenv("S3_ENDPOINT_URL")
         self.S3_ACCESS_KEY: str | None = getenv("S3_ACCESS_KEY")
@@ -66,7 +60,6 @@ class WorkerConfig:
         self.S3_DEFAULT_BUCKET: str = getenv("S3_DEFAULT_BUCKET", "avtomatika-payloads")
         self.S3_REGION: str = getenv("S3_REGION", "us-east-1")
 
-        # --- Tuning parameters ---
         self.HEARTBEAT_INTERVAL: float = float(getenv("HEARTBEAT_INTERVAL", "15"))
         self.RESULT_MAX_RETRIES: int = int(getenv("RESULT_MAX_RETRIES", "5"))
         self.RESULT_RETRY_INITIAL_DELAY: float = float(
@@ -82,6 +75,7 @@ class WorkerConfig:
         self.ENABLE_WEBSOCKETS: bool = getenv("WORKER_ENABLE_WEBSOCKETS", "false").lower() == "true"
         self.MULTI_ORCHESTRATOR_MODE: str = getenv("MULTI_ORCHESTRATOR_MODE", "FAILOVER")
         self.WORKER_SKILLS_DIR: str = getenv("WORKER_SKILLS_DIR", "skills")
+        self.STRICT_EVENT_VALIDATION: bool = getenv("STRICT_EVENT_VALIDATION", "true").lower() == "true"
 
         # --- Custom Extra Capabilities ---
         # Automatically pick up environment variables starting with WORKER_EXTRA_
@@ -119,10 +113,6 @@ class WorkerConfig:
                 raise ValueError("Orchestrator configuration missing URL.")
 
     def _get_orchestrators_config(self) -> list[dict[str, Any]]:
-        """
-        Loads orchestrator configuration from the ORCHESTRATORS_CONFIG environment variable.
-        For backward compatibility, if it is not set, it uses ORCHESTRATOR_URL.
-        """
         if orchestrators_json := getenv("ORCHESTRATORS_CONFIG"):
             try:
                 orchestrators = loads(orchestrators_json)
@@ -142,17 +132,21 @@ class WorkerConfig:
         return [{"url": orchestrator_url, "priority": 1, "weight": 1}]
 
     @staticmethod
-    def _get_gpu_info() -> dict[str, Any] | None:
-        """Collects GPU information from environment variables.
-        Returns None if GPU is not configured.
+    def _get_devices() -> list[dict[str, Any]] | None:
+        """Collects device information from environment variables.
+        Returns a list of HardwareDevice-compatible dictionaries.
         """
+        devices = []
         if gpu_model := getenv("GPU_MODEL"):
-            return {
-                "model": gpu_model,
-                "vram_gb": int(getenv("GPU_VRAM_GB", "0")),
-            }
-        else:
-            return None
+            devices.append(
+                {
+                    "type": "gpu",
+                    "model": gpu_model,
+                    "memory_gb": int(getenv("GPU_VRAM_GB", "0")),
+                }
+            )
+        # Add logic for other devices if needed
+        return devices if devices else None
 
     @staticmethod
     def _load_json_from_env(key: str, default: Any) -> Any:

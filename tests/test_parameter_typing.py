@@ -36,7 +36,7 @@ async def test_process_task_with_default_dict(mocker):
 
     received_params = None
 
-    @worker.task("dict_task")
+    @worker.skill("dict_task")
     async def my_handler(params: dict, **kwargs):
         nonlocal received_params
         received_params = params
@@ -62,7 +62,7 @@ async def test_process_task_with_simple_dataclass_success(mocker):
     worker = Worker()
     received_params = None
 
-    @worker.task("dataclass_task")
+    @worker.skill("dataclass_task")
     async def my_handler(params: SimpleDataclass, **kwargs):
         nonlocal received_params
         received_params = params
@@ -89,7 +89,7 @@ async def test_process_task_with_dataclass_validation_failure(mocker):
     client = mocker.AsyncMock(spec=Transport)
     worker = Worker()
 
-    @worker.task("dataclass_validation_task")
+    @worker.skill("dataclass_validation_task")
     async def my_handler(params: DataclassWithValidation, **kwargs):
         return {"status": "success"}
 
@@ -117,7 +117,7 @@ async def test_process_task_with_pydantic_success(mocker):
     worker = Worker()
     received_params = None
 
-    @worker.task("pydantic_task")
+    @worker.skill("pydantic_task")
     async def my_handler(params: PydanticModel, **kwargs):
         nonlocal received_params
         received_params = params
@@ -144,7 +144,7 @@ async def test_process_task_with_pydantic_validation_failure(mocker):
     client = mocker.AsyncMock(spec=Transport)
     worker = Worker()
 
-    @worker.task("pydantic_validation_task")
+    @worker.skill("pydantic_validation_task")
     async def my_handler(params: PydanticModel, **kwargs):
         return {"status": "success"}
 

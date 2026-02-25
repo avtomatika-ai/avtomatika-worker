@@ -9,23 +9,27 @@ from avtomatika_worker.worker import Worker
 
 
 @pytest.mark.asyncio
-async def test_validate_config_warns_on_unused_task_type_limits(mocker):
+async def test_validate_config_warns_on_unused_skill_type_limits(mocker):
     """
     Tests that _validate_config warns when a task type limit is defined
     but no task with that type is registered.
     """
     logger_mock = mocker.patch("avtomatika_worker.worker.logger.warning")
-    worker = Worker(task_type_limits={"gpu": 1})
+    worker = Worker(skill_type_limits={"gpu": 1})
 
-    @worker.task("cpu_task")
+    @worker.skill("cpu_task")
     def cpu_task(params: dict):
         pass
 
-    worker._validate_task_types()
+    worker._validate_skill_types()
 
-    logger_mock.assert_called_once_with(
-        "Configuration warning: A limit is defined for task type 'gpu', but no tasks are registered with this type."
+    # The Skill decorator might also trigger a warning if 'cpu_task' type is not in limits.
+    # We check that our specific configuration warning is present.
+    config_warning = (
+        "Configuration warning: A limit is defined for skill type 'gpu', but no tasks are registered with this type."
     )
+    any_match = any(config_warning in call.args[0] for call in logger_mock.call_args_list)
+    assert any_match, f"Expected warning '{config_warning}' not found in logger calls."
 
 
 @pytest.mark.asyncio
@@ -81,7 +85,7 @@ async def test_poll_for_tasks_receives_task(mocker):
     worker = Worker()
 
     # Register a dummy task so the worker is not "busy" (has supported tasks)
-    @worker.task("successful_task")
+    @worker.skill("successful_task")
     def dummy_handler(params):
         pass
 
@@ -108,7 +112,7 @@ async def test_poll_for_tasks_no_task(mocker):
     worker = Worker()
 
     # Register a dummy task so the worker is not "busy" (has supported tasks)
-    @worker.task("dummy_task")
+    @worker.skill("dummy_task")
     def dummy_handler(params):
         pass
 
@@ -173,7 +177,7 @@ async def test_process_task_exception(mocker):
 
     client = mocker.AsyncMock(spec=Transport)
 
-    @worker.task("failing_task")
+    @worker.skill("failing_task")
     def failing_task(params: dict, **kwargs):
         raise ValueError("Task failed")
 
@@ -215,7 +219,7 @@ async def test_process_unsupported_task(mocker):
     client.send_result.assert_called_once()
     payload = client.send_result.call_args.args[0]
     assert payload.status == "failure"
-    assert payload.error.message == "Unsupported task: unsupported_task"
+    assert payload.error.message == "Unsupported skill: unsupported_task"
 
 
 @pytest.mark.asyncio
@@ -224,7 +228,7 @@ async def test_process_task_cancelled(mocker):
     worker = Worker()
     client = mocker.AsyncMock(spec=Transport)
 
-    @worker.task("cancellable_task")
+    @worker.skill("cancellable_task")
     async def cancellable_task(params: dict, **kwargs):
         raise asyncio.CancelledError
 

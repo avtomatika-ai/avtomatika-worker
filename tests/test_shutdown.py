@@ -15,7 +15,7 @@ async def test_graceful_shutdown_drains_tasks(mocker):
 
     task_completed = False
 
-    @worker.task("long_task")
+    @worker.skill("long_task")
     async def long_handler(params, **kwargs):
         nonlocal task_completed
         await asyncio.sleep(0.5)
@@ -54,7 +54,7 @@ async def test_shutdown_timeout(mocker):
 
     task_interrupted = False
 
-    @worker.task("infinite_task")
+    @worker.skill("infinite_task")
     async def infinite_handler(params, **kwargs):
         nonlocal task_interrupted
         try:

@@ -60,7 +60,7 @@ async def test_worker_logging_context(monkeypatch):
     handler.addFilter(_context_filter)
     root_logger.addHandler(handler)
 
-    @worker.task("test_task")
+    @worker.skill("test_task")
     async def task_handler(params, **kwargs):
         logging.getLogger("test").info("Inside task")
         return {"status": "success"}

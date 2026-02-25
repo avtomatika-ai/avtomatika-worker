@@ -7,14 +7,15 @@ def test_blueprint_registration():
     """Tests that SkillBlueprint correctly collects tasks."""
     bp = SkillBlueprint()
 
-    @bp.task("bp_task", task_type="gpu")
+    @bp.skill("bp_task", type="gpu")
     def my_handler(params):
         return {"status": "success"}
 
-    assert len(bp._tasks) == 1
-    assert bp._tasks[0][0] == "bp_task"
-    assert bp._tasks[0][1] == "gpu"
-    assert bp._tasks[0][2] == my_handler
+    assert len(bp._skills) == 1
+    skill_info, handler = bp._skills[0]
+    assert skill_info.name == "bp_task"
+    assert skill_info.type == "gpu"
+    assert handler == my_handler
 
 
 def test_worker_include_blueprint():
@@ -22,14 +23,14 @@ def test_worker_include_blueprint():
     worker = Worker()
     bp = SkillBlueprint()
 
-    @bp.task("bp_task")
+    @bp.skill("bp_task")
     def my_handler(params):
         pass
 
     worker.include_blueprint(bp)
 
-    assert "bp_task" in worker._task_handlers
-    assert worker._task_handlers["bp_task"]["func"] == my_handler
+    assert "bp_task" in worker._skill_handlers
+    assert worker._skill_handlers["bp_task"]["func"] == my_handler
 
 
 @pytest.mark.asyncio
@@ -44,7 +45,7 @@ from avtomatika_worker import SkillBlueprint
 
 bp = SkillBlueprint()
 
-@bp.task("dynamic_task")
+@bp.skill("dynamic_task")
 def dynamic_handler(params):
     return {"status": "dynamic_ok"}
 """
@@ -53,7 +54,7 @@ def dynamic_handler(params):
     # Create a skill file with a setup(worker) function
     setup_skill_content = """
 def setup(worker):
-    @worker.task("setup_task")
+    @worker.skill("setup_task")
     def setup_handler(params):
         return {"status": "setup_ok"}
 """
@@ -64,12 +65,12 @@ def setup(worker):
     worker = Worker()
     await worker.load_skills()
 
-    assert "dynamic_task" in worker._task_handlers
-    assert "setup_task" in worker._task_handlers
+    assert "dynamic_task" in worker._skill_handlers
+    assert "setup_task" in worker._skill_handlers
 
     # Verify they actually work
-    assert worker._task_handlers["dynamic_task"]["func"](None) == {"status": "dynamic_ok"}
-    assert worker._task_handlers["setup_task"]["func"](None) == {"status": "setup_ok"}
+    assert worker._skill_handlers["dynamic_task"]["func"](None) == {"status": "dynamic_ok"}
+    assert worker._skill_handlers["setup_task"]["func"](None) == {"status": "setup_ok"}
 
 
 @pytest.mark.asyncio

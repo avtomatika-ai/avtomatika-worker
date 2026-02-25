@@ -2,9 +2,9 @@
 
 # Avtomatika Worker SDK
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License: MPL 2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](https://opensource.org/licenses/MPL-2.0)
+[![PyPI version](https://img.shields.io/pypi/v/avtomatika-worker.svg)](https://pypi.org/project/avtomatika-worker/)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/release/python-3110/)
-[![Code Style: Ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)](https://github.com/astral-sh/ruff)
 
 Официальный SDK для создания воркеров, совместимых с **[Avtomatika Orchestrator](https://github.com/avtomatika-ai/avtomatika)**. SDK берет на себя опрос задач, heartbeat-сообщения, передачу больших файлов через S3 и корректное завершение работы, позволяя вам сосредоточиться на бизнес-логике.
 
@@ -23,33 +23,42 @@ pip install avtomatika-worker
 
 ### Вариант 1: Использование CLI (Рекомендуется)
 
-Определите ваш воркер в модуле Python (например, `app/main.py`):
+Определите ваш воркер в модуле Python (например, `app/main.py`). SDK автоматически выведет имена и схемы навыков из вашего кода!
 
 ```python
 from avtomatika_worker import Worker
+from pydantic import BaseModel
 
 worker = Worker(worker_type="image-processor")
 
-@worker.task("resize")
-async def resize_image(params: dict, **kwargs):
+class ResizeParams(BaseModel):
+    width: int
+    height: int
+    url: str
+
+# Автоматически: name="resize", схема из ResizeParams
+@worker.skill()
+async def resize(params: ResizeParams):
+    print(f"Изменение размера до {params.width}px")
     return {"status": "success", "data": {"result": "ok"}}
 ```
 
-### Вариант 2: Динамическая загрузка скиллов (без изменения кода)
+### Вариант 2: Динамическая загрузка скиллов
 
-Просто поместите ваши обработчики задач в папку `skills/` (например, `skills/my_tasks.py`):
+Просто поместите ваши обработчики в папку `skills/` (например, `skills/my_skills.py`):
 
 ```python
 from avtomatika_worker import SkillBlueprint
 
 bp = SkillBlueprint()
 
-@bp.task("generate_preview")
-async def generate_preview(params: dict, **kwargs):
+# Добавьте метаданные для Биржи (опционально)
+@bp.skill(price=0.5, category="AI")
+async def generate_preview(params: dict):
     return {"status": "success"}
 ```
 
-Запустите воркер, и он автоматически подхватит все задачи из этой папки. Вы можете указать путь через переменную окружения `WORKER_SKILLS_DIR` или параметр конструктора `Worker(skills_dir=...)` (значение из конструктора имеет приоритет, если указаны оба варианта):
+Запустите воркер, и он автоматически подхватит все навыки из этой папки:
 
 ```bash
 # По умолчанию поиск идет в папке ./skills
@@ -58,19 +67,30 @@ worker run --app app.main:worker
 
 ## Ключевые возможности
 
-### 1. Структурное логирование
+### 1. Умная регистрация навыков
+- **Zero Configuration:** Имена и схемы выводятся автоматически из названий функций и аннотаций типов.
+- **Авто-контракты:** Генерация `input_schema` и `output_schema` из Pydantic-моделей или стандартных Dataclasses.
+- **Универсальные события:** Декларация кастомных сигналов через `@worker.skill(events={"alert": Schema})` и их отправка через хелпер `send_event`. Прогресс также является системным событием.
+- **Динамические расширения:** Передавайте любые поля (цена, категория) напрямую в декоратор.
+
+### 2. Оптимизация сетевого трафика
+- **Skills Hashing:** Воркер отправляет полный список навыков только при их изменении. Периодические Heartbeat-сообщения используют легковесный `skills_hash`.
+- **Самовосстановление (Self-Healing):** Если оркестратор теряет метаданные воркера, он может запросить `Full Sync` через ответ на Heartbeat, обеспечивая бесшовное восстановление.
+- **Интеллектуальный транспорт:** События отправляются через WebSocket (если доступен) с автоматическим откатом на HTTP POST.
+
+### 3. Fail-Fast Валидация
+- **Локальный контроль:** SDK проверяет результаты задач и события на соответствие схемам **до** их отправки в оркестратор. Ошибки логируются мгновенно, предотвращая передачу некорректных данных.
+
+### 4. Структурное логирование
 SDK поддерживает текстовый и JSON форматы логов.
 - `LOG_FORMAT=json` — для продакшена (ELK, Grafana Loki).
 - `LOG_FORMAT=text` — для локальной разработки (по умолчанию).
 - Все логи автоматически содержат контекст: `worker_id`, `task_id` и `job_id`.
 
-### 2. Корректное завершение (Graceful Shutdown)
-Встроенная обработка сигналов `SIGTERM` и `SIGINT`. При получении сигнала воркер:
-1. Входит в "Drain Mode" (перестает брать новые задачи).
-2. Дожидается завершения текущих задач (таймаут настраивается через `WORKER_SHUTDOWN_TIMEOUT`).
-3. Отправляет финальные heartbeat-сообщения и закрывает соединения.
+### 5. Корректное завершение (Graceful Shutdown)
+Встроенная обработка сигналов `SIGTERM` и `SIGINT`.
 
-### 3. Работа с файлами и S3
+### 4. Работа с файлами и S3
 - **TaskFiles**: Асинхронный помощник для работы в изолированной директории задачи.
 - **S3 Payload Offloading**: Автоматическое скачивание и загрузка тяжелых файлов, если в параметрах указаны `s3://` ссылки (требует `[s3]` экстру).
 

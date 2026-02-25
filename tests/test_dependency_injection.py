@@ -19,7 +19,7 @@ async def test_task_files_injection(mocker):
 
     injected_task_files = None
 
-    @worker.task("di_task")
+    @worker.skill("di_task")
     async def handler(params: dict, tf: TaskFiles, **kwargs):
         nonlocal injected_task_files
         injected_task_files = tf
