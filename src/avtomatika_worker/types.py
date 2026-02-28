@@ -1,7 +1,19 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+#
+# Copyright (c) 2026 Dmitrii Gagarin aka madgagarin
+
 from typing import Any, Awaitable, Callable
 
 from rxon.constants import (
+    ERROR_CODE_CONTRACT_VIOLATION as CONTRACT_VIOLATION_ERROR,
+)
+from rxon.constants import (
     ERROR_CODE_DEPENDENCY as DEPENDENCY_ERROR,
+)
+from rxon.constants import (
+    ERROR_CODE_DEPENDENCY_MISSING as DEPENDENCY_MISSING_ERROR,
 )
 from rxon.constants import (
     ERROR_CODE_INTERNAL as INTERNAL_ERROR,
@@ -40,7 +52,9 @@ __all__ = [
     "RESOURCE_EXHAUSTED_ERROR",
     "SECURITY_ERROR",
     "DEPENDENCY_ERROR",
+    "DEPENDENCY_MISSING_ERROR",
     "TIMEOUT_ERROR",
     "INTERNAL_ERROR",
+    "CONTRACT_VIOLATION_ERROR",
     "ParamValidationError",
 ]

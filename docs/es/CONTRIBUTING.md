@@ -1,28 +1,40 @@
 [EN](https://github.com/avtomatika-ai/avtomatika-worker/blob/main/CONTRIBUTING.md) | ES | [RU](https://github.com/avtomatika-ai/avtomatika-worker/blob/main/docs/ru/CONTRIBUTING.md)
 
-# Contribuir a Avtomatika Worker SDK
+# Contribuyendo al SDK del Worker de Avtomatika
 
-¡Gracias por ayudar a mejorar el Shell de nuestro ecosistema!
+¡Gracias por ayudarnos a mejorar el caparazón (Shell) de nuestro ecosistema!
 
-## Preparación
+## Configuración
 
-1.  Clone el repositorio y navegue a este directorio.
-2.  Instale las dependencias:
+1. Clone el repositorio y navegue hasta este directorio.
+2. Instale las dependencias de desarrollo:
     ```bash
-    pip install -e .[test,dev,s3,pydantic]
+    pip install -e .[dev]
     ```
+
+## Control de Calidad
+
+Utilizamos `ruff` para el linting y el formateo, y `mypy` para la comprobación de tipos. Por favor, asegúrese de que sus cambios pasen estas comprobaciones:
+
+```bash
+# Linting y formateo
+ruff check .
+ruff format .
+
+# Comprobación de tipos
+mypy src/avtomatika_worker
+```
 
 ## Pruebas
 
 Ejecute las pruebas específicas del worker:
 ```bash
-pytest tests/
+pytest
 ```
 
-## Agregar Nuevas Funciones
+## Adición de Nuevas Características
 
--   Si agrega un nuevo parámetro de configuración, actualice `src/avtomatika_worker/config.py`.
--   Si cambia la interacción del protocolo, asegure la compatibilidad con el paquete `rxon`.
--   **Siempre** actualice el `README.md` si cambia la API orientada al usuario (Skill API, Events).
--   Use `ruff check .` y `ruff format .` para verificar el estilo del código.
--   Asegúrese de que `mypy src/avtomatika_worker` no encuentre errores de tipo.
+- Si agrega un nuevo parámetro de configuración, actualice `src/avtomatika_worker/config.py`.
+- Si cambia la interacción del protocolo, asegúrese de la compatibilidad con el paquete `rxon`.
+- Actualice siempre el `README.md` si cambia la API de cara al usuario.
+- Todo el código nuevo debe tener sugerencias de tipos.

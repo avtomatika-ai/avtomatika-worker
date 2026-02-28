@@ -11,19 +11,20 @@ This document describes how to create a custom Worker compatible with the Orches
 Workers created with the SDK implement a hybrid interaction model with the Orchestrator:
 - **PULL Model for Task Fetching:** The worker initiates the connection to the Orchestrator and "pulls" tasks from its personal queue. This allows Workers to operate from any network, including behind NAT or corporate firewalls, without needing a public IP address.
 - **WebSocket for Real-time Communication:** An optional bidirectional channel for receiving commands (e.g., task cancellation) and sending intermediate execution progress.
+- **HLN Optimization:** The SDK uses the **Reverse Axon (RXON)** protocol, which reduces traffic by hashing skill lists and only sending updates when changes occur.
 
 ## How to Create a Worker with the SDK
 
 ### Step 1: Install `avtomatika-worker`
 
-Ensure the SDK is installed in your environment. If you are working in the main repository, you can install it in editable mode:
+Ensure the SDK is installed in your environment. Recommended for full features (S3 and Pydantic):
 ```bash
-pip install -e .
+pip install "avtomatika-worker[s3,pydantic]"
 ```
 
-To enable S3 support, install the `s3` extra:
+If you are working in the main repository, you can install it in editable mode:
 ```bash
-pip install "avtomatika-worker[s3]"
+pip install -e .[dev]
 ```
 
 ### Step 2: Create a Worker File
@@ -82,7 +83,19 @@ if __name__ == "__main__":
     worker.run()
 ```
 
-### Step 3: Connection and Authentication Configuration
+### Step 3: Run the Worker
+
+You can run the worker directly via Python or use the built-in CLI for better control:
+
+```bash
+# Recommended: runs worker and enables health-check server (default port 8083)
+worker run --app my_worker:worker
+
+# For development (auto-restarts on code changes)
+worker run --app my_worker:worker --reload
+```
+
+### Step 4: Connection and Authentication Configuration
 
 #### Option 1: Simple Connection (Single Orchestrator)
 
@@ -96,20 +109,20 @@ WORKER_INDIVIDUAL_TOKEN=a-super-secret-token-for-this-worker
 
 ```dotenv
 ORCHESTRATORS_CONFIG='[
-    {"url": "http://main-orchestrator:8080", "priority": 1},
-    {"url": "http://backup-orchestrator:8080", "priority": 2}
+    {"url": "http://main-orchestrator:8080", "priority": 1, "weight": 5},
+    {"url": "http://backup-orchestrator:8080", "priority": 2, "weight": 1}
 ]'
-MULTI_ORCHESTRATOR_MODE=FAILOVER
+MULTI_ORCHESTRATOR_MODE=ROUND_ROBIN  # Or FAILOVER
 ```
 
-### Step 4: Real-time Communication (WebSocket)
+### Step 5: Real-time Communication (WebSocket)
 
 To enable this functionality, set `WORKER_ENABLE_WEBSOCKETS=true`. This allows you to:
 1.  **Send Progress and Events:** Use the injected `send_progress` and `send_event` functions.
 2.  **Task Cancellation:** The Orchestrator can send a command that will instantly raise an `asyncio.CancelledError` in your handler.
 
 
-### Step 5: Modular Skills (SkillBlueprint)
+### Step 6: Modular Skills (SkillBlueprint)
 
 Organize tasks into modules in the `skills/` directory.
 
@@ -130,22 +143,6 @@ async def resize(params: ResizeParams):
 ```
 
 The Worker will automatically load all skills from the directory specified in `WORKER_SKILLS_DIR`.
-
-### Step 6: Advanced Skill Registration
-
-The `.skill()` decorator is highly flexible:
-
-1.  **Zero-config:** `@worker.skill()` (Infers everything from code).
-2.  **Metadata:** `@worker.skill(price=0.5, category="ML")` (Creates dynamic extensions for the Marketplace).
-3.  **Strict Contract:** 
-    ```python
-    @dataclass(frozen=True)
-    class MyContract(SkillInfo):
-        price: float
-        
-    @worker.skill(MyContract(name="pro_render", price=1.0))
-    async def render(params: RenderModel): ...
-    ```
 
 ### Step 7: Working with Large Files (S3 Offloading)
 
@@ -175,3 +172,10 @@ async def process_video(params: dict, files: TaskFiles):
 - `TASK_FILES_DIR`: Local root for temporary data (default: `/tmp/payloads`).
 
 > **Note:** The SDK automatically cleans up the entire task directory after the task completes.
+
+### Step 8: Health Checks
+
+By default, the SDK starts a small aiohttp server on `0.0.0.0:8083`. You can check the worker status at `/health`.
+This is useful for Kubernetes (Liveness/Readiness probes) or monitoring systems.
+- Variable: `WORKER_PORT` (default: 8083)
+- CLI flag: `--health-check` (enabled by default)

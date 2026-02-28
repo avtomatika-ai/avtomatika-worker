@@ -1,29 +1,35 @@
 [EN](https://github.com/avtomatika-ai/avtomatika-worker/blob/main/docs/DEVELOPMENT.md) | ES | [RU](https://github.com/avtomatika-ai/avtomatika-worker/blob/main/docs/ru/DEVELOPMENT.md)
 
-# Guía de Desarrollo del Worker
+# Guía de Desarrollo de Workers
 
 Este documento describe cómo crear un Worker personalizado compatible con el Orquestador utilizando `avtomatika-worker`.
 
 **Requisitos:** Python 3.11 o superior.
 
-## Concepto Principal
+## Concepto Central
 
 Los Workers creados con el SDK implementan un modelo de interacción híbrido con el Orquestador:
-- **Modelo PULL:** El worker inicia la conexión y "tira" (pull) de las tareas de su cola personal.
-- **WebSocket:** Canal bidireccional opcional para recibir comandos (ej., cancelación) y enviar progreso.
+- **Modelo PULL para la Obtención de Tareas:** El worker inicia la conexión con el Orquestador y "tira" de las tareas de su cola personal. Esto permite que los Workers operen desde cualquier red (incluyendo detrás de NAT o firewalls corporativos) sin necesidad de una dirección IP pública.
+- **WebSocket para Comunicación en Tiempo Real:** Un canal bidireccional opcional para recibir comandos (ej., cancelación de tareas) y enviar el progreso de ejecución intermedio.
+- **Optimización HLN:** El SDK utiliza el protocolo **Reverse Axon (RXON)**, que reduce el tráfico mediante el hashing de listas de habilidades y enviando solo las actualizaciones cuando ocurren cambios.
 
-## Cómo crear un Worker con el SDK
+## Cómo Crear un Worker con el SDK
 
 ### Paso 1: Instalar `avtomatika-worker`
 
+Asegúrese de que el SDK esté instalado en su entorno. Recomendado para todas las funciones (S3 y Pydantic):
 ```bash
-pip install avtomatika-worker
+pip install "avtomatika-worker[s3,pydantic]"
 ```
-Para soporte de S3: `pip install "avtomatika-worker[s3]"`
 
-### Paso 2: Crear un archivo de Worker
+Si está trabajando en el repositorio principal, puede instalarlo en modo editable:
+```bash
+pip install -e .[dev]
+```
 
-El SDK utiliza **Inferencia Automática** para reducir el código repetitivo.
+### Paso 2: Crear un Archivo de Worker
+
+Cree un archivo Python (ej., `my_worker.py`) e importe la clase `Worker`. El SDK utiliza la **Inferencia Automática** para reducir el código repetitivo.
 
 ```python
 import asyncio
@@ -31,22 +37,23 @@ from avtomatika_worker import Worker
 from pydantic import BaseModel
 
 # 1. Inicializar la clase Worker
-worker = Worker(worker_type="mi-worker-personalizado")
+worker = Worker(worker_type="my-custom-worker")
 
 # 2. Definir modelos de datos para sus habilidades
 class ReportParams(BaseModel):
     data_source: str
     format: str = "pdf"
 
-# 3. Definir manejadores usando el decorador @worker.skill
+# 3. Definir manejadores de habilidades usando el decorador @worker.skill
 # El SDK infiere automáticamente:
-# - nombre: "generar_informe" (del nombre de la función)
-# - esquema: generado desde ReportParams para el Marketplace
+# - name: "generate_report" (del nombre de la función)
+# - input_schema: generado a partir de ReportParams
 @worker.skill(description="Genera informes complejos")
-async def generar_informe(params: ReportParams, send_progress, send_event, **kwargs) -> dict:
+async def generate_report(params: ReportParams, send_progress, send_event, **kwargs) -> dict:
     """
-    - `params` (ReportParams): Parámetros validados y tipados.
-    - `send_progress`: Función asíncrona para enviar el progreso.
+    - `params` (ReportParams): Parámetros validados y tipados. 
+      IMPORTANTE: El argumento DEBE llamarse 'params' para que funcione la inferencia automática de esquemas.
+    - `send_progress`: Función asíncrona para enviar actualizaciones de progreso.
     - `send_event`: Función asíncrona para emitir eventos personalizados.
     - `**kwargs`: Metadatos: task_id, job_id, etc.
     """
@@ -55,7 +62,7 @@ async def generar_informe(params: ReportParams, send_progress, send_event, **kwa
     print(f"Generando informe {params.format} desde {params.data_source}")
 
     # Enviar progreso (evento estándar)
-    await send_progress(progress=0.5, message="Procesando...")
+    await send_progress(progress=0.5, message="Procesando datos...")
     
     # Enviar evento personalizado
     await send_event("milestone", {"name": "data_parsed"})
@@ -65,10 +72,10 @@ async def generar_informe(params: ReportParams, send_progress, send_event, **kwa
         "data": {"report_url": f"s3://bucket/reports/{task_id}.pdf"}
     }
 
-# Extensión Dinámica: agregar 'precio' para el Marketplace
-@worker.skill(name="enviar_email", price=0.01)
-async def enviar_email(params: dict, **kwargs) -> dict:
-    print(f"Enviando email: {params}")
+# Extensión de campo dinámico: agregar 'price' para el Marketplace
+@worker.skill(name="send_email", price=0.01)
+async def send_email(params: dict, **kwargs) -> dict:
+    print(f"Enviando correo: {params}")
     return {"status": "success"}
 
 # 4. Ejecutar el worker
@@ -76,23 +83,48 @@ if __name__ == "__main__":
     worker.run()
 ```
 
-### Paso 3: Configuración
+### Paso 3: Ejecutar el Worker
+
+Puede ejecutar el worker directamente a través de Python o usar la CLI integrada para un mejor control:
+
+```bash
+# Recomendado: ejecuta el worker y habilita el servidor de comprobación de salud (puerto 8083 por defecto)
+worker run --app my_worker:worker
+
+# Para el desarrollo (reinicio automático en cambios de código)
+worker run --app my_worker:worker --reload
+```
+
+### Paso 4: Configuración de Conexión y Autenticación
+
+#### Opción 1: Conexión Simple (Un Solo Orquestador)
 
 ```dotenv
 ORCHESTRATOR_URL=http://localhost:8080
 WORKER_ID=report-worker-01
-WORKER_INDIVIDUAL_TOKEN=mi-token-secreto
+WORKER_INDIVIDUAL_TOKEN=a-super-secret-token-for-this-worker
 ```
 
-### Paso 4: Comunicación en Tiempo Real (WebSocket)
+#### Opción 2: Conexión Avanzada (Múltiples Orquestadores)
 
-Para habilitar esta funcionalidad, establezca `WORKER_ENABLE_WEBSOCKETS=true`. Esto le permite:
-1.  **Enviar progreso y eventos:** Use las funciones inyectadas `send_progress` y `send_event`.
-2.  **Cancelación de tareas:** El Orquestador puede enviar un comando que lanzará instantáneamente un `asyncio.CancelledError` en su manejador.
+```dotenv
+ORCHESTRATORS_CONFIG='[
+    {"url": "http://main-orchestrator:8080", "priority": 1, "weight": 5},
+    {"url": "http://backup-orchestrator:8080", "priority": 2, "weight": 1}
+]'
+MULTI_ORCHESTRATOR_MODE=ROUND_ROBIN  # O FAILOVER
+```
 
-### Paso 5: Skills Modulares (SkillBlueprint)
+### Paso 5: Comunicación en Tiempo Real (WebSocket)
 
-Puede organizar sus habilidades en archivos dentro del directorio `skills/`.
+Para habilitar esta funcionalidad, configure `WORKER_ENABLE_WEBSOCKETS=true`. Esto le permite:
+1.  **Enviar Progreso y Eventos:** Use las funciones inyectadas `send_progress` y `send_event`.
+2.  **Cancelación de Tareas:** El Orquestador puede enviar un comando que lanzará instantáneamente un `asyncio.CancelledError` en su manejador.
+
+
+### Paso 6: Habilidades Modulares (SkillBlueprint)
+
+Organice las tareas en módulos en el directorio `skills/`.
 
 `skills/image_skills.py`:
 ```python
@@ -105,45 +137,45 @@ class ResizeParams(BaseModel):
 
 bp = SkillBlueprint()
 
-@bp.skill() # nombre="resize", esquema desde ResizeParams
+@bp.skill() # name="resize", esquema de ResizeParams
 async def resize(params: ResizeParams):
     return {"status": "success"}
 ```
 
-El Worker cargará automáticamente todos los skills del directorio `WORKER_SKILLS_DIR`.
+El Worker cargará automáticamente todas las habilidades del directorio especificado en `WORKER_SKILLS_DIR`.
 
-### Paso 6: Registro Avanzado de Skills
+### Paso 7: Trabajo con Archivos Grandes (Descarga de S3)
 
-El decorador `.skill()` soporta tres modos:
+El SDK admite la **"Descarga de Carga Útil"** (Payload Offloading) a través de almacenamiento compatible con S3 utilizando la biblioteca de alto rendimiento **`obstore`**.
 
-1.  **Cero-configuración:** `@worker.skill()` (todo se infiere del código).
-2.  **Metadatos:** `@worker.skill(price=0.5, category="AI")` (crea extensiones dinámicas).
-3.  **Contrato estricto:** Pase un objeto `SkillInfo` (o descendiente) directamente.
-
-### Paso 7: Trabajo con Archivos Grandes (S3 Offloading)
-
-El SDK admite la transferencia automática de datos pesados a través de S3 utilizando la librería **`obstore`**.
-
-1.  **Descarga Automática:** Si `params` contiene una URI `s3://`, el SDK la descarga antes de llamar a su código.
-2.  **Carga Automática:** Si devuelve una ruta local, el SDK la sube a S3 automáticamente.
-3.  **TaskFiles:** Use la clase `TaskFiles` para operaciones de archivos asíncronas en el directorio aislado de la tarea.
+1.  **Descarga Automática:** Si `params` contiene un URI `s3://`, el SDK lo descarga a una carpeta temporal local antes de llamar a su manejador.
+2.  **Carga Automática:** Si su manejador devuelve una ruta local, el SDK la sube a S3 y devuelve el URI al Orquestador.
+3.  **TaskFiles:** Use la clase `TaskFiles` para operaciones de archivo asíncronas fáciles en el directorio aislado de la tarea.
 
 ```python
 from avtomatika_worker import Worker, TaskFiles
 
 @worker.skill()
-async def procesar_video(params: dict, files: TaskFiles):
-    # 'video_url' reemplazado por la ruta local tras la descarga de S3
-    ruta_local = params["video_url"]
+async def process_video(params: dict, files: TaskFiles):
+    # 'video_url' en params podría ser un URI de S3, ahora reemplazado con la ruta local
+    local_path = params["video_url"]
     
     # Crear archivo de resultado
-    ruta_resultado = await files.path_to("output.mp4")
+    result_path = await files.path_to("output.mp4")
     # ... procesar ...
     
-    return {"status": "success", "data": {"result": ruta_resultado}}
+    return {"status": "success", "data": {"result": result_path}}
 ```
 
 #### Configuración de S3
-Use las variables: `S3_ENDPOINT_URL`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_DEFAULT_BUCKET`.
+- `S3_ENDPOINT_URL`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_DEFAULT_BUCKET`.
+- `TASK_FILES_DIR`: Raíz local para datos temporales (por defecto: `/tmp/payloads`).
 
-> **Nota:** El SDK elimina automáticamente todo el directorio de la tarea después de su finalización.
+> **Nota:** El SDK limpia automáticamente todo el directorio de la tarea una vez que se completa.
+
+### Paso 8: Comprobaciones de Salud (Health Checks)
+
+Por defecto, el SDK inicia un pequeño servidor aiohttp en `0.0.0.0:8083`. Puede comprobar el estado del worker en `/health`.
+Esto es útil para Kubernetes (probas de Liveness/Readiness) o sistemas de monitoreo.
+- Variable: `WORKER_PORT` (por defecto: 8083)
+- Bandera CLI: `--health-check` (habilitada por defecto)

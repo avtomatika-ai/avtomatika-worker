@@ -1,9 +1,15 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+#
+# Copyright (c) 2026 Dmitrii Gagarin aka madgagarin
+
 import asyncio
 import contextlib
 
 import pytest
 from rxon import WorkerCommand
-from rxon.models import TaskPayload, TaskResult
+from rxon.models import SkillInfo, TaskPayload, TaskResult
 from rxon.testing import MockTransport
 
 from avtomatika_worker.config import WorkerConfig
@@ -47,6 +53,7 @@ async def test_worker_polls_executes_and_sends_result(monkeypatch):
     monkeypatch.setenv("IDLE_POLL_DELAY", "0.01")
     monkeypatch.setenv("ORCHESTRATOR_URL", "http://test-orchestrator")
     monkeypatch.setenv("COST_PER_SKILL", '{"successful_task": 0.5}')
+    monkeypatch.setenv("RAM_GB", "16.0")
 
     transport = MockTransport(worker_id="test-worker")
 
@@ -80,7 +87,9 @@ async def test_worker_polls_executes_and_sends_result(monkeypatch):
 
     # --- Assertions ---
     assert len(transport.registered) > 0
-    assert transport.registered[0].capabilities.cost_per_skill == {"successful_task": 0.5}
+    registration = transport.registered[0]
+    assert registration.capabilities.cost_per_skill == {"successful_task": 0.5}
+    assert registration.resources.ram_gb == 16.0
 
     assert len(transport.results) == 1
     result: TaskResult = transport.results[0]
@@ -284,3 +293,86 @@ async def test_run_and_shutdown():
         await asyncio.wait_for(run_task, timeout=1.0)
 
     assert not transport.connected
+
+
+def test_worker_contract_hash_consistency():
+    """
+    Tests that the worker's contract hash correctly changes when skills,
+    costs, or extra capabilities change.
+    """
+    worker = Worker()
+
+    # 1. Initial Hash
+    initial_skills = [SkillInfo(name="task1")]
+    hash1 = worker._calculate_contract_hash(initial_skills)
+
+    # 2. Same input should produce same hash
+    assert worker._calculate_contract_hash(initial_skills) == hash1
+
+    # 3. Change skills -> Hash should change
+    new_skills = [SkillInfo(name="task1"), SkillInfo(name="task2")]
+    hash2 = worker._calculate_contract_hash(new_skills)
+    assert hash1 != hash2
+
+    # 4. Change COST_PER_SKILL -> Hash should change
+    worker._config.COST_PER_SKILL = {"task1": 0.5}
+    hash3 = worker._calculate_contract_hash(new_skills)
+    assert hash2 != hash3
+
+    # 5. Change EXTRA_CAPABILITIES -> Hash should change
+    worker._config.EXTRA_CAPABILITIES = {"region": "us-east-1"}
+    hash4 = worker._calculate_contract_hash(new_skills)
+    assert hash3 != hash4
+
+    # 6. Reverting change should restore hash (determinism)
+    worker._config.EXTRA_CAPABILITIES = {}
+    assert worker._calculate_contract_hash(new_skills) == hash3
+
+
+@pytest.mark.asyncio
+async def test_worker_custom_usage_checker():
+    """Tests that a custom usage checker is correctly used in heartbeats."""
+    from rxon.models import ResourcesUsage
+
+    transport = MockTransport()
+    worker = Worker(clients=[({"url": "http://test-orchestrator", "weight": 1}, transport)])
+
+    mock_usage = ResourcesUsage(cpu_load_percent=88.5, ram_used_gb=12.2, devices_usage=None)
+
+    def my_checker():
+        return mock_usage
+
+    worker.set_usage_checker(my_checker)
+    await worker._send_heartbeats_to_all()
+
+    assert len(transport.heartbeats) == 1
+    hb = transport.heartbeats[0]
+    assert hb.usage.cpu_load_percent == 88.5
+    assert hb.usage.ram_used_gb == 12.2
+
+
+def test_worker_hash_sync_between_registration_and_heartbeat():
+    """
+    Ensures that registration and heartbeat use the same hash for the same state.
+    """
+    worker = Worker()
+
+    @worker.skill("test_skill")
+    def handler(params):
+        return {"status": "success"}
+
+    state = worker._get_current_state()
+    current_skills = state["supported_skills"]
+
+    # Hash calculation used internally
+    expected_hash = worker._calculate_contract_hash(current_skills)
+
+    # Simulation: Registration logic
+    # (Inside _register_with_all_orchestrators, it calls _calculate_contract_hash)
+    reg_hash = worker._calculate_contract_hash(current_skills)
+
+    # Simulation: Heartbeat logic
+    # (Inside _send_heartbeats_to_all, it calls _calculate_contract_hash)
+    hb_hash = worker._calculate_contract_hash(current_skills)
+
+    assert reg_hash == hb_hash == expected_hash

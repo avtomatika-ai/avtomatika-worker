@@ -1,3 +1,9 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+#
+# Copyright (c) 2026 Dmitrii Gagarin aka madgagarin
+
 from __future__ import annotations
 
 from asyncio import (
@@ -249,11 +255,19 @@ class Worker:
                 o["current_weight"] = 0
                 self._total_orchestrator_weight += o.get("weight", 1)
         self._clients = clients or []
+        self._usage_checker: Callable[[], ResourcesUsage] | None = None
         if not self._clients and self._http_session:
             self._init_clients()
 
     def add_middleware(self, middleware: Middleware) -> None:
         self._middlewares.append(middleware)
+
+    async def emit_event(self, event: WorkerEventPayload) -> None:
+        """Publishes an event to all connected orchestrators."""
+        if not self._clients:
+            logger.warning("No clients connected. Cannot emit event.")
+            return
+        await gather(*[client.emit_event(event) for _, client in self._clients], return_exceptions=True)
 
     def include_blueprint(self, blueprint: SkillBlueprint) -> None:
         for skill_info, func in blueprint._skills:
@@ -611,7 +625,8 @@ class Worker:
                     "task_id": task_id,
                     "job_id": job_id,
                     "tracing_context": task_payload.tracing_context,
-                    "priority": task_data_raw.get("priority", 0),
+                    "priority": task_payload.priority,
+                    "deadline": task_payload.deadline,
                     "send_progress": send_progress_wrapper,
                     "send_event": send_event_wrapper,
                     "add_to_hot_cache": self.add_to_hot_cache,
@@ -749,19 +764,44 @@ class Worker:
             return data
         if not isinstance(data, dict):
             return data
-        fields_list = cast(Any, cls)._fields
-        filtered_data = {k: v for k, v in data.items() if k in fields_list}
-        return cls(**filtered_data)
+
+        if hasattr(cls, "_fields"):
+            # NamedTuple support
+            fields_list = cast(Any, cls)._fields
+            filtered_data = {k: v for k, v in data.items() if k in fields_list}
+            return cls(**filtered_data)
+        elif is_dataclass(cls):
+            # Dataclass support
+            known_field_names = {f.name for f in fields(cls)}
+            filtered_data = {k: v for k, v in data.items() if k in known_field_names}
+            return cls(**filtered_data)
+
+        return data
+
+    def _calculate_contract_hash(self, skills: list[SkillInfo]) -> str:
+        """Calculates a hash representing the worker's current 'contract' (skills + prices + capabilities)."""
+        from rxon.utils import calculate_dict_hash
+
+        combined_contract = {
+            "skills": skills,
+            "capabilities": self._config.COST_PER_SKILL,
+            "extra": self._config.EXTRA_CAPABILITIES,
+        }
+        return cast(str, calculate_dict_hash(combined_contract))
 
     async def _register_with_all_orchestrators(self) -> None:
         state = self._get_current_state()
         devices = None
         if self._config.RESOURCES.get("devices"):
-            devices = [HardwareDevice(**d) for d in self._config.RESOURCES["devices"]]
+            devices = [
+                HardwareDevice(**{k: v for k, v in d.items() if k in HardwareDevice._fields})
+                for d in self._config.RESOURCES["devices"]
+            ]
 
         resources = Resources(
             max_concurrent_tasks=self._config.MAX_CONCURRENT_TASKS,
             cpu_cores=self._config.RESOURCES["cpu_cores"],
+            ram_gb=self._config.RESOURCES.get("ram_gb", 0.0),
             devices=devices,
         )
         s3_hash = calculate_config_hash(
@@ -772,9 +812,7 @@ class Worker:
         combined_extra = {"websockets": self._config.ENABLE_WEBSOCKETS}
         combined_extra.update(self._config.EXTRA_CAPABILITIES)
 
-        from rxon.utils import calculate_dict_hash
-
-        skills_hash = calculate_dict_hash(state["supported_skills"])
+        skills_hash = self._calculate_contract_hash(state["supported_skills"])
         self._last_synced_skills_hash = skills_hash
 
         registration = WorkerRegistration(
@@ -783,7 +821,10 @@ class Worker:
             supported_skills=state["supported_skills"],
             resources=resources,
             installed_software=self._config.INSTALLED_SOFTWARE,
-            installed_artifacts=[InstalledArtifact(**m) for m in self._config.INSTALLED_ARTIFACTS],
+            installed_artifacts=[
+                InstalledArtifact(**{k: v for k, v in m.items() if k in InstalledArtifact._fields})
+                for m in self._config.INSTALLED_ARTIFACTS
+            ],
             capabilities=WorkerCapabilities(
                 hostname=self._config.HOSTNAME,
                 ip_address=self._config.IP_ADDRESS,
@@ -806,9 +847,26 @@ class Worker:
 
     def _get_resources_usage(self) -> ResourcesUsage:
         """Collects current resource usage metrics."""
-        # For now, using basic placeholders as psutil is not a dependency
-        # In a real scenario, this would use psutil or platform-specific tools
-        return ResourcesUsage(cpu_load_percent=0.0, ram_used_gb=0.0, devices_usage=None)
+        # HLN: Usage can be customized via a checker
+        if self._usage_checker is not None:
+            return self._usage_checker()
+
+        # Basic reporting using psutil if available
+        cpu_load = 0.0
+        ram_used = 0.0
+        try:
+            import psutil
+
+            cpu_load = psutil.cpu_percent()
+            ram_used = psutil.virtual_memory().used / (1024**3)  # GB
+        except ImportError:
+            pass
+
+        return ResourcesUsage(cpu_load_percent=cpu_load, ram_used_gb=ram_used, devices_usage=None)
+
+    def set_usage_checker(self, checker: Callable[[], ResourcesUsage]) -> None:
+        """Sets a custom callback for resource monitoring."""
+        self._usage_checker = checker
 
     async def _send_heartbeats_to_all(self) -> None:
         state = self._get_current_state()
@@ -825,17 +883,8 @@ class Worker:
                     final_hot_skills.append(SkillInfo(name=hs_name))
             hot_skills = final_hot_skills
 
-        from rxon.utils import calculate_dict_hash
-
         current_skills = state["supported_skills"]
-
-        # HLN Optimization: Hash includes skills AND capabilities (prices, etc.)
-        combined_contract = {
-            "skills": current_skills,
-            "capabilities": self._config.COST_PER_SKILL,
-            "extra": self._config.EXTRA_CAPABILITIES,
-        }
-        current_hash = calculate_dict_hash(combined_contract)
+        current_hash = self._calculate_contract_hash(current_skills)
 
         # HLN OPTIMIZATION: Only send skills if hash changed
         skills_to_send = None

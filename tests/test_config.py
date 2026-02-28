@@ -1,3 +1,9 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+#
+# Copyright (c) 2026 Dmitrii Gagarin aka madgagarin
+
 import os
 from unittest.mock import patch
 
@@ -70,7 +76,10 @@ def test_worker_config_custom_values():
         assert config.COST_PER_SKILL == {"skill1": 0.5}
         assert config.MAX_CONCURRENT_TASKS == 20
         assert config.RESOURCES["cpu_cores"] == 8
-        assert config.RESOURCES["devices"] == [{"type": "gpu", "model": "RTX 4090", "memory_gb": 24}]
+        assert config.RESOURCES["ram_gb"] == 0.0
+        assert config.RESOURCES["devices"] == [
+            {"type": "gpu", "model": "RTX 4090", "id": "0", "properties": {"memory_gb": 24}}
+        ]
         assert config.INSTALLED_SOFTWARE == {"python": "3.10"}
         assert config.INSTALLED_ARTIFACTS == [{"name": "test-model"}]
         assert config.TASK_FILES_DIR == "/custom/path"
@@ -83,6 +92,22 @@ def test_worker_config_custom_values():
         assert config.IDLE_POLL_DELAY == 0.02
         assert config.ENABLE_WEBSOCKETS
         assert config.MULTI_ORCHESTRATOR_MODE == "ROUND_ROBIN"
+
+
+def test_worker_config_extra_and_devices_and_ram(monkeypatch):
+    """Tests loading RAM_GB, EXTRA capabilities, and generic WORKER_DEVICES."""
+    monkeypatch.setenv("RAM_GB", "16.5")
+    monkeypatch.setenv("WORKER_EXTRA_REGION", "us-east-1")
+    monkeypatch.setenv("WORKER_EXTRA_TIER", '["standard", "pro"]')
+    monkeypatch.setenv("WORKER_DEVICES", '[{"type": "npu", "model": "Coral", "id": "1"}]')
+    monkeypatch.setenv("ORCHESTRATOR_URL", "http://localhost:8080")
+
+    config = WorkerConfig()
+    assert config.RESOURCES["ram_gb"] == 16.5
+    assert config.EXTRA_CAPABILITIES["region"] == "us-east-1"
+    assert config.EXTRA_CAPABILITIES["tier"] == ["standard", "pro"]
+    assert config.RESOURCES["devices"][-1]["type"] == "npu"
+    assert config.RESOURCES["devices"][-1]["model"] == "Coral"
 
 
 def test_get_orchestrators_config_invalid_json(caplog):

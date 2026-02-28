@@ -1,3 +1,9 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+#
+# Copyright (c) 2026 Dmitrii Gagarin aka madgagarin
+
 from __future__ import annotations
 
 from _socket import gaierror, gethostbyname, gethostname
@@ -41,6 +47,7 @@ class WorkerConfig:
         self.MAX_CONCURRENT_TASKS: int = int(getenv("MAX_CONCURRENT_TASKS", "10"))
         self.RESOURCES: dict[str, Any] = {
             "cpu_cores": int(getenv("CPU_CORES", "4")),
+            "ram_gb": float(getenv("RAM_GB", "0.0")),
             "devices": self._get_devices(),
         }
 
@@ -142,10 +149,21 @@ class WorkerConfig:
                 {
                     "type": "gpu",
                     "model": gpu_model,
-                    "memory_gb": int(getenv("GPU_VRAM_GB", "0")),
+                    "id": getenv("GPU_ID", "0"),
+                    "properties": {
+                        "memory_gb": int(getenv("GPU_VRAM_GB", "0")),
+                    },
                 }
             )
-        # Add logic for other devices if needed
+        # Support for generic devices via JSON env var
+        if generic_devices_json := getenv("WORKER_DEVICES"):
+            try:
+                generic_devices = loads(generic_devices_json)
+                if isinstance(generic_devices, list):
+                    devices.extend(generic_devices)
+            except (JSONDecodeError, TypeError):
+                logger.warning("Could not decode JSON from WORKER_DEVICES.")
+
         return devices if devices else None
 
     @staticmethod

@@ -14,10 +14,15 @@ The official SDK for creating workers compatible with the **[Avtomatika Orchestr
 pip install avtomatika-worker
 ```
 
+Recommended for full features:
+```bash
+pip install "avtomatika-worker[s3,pydantic]"
+```
+
 Extras:
-- `pip install "avtomatika-worker[s3]"` — for S3 payload offloading (requires `obstore`).
-- `pip install "avtomatika-worker[pydantic]"` — for Pydantic-based parameter validation.
-- `pip install "avtomatika-worker[dev]"` — for development features like CLI `--reload`.
+- `[s3]` — for S3 payload offloading (requires `obstore`).
+- `[pydantic]` — for Pydantic-based parameter validation.
+- `[dev]` — for development features like CLI `--reload`.
 
 ## Quick Start
 
@@ -71,9 +76,8 @@ worker run --app app.main:worker
 - **Zero Configuration:** Names and schemas are inferred from function names and type hints.
 - **Auto-Contracts:** Both `input_schema` and `output_schema` are automatically generated from Pydantic models or standard Dataclasses.
 - **Generic Events:** Declare custom events via `@worker.skill(events={"alert": Schema})` and emit them using the `send_event` helper. Progress is also a system event.
-- **Dynamic Extensions:** Pass any custom fields (like `price` or `tier`) directly to the decorator.
 
-### 2. Optimized Network Traffic
+### 2. Optimized Network Traffic (HLN Protocol)
 - **Skills Hashing:** Workers only send the full skill list when it actually changes. Periodic heartbeats use a lightweight `skills_hash`.
 - **Self-Healing Sync:** If the orchestrator loses worker metadata, it can trigger a `Full Sync` via heartbeat response, ensuring seamless recovery.
 - **Intelligent Transports:** Events are sent via WebSocket if available, falling back to HTTP automatically.
@@ -87,10 +91,7 @@ The SDK supports both human-readable and JSON logging.
 - `LOG_FORMAT=text` — for development (default).
 - All logs automatically include `worker_id`, `task_id`, and `job_id` context.
 
-### 5. Graceful Shutdown
-Built-in handling of `SIGTERM` and `SIGINT`.
-
-### 4. File System & S3 Offloading
+### 5. File System & S3 Offloading
 - **TaskFiles**: Async helper for isolated task workspaces.
 - **S3 Payload Offloading**: Automatic download/upload of large files via S3 URIs in task parameters (requires `[s3]` extra).
 
@@ -102,6 +103,7 @@ Built-in handling of `SIGTERM` and `SIGINT`.
 | `ORCHESTRATOR_URL` | Address of the orchestrator. | `http://localhost:8080` |
 | `LOG_FORMAT` | Log format: `text` or `json`. | `text` |
 | `LOG_LEVEL` | Minimum log level (DEBUG, INFO, etc). | `INFO` |
+| `WORKER_PORT` | Port for health-check server. | `8083` |
 | `WORKER_SHUTDOWN_TIMEOUT`| Max seconds to wait for tasks during shutdown. | `30.0` |
 | `WORKER_ENABLE_WEBSOCKETS`| Enable real-time commands (e.g., cancellation). | `false` |
 | `TASK_FILES_DIR` | Local directory for temporary S3 payloads. | `/tmp/payloads` |
@@ -124,6 +126,6 @@ docker run -e ORCHESTRATOR_URL=... my-worker worker run --app app:worker
 
 Install development dependencies:
 ```bash
-pip install -e .[test,dev]
+pip install -e .[dev]
 pytest
 ```

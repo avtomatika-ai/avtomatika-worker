@@ -1,65 +1,67 @@
 [EN](https://github.com/avtomatika-ai/avtomatika-worker/blob/main/docs/DEVELOPMENT.md) | [ES](https://github.com/avtomatika-ai/avtomatika-worker/blob/main/docs/es/DEVELOPMENT.md) | RU
 
-# Руководство по разработке Воркера
+# Руководство по разработке воркеров
 
-Этот документ описывает, как создать кастомный Воркер, совместимый с Оркестратором, используя `avtomatika-worker`.
+Этот документ описывает, как создать кастомный воркер, совместимый с оркестратором, используя `avtomatika-worker`.
 
 **Требования:** Python 3.11 или выше.
 
 ## Основная концепция
 
-Воркеры, созданные с помощью SDK, реализуют гибридную модель взаимодействия с Оркестратором:
-- **PULL-модель для получения задач:** Воркер сам инициирует соединение с Оркестратором и "вытягивает" (pull) задачи из своей персональной очереди. Это позволяет Воркерам работать из любой сети, в том числе за NAT или корпоративным файрволом.
-- **WebSocket для Real-time коммуникации:** Опциональный двунаправленный канал для получения команд (например, отмена задачи) и отправки промежуточного прогресса выполнения.
+Воркеры, созданные с помощью SDK, реализуют гибридную модель взаимодействия с оркестратором:
+- **PULL-модель для получения задач:** Воркер инициирует соединение с оркестратором и «вытягивает» задачи из своей очереди. Это позволяет воркерам работать из любой сети (даже за NAT или корпоративными файрволами) без необходимости внешнего IP-адреса.
+- **WebSocket для связи в реальном времени:** Опциональный двунаправленный канал для получения команд (например, отмена задачи) и отправки промежуточного прогресса выполнения.
+- **Оптимизация HLN:** SDK использует протокол **Reverse Axon (RXON)**, который снижает нагрузку на сеть за счет хеширования списка навыков и передачи только изменений.
 
-## Как создать Воркер с помощью SDK
+## Как создать воркер с помощью SDK
 
 ### Шаг 1: Установка `avtomatika-worker`
 
-Убедитесь, что SDK установлен в вашем окружении.
+Убедитесь, что SDK установлен в вашей среде. Рекомендуется установить со всеми основными расширениями (S3 и Pydantic):
 ```bash
-pip install avtomatika-worker
+pip install "avtomatika-worker[s3,pydantic]"
 ```
 
-Для поддержки S3:
+Если вы работаете в основном репозитории, вы можете установить его в режиме редактирования:
 ```bash
-pip install "avtomatika-worker[s3]"
+pip install -e .[dev]
 ```
 
-### Шаг 2: Создание файла Воркера
+### Шаг 2: Создание файла воркера
 
-SDK использует **автоматическое выведение данных (Inference)**, чтобы минимизировать количество шаблонного кода.
+Создайте Python-файл (например, `my_worker.py`) и импортируйте класс `Worker`. SDK использует **автоматический вывод (Inference)** для сокращения шаблонного кода.
 
 ```python
 import asyncio
 from avtomatika_worker import Worker
 from pydantic import BaseModel
 
-# 1. Инициализируйте класс Worker
+# 1. Инициализация класса Worker
 worker = Worker(worker_type="my-custom-worker")
 
-# 2. Определите модели данных для ваших навыков
+# 2. Определение моделей данных для ваших навыков
 class ReportParams(BaseModel):
     data_source: str
     format: str = "pdf"
 
-# 3. Определите обработчики с помощью декоратора @worker.skill
+# 3. Определение обработчиков навыков с помощью декоратора @worker.skill
 # SDK автоматически выведет:
-# - имя: "generate_report" (из названия функции)
-# - схему: сгенерирует из ReportParams для Биржи
+# - name: "generate_report" (из имени функции)
+# - input_schema: сгенерирована из ReportParams
 @worker.skill(description="Генерация сложных отчетов")
 async def generate_report(params: ReportParams, send_progress, send_event, **kwargs) -> dict:
     """
-    - `params` (ReportParams): Валидированные и типизированные параметры.
-    - `send_progress`: Асинхронная функция для отправки прогресса.
+    - `params` (ReportParams): Проверенные и типизированные параметры. 
+      ВАЖНО: Аргумент ДОЛЖЕН называться 'params' для автоматического вывода схемы.
+    - `send_progress`: Асинхронная функция для отправки обновлений прогресса.
     - `send_event`: Асинхронная функция для отправки кастомных событий.
-    - `**kwargs`: Метаданные: task_id, job_id и др.
+    - `**kwargs`: Метаданные: task_id, job_id и т.д.
     """
     task_id = kwargs.get("task_id")
 
-    print(f"Генерация отчета {params.format} из {params.data_source}")
+    print(f"Генерация {params.format} отчета из {params.data_source}")
 
-    # Отправка промежуточного прогресса (стандартное событие)
+    # Отправка прогресса (стандартное событие)
     await send_progress(progress=0.5, message="Обработка данных...")
     
     # Отправка кастомного события
@@ -70,18 +72,32 @@ async def generate_report(params: ReportParams, send_progress, send_event, **kwa
         "data": {"report_url": f"s3://bucket/reports/{task_id}.pdf"}
     }
 
-# Динамические поля: добавление цены для Маркетплейса
+# Динамическое расширение полей: добавим 'price' для Биржи (Marketplace)
 @worker.skill(name="send_email", price=0.01)
 async def send_email(params: dict, **kwargs) -> dict:
     print(f"Отправка email: {params}")
     return {"status": "success"}
 
-# 4. Запустите воркер
+# 4. Запуск воркера
 if __name__ == "__main__":
     worker.run()
 ```
 
-### Шаг 3: Настройка подключения
+### Шаг 3: Запуск воркера
+
+Вы можете запустить воркер напрямую через Python или использовать встроенный CLI для лучшего управления:
+
+```bash
+# Рекомендуется: запускает воркер и включает сервер проверки здоровья (health-check) на порту 8083 по умолчанию
+worker run --app my_worker:worker
+
+# Для разработки (автоматический перезапуск при изменении кода)
+worker run --app my_worker:worker --reload
+```
+
+### Шаг 4: Конфигурация соединения и аутентификации
+
+#### Вариант 1: Простое соединение (один оркестратор)
 
 ```dotenv
 ORCHESTRATOR_URL=http://localhost:8080
@@ -89,15 +105,26 @@ WORKER_ID=report-worker-01
 WORKER_INDIVIDUAL_TOKEN=a-super-secret-token-for-this-worker
 ```
 
-### Шаг 4: Real-time коммуникация (WebSocket)
+#### Вариант 2: Расширенное соединение (несколько оркестраторов)
 
-Для включения установите `WORKER_ENABLE_WEBSOCKETS=true`. Это позволит:
-1.  **Отправлять прогресс и события:** Используйте внедренные функции `send_progress` и `send_event`.
-2.  **Отмена задач:** Оркестратор может отправить команду, которая мгновенно вызовет `asyncio.CancelledError` в вашем обработчике.
+```dotenv
+ORCHESTRATORS_CONFIG='[
+    {"url": "http://main-orchestrator:8080", "priority": 1, "weight": 5},
+    {"url": "http://backup-orchestrator:8080", "priority": 2, "weight": 1}
+]'
+MULTI_ORCHESTRATOR_MODE=ROUND_ROBIN  # Или FAILOVER
+```
 
-### Шаг 5: Модульные навыки (SkillBlueprint)
+### Шаг 5: Связь в реальном времени (WebSocket)
 
-Вы можете организовать навыки в модули в папке `skills/`.
+Чтобы включить эту функциональность, установите `WORKER_ENABLE_WEBSOCKETS=true`. Это позволит вам:
+1.  **Отправлять прогресс и события:** Используйте функции `send_progress` и `send_event`.
+2.  **Отменять задачи:** Оркестратор может отправить команду, которая мгновенно вызовет `asyncio.CancelledError` в вашем обработчике.
+
+
+### Шаг 6: Модульные навыки (SkillBlueprint)
+
+Организуйте задачи в модули в директории `skills/`.
 
 `skills/image_skills.py`:
 ```python
@@ -110,46 +137,30 @@ class ResizeParams(BaseModel):
 
 bp = SkillBlueprint()
 
-@bp.skill() # имя="resize", схема из ResizeParams
+@bp.skill() # name="resize", схема из ResizeParams
 async def resize(params: ResizeParams):
     return {"status": "success"}
 ```
 
-Воркер автоматически загрузит все навыки из директории `WORKER_SKILLS_DIR`.
-
-### Шаг 6: Продвинутая регистрация навыков
-
-Декоратор `.skill()` поддерживает три режима:
-
-1.  **Zero-config:** `@worker.skill()` (всё выводится из кода).
-2.  **Метаданные:** `@worker.skill(price=0.5, category="AI")` (динамические расширения для Биржи).
-3.  **Строгий контракт:** 
-    ```python
-    @dataclass(frozen=True)
-    class MyContract(SkillInfo):
-        price: float
-        
-    @worker.skill(MyContract(name="pro_render", price=1.0))
-    async def render(params: RenderModel): ...
-    ```
+Воркер автоматически загрузит все навыки из директории, указанной в `WORKER_SKILLS_DIR`.
 
 ### Шаг 7: Работа с большими файлами (S3 Offloading)
 
-SDK поддерживает автоматическую передачу тяжелых данных через S3 с использованием библиотеки **`obstore`**.
+SDK поддерживает **"Payload Offloading"** через S3-совместимые хранилища с использованием высокопроизводительной библиотеки **`obstore`**.
 
-1.  **Авто-скачивание:** Если в `params` есть `s3://` ссылка, SDK скачает её во временную папку до вызова вашего кода.
-2.  **Авто-загрузка:** Если вы вернете локальный путь к файлу, SDK сам загрузит его в S3.
-3.  **TaskFiles:** Используйте класс `TaskFiles` для асинхронной работы с файлами в изолированной папке задачи.
+1.  **Авто-загрузка (Download):** Если `params` содержит URI `s3://`, SDK скачает файл в локальную временную папку перед вызовом вашего обработчика.
+2.  **Авто-выгрузка (Upload):** Если ваш обработчик возвращает локальный путь, SDK загрузит его в S3 и вернет URI оркестратору.
+3.  **TaskFiles:** Используйте класс `TaskFiles` для простых асинхронных операций с файлами в изолированной директории задачи.
 
 ```python
 from avtomatika_worker import Worker, TaskFiles
 
 @worker.skill()
 async def process_video(params: dict, files: TaskFiles):
-    # 'video_url' подменен локальным путем после скачивания из S3
+    # 'video_url' в params может быть S3 URI, теперь заменен на локальный путь
     local_path = params["video_url"]
     
-    # Создание файла результата
+    # Создание результирующего файла
     result_path = await files.path_to("output.mp4")
     # ... обработка ...
     
@@ -157,6 +168,14 @@ async def process_video(params: dict, files: TaskFiles):
 ```
 
 #### Настройка S3
-Используйте переменные: `S3_ENDPOINT_URL`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_DEFAULT_BUCKET`.
+- `S3_ENDPOINT_URL`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_DEFAULT_BUCKET`.
+- `TASK_FILES_DIR`: Локальный корень для временных данных (по умолчанию: `/tmp/payloads`).
 
-> **Примечание:** SDK автоматически удаляет всю директорию задачи после её завершения.
+> **Примечание:** SDK автоматически очищает всю директорию задачи после её завершения.
+
+### Шаг 8: Проверки здоровья (Health Checks)
+
+По умолчанию SDK запускает небольшой aiohttp-сервер на `0.0.0.0:8083`. Вы можете проверить статус воркера по адресу `/health`.
+Это полезно для Kubernetes (Liveness/Readiness пробы) или систем мониторинга.
+- Переменная: `WORKER_PORT` (по умолчанию: 8083)
+- Флаг CLI: `--health-check` (включен по умолчанию)

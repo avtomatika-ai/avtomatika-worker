@@ -8,9 +8,12 @@ Si descubre una vulnerabilidad de seguridad potencial en el Worker SDK, por favo
 
 ## Modelo de Seguridad
 
-Como parte fundamental del ecosistema HLN, el Worker SDK implementa:
-- **Soporte de Cliente mTLS**: Manejo automático de certificados de cliente.
-- **Rotación de Tokens**: Lógica integrada para refrescar tokens STS.
-- **Espacios de Trabajo Aislados**: Aislamiento del sistema de archivos por tarea para prevenir fugas de datos.
+El SDK del Worker es un componente central del ecosistema de Avtomatika, diseñado con principios de seguridad primero:
 
-Consulte el [Modelo de Seguridad HLN](../../packages/hln/SECURITY.md) completo para obtener más detalles.
+1.  **TLS Mutuo (mTLS)**: Admite certificados de cliente para una comunicación segura y autenticada con el Orquestador.
+2.  **Rotación Dinámica de Tokens**: Maneja automáticamente la actualización de los tokens de acceso STS sin necesidad de reiniciar el worker.
+3.  **Aislamiento Estricto**: Cada tarea opera en su propio directorio temporal (`TASK_FILES_DIR`). Los datos de una tarea no pueden ser accedidos por otra.
+4.  **Limpieza Automática**: Los datos temporales de la tarea se eliminan de forma segura inmediatamente después de la finalización o fallo de la tarea para evitar la permanencia de datos.
+5.  **Protección de Datos Sensibles**: Las credenciales de S3 y los tokens del orquestador se manejan exclusivamente a través de variables de entorno u objetos de configuración seguros, nunca se registran en los logs.
+
+Consulte el [Modelo de Seguridad HLN](https://github.com/avtomatika-ai/avtomatika/blob/main/packages/hln/SECURITY.md) completo para obtener detalles sobre todo el ecosistema.

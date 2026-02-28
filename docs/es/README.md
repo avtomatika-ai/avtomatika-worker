@@ -14,10 +14,15 @@ El SDK oficial para crear workers compatibles con el **[Orquestador Avtomatika](
 pip install avtomatika-worker
 ```
 
+Recomendado para todas las funciones:
+```bash
+pip install "avtomatika-worker[s3,pydantic]"
+```
+
 Extras:
-- `pip install "avtomatika-worker[s3]"` — para descarga de S3 (requiere `obstore`).
-- `pip install "avtomatika-worker[pydantic]"` — para validación de parámetros basada en Pydantic.
-- `pip install "avtomatika-worker[dev]"` — para funciones de desarrollo como CLI `--reload`.
+- `[s3]` — para descarga de S3 (requiere `obstore`).
+- `[pydantic]` — para validación de parámetros basada en Pydantic.
+- `[dev]` — para funciones de desarrollo como CLI `--reload`.
 
 ## Inicio Rápido
 
@@ -68,12 +73,11 @@ worker run --app app.main:worker
 ## Características Clave
 
 ### 1. Registro Inteligente de Skills
-- **Configuración Cero:** Los nombres y esquemas se infieren automáticamente de los nombres de las funciones и las pistas de tipo.
-- **Auto-Contratos:** Generación de `input_schema` y `output_schema` a partir de modelos Pydantic o Dataclasses estándar.
-- **Eventos Genéricos:** Declare señales personalizadas mediante `@worker.skill(events={"alert": Schema})` y emítalas usando el ayudante `send_event`. El progreso también es un evento del sistema.
-- **Extensiones Dinámicas:** Pase cualquier campo personalizado (como `price` o `category`) directamente al decorador.
+- **Configuración Cero:** Los nombres и esquemas se infieren automáticamente de los nombres de las funciones и las pistas de tipo.
+- **Auto-Contratos:** Generación de `input_schema` и `output_schema` a partir de modelos Pydantic o Dataclasses estándar.
+- **Eventos Genéricos:** Declare señales personalizadas mediante `@worker.skill(events={"alert": Schema})` и emítalas usando el ayudante `send_event`. El progreso también es un evento del sistema.
 
-### 2. Tráfico de Red Optimizado
+### 2. Tráfico de Red Optimizado (Protocolo HLN)
 - **Hashing de Skills:** Los workers solo envían la lista completa de habilidades cuando realmente cambia. Los latidos periódicos utilizan un `skills_hash` ligero.
 - **Sincronización Autorrecuperable (Self-Healing):** Si el orquestador pierde los metadatos del worker, puede solicitar una sincronización completa a través de la respuesta del latido, asegurando una recuperación perfecta.
 - **Transportes Inteligentes:** Los eventos se envían a través de WebSocket si está disponible, recurriendo a HTTP automáticamente.
@@ -87,10 +91,7 @@ El SDK admite el registro tanto en formato legible por humanos como en JSON.
 - `LOG_FORMAT=text` — para desarrollo (por defecto).
 - Todos los registros incluyen automáticamente el contexto de `worker_id`, `task_id` и `job_id`.
 
-### 5. Cierre Ordenado (Graceful Shutdown)
-Manejo integrado de `SIGTERM` и `SIGINT`.
-
-### 4. Sistema de Archivos y Descarga de S3
+### 5. Sistema de Archivos y Descarga de S3
 - **TaskFiles**: Asistente asíncrono para espacios de trabajo de tareas aislados.
 - **S3 Payload Offloading**: Descarga/carga automática de archivos grandes mediante URIs de S3 en los parámetros de la tarea (requiere extra `[s3]`).
 
@@ -102,6 +103,7 @@ Manejo integrado de `SIGTERM` и `SIGINT`.
 | `ORCHESTRATOR_URL` | Dirección del orquestador. | `http://localhost:8080` |
 | `LOG_FORMAT` | Formato de registro: `text` o `json`. | `text` |
 | `LOG_LEVEL` | Nivel de registro mínimo (DEBUG, INFO, etc). | `INFO` |
+| `WORKER_PORT` | Puerto para el servidor de health-check. | `8083` |
 | `WORKER_SHUTDOWN_TIMEOUT`| Segundos máx. para esperar tareas durante el cierre. | `30.0` |
 | `WORKER_ENABLE_WEBSOCKETS`| Habilitar comandos en tiempo real (ej. cancelación). | `false` |
 | `TASK_FILES_DIR` | Directorio local para cargas útiles temporales de S3. | `/tmp/payloads` |
@@ -124,6 +126,6 @@ docker run -e ORCHESTRATOR_URL=... my-worker worker run --app app:worker
 
 Instala las dependencias de desarrollo:
 ```bash
-pip install -e .[test,dev]
+pip install -e .[dev]
 pytest
 ```
