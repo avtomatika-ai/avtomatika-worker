@@ -72,6 +72,8 @@ class WorkerConfig:
         self.RESULT_RETRY_INITIAL_DELAY: float = float(
             getenv("RESULT_RETRY_INITIAL_DELAY", "1.0"),
         )
+        self.REGISTRATION_RETRY_INITIAL_DELAY: float = float(getenv("REGISTRATION_RETRY_INITIAL_DELAY", "1.0"))
+        self.REGISTRATION_RETRY_MAX_DELAY: float = float(getenv("REGISTRATION_RETRY_MAX_DELAY", "60.0"))
         self.HEARTBEAT_DEBOUNCE_DELAY: float = float(getenv("WORKER_HEARTBEAT_DEBOUNCE_DELAY", 0.1))
         self.TASK_POLL_TIMEOUT: float = float(getenv("TASK_POLL_TIMEOUT", "30"))
         self.TASK_POLL_ERROR_DELAY: float = float(

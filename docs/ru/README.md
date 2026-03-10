@@ -106,6 +106,8 @@ SDK поддерживает текстовый и JSON форматы лого�
 | `WORKER_PORT` | Порт для сервера проверки здоровья (health-check). | `8083` |
 | `WORKER_SHUTDOWN_TIMEOUT`| Макс. время ожидания задач при выключении (сек). | `30.0` |
 | `WORKER_ENABLE_WEBSOCKETS`| Включить WebSocket для команд (напр. отмена). | `false` |
+| `REGISTRATION_RETRY_INITIAL_DELAY`| Начальная пауза между попытками регистрации (сек). | `1.0` |
+| `REGISTRATION_RETRY_MAX_DELAY`| Максимальная пауза между попытками регистрации (сек). | `60.0` |
 | `TASK_FILES_DIR` | Локальная директория для временных данных S3. | `/tmp/payloads` |
 | `WORKER_SKILLS_DIR` | Папка для динамической загрузки скиллов. | `skills` |
 

@@ -12,6 +12,10 @@ Workers created with the SDK implement a hybrid interaction model with the Orche
 - **PULL Model for Task Fetching:** The worker initiates the connection to the Orchestrator and "pulls" tasks from its personal queue. This allows Workers to operate from any network, including behind NAT or corporate firewalls, without needing a public IP address.
 - **WebSocket for Real-time Communication:** An optional bidirectional channel for receiving commands (e.g., task cancellation) and sending intermediate execution progress.
 - **HLN Optimization:** The SDK uses the **Reverse Axon (RXON)** protocol, which reduces traffic by hashing skill lists and only sending updates when changes occur.
+- **Robust Connectivity:** 
+    - **Independent Orchestrators:** Each orchestrator connection is managed by a separate task. A failure of one server doesn't block communications with others.
+    - **Registration Retries:** Infinite retries with exponential backoff if an orchestrator is offline.
+    - **Non-blocking Startup:** The worker starts polling tasks as soon as it connects to at least one orchestrator.
 
 ## How to Create a Worker with the SDK
 

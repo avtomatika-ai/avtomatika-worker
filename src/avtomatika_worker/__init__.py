@@ -10,9 +10,18 @@ from importlib.metadata import PackageNotFoundError, version
 
 from .logging import setup_logging
 from .task_files import TaskFiles
-from .worker import SkillBlueprint, Worker
+from .worker import DeviceUsage, ResourcesUsage, SkillBlueprint, Worker, is_valid_identifier, validate_identifier
 
-__all__ = ["Worker", "SkillBlueprint", "TaskFiles", "setup_logging"]
+__all__ = [
+    "Worker",
+    "SkillBlueprint",
+    "TaskFiles",
+    "setup_logging",
+    "ResourcesUsage",
+    "DeviceUsage",
+    "is_valid_identifier",
+    "validate_identifier",
+]
 
 try:
     __version__ = version("avtomatika-worker")

@@ -65,7 +65,7 @@ async def test_worker_registration_payload(mocker):
     def task1(params: dict):
         pass
 
-    await worker._register_with_all_orchestrators()
+    await worker._register_client_with_retry(mock_transport)
 
     assert len(mock_transport.registered) == 1
     registration = mock_transport.registered[0]

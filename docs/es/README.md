@@ -106,7 +106,9 @@ El SDK admite el registro tanto en formato legible por humanos como en JSON.
 | `WORKER_PORT` | Puerto para el servidor de health-check. | `8083` |
 | `WORKER_SHUTDOWN_TIMEOUT`| Segundos máx. para esperar tareas durante el cierre. | `30.0` |
 | `WORKER_ENABLE_WEBSOCKETS`| Habilitar comandos en tiempo real (ej. cancelación). | `false` |
-| `TASK_FILES_DIR` | Directorio local para cargas útiles temporales de S3. | `/tmp/payloads` |
+| `REGISTRATION_RETRY_INITIAL_DELAY`| Retraso inicial para reintentos de registro (seg). | `1.0` |
+| `REGISTRATION_RETRY_MAX_DELAY`| Retraso máximo para reintentos de registro (seg). | `60.0` |
+| `TASK_FILES_DIR` | Directorio local para cargas temporales de S3. | `/tmp/payloads` |
 | `WORKER_SKILLS_DIR` | Directorio para cargar skills dinámicamente. | `skills` |
 
 ## Documentación

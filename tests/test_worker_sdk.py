@@ -165,7 +165,9 @@ async def test_hot_cache_update_and_heartbeat():
     worker.add_to_hot_cache("model-2")
     worker.remove_from_hot_cache("model-1")
 
-    await worker._send_heartbeats_to_all()
+    # Simulate Heartbeat
+    for _, client in worker._clients:
+        await worker._send_single_heartbeat(client)
 
     assert len(transport.heartbeats) == 1
     heartbeat = transport.heartbeats[0]
@@ -189,7 +191,9 @@ async def test_heartbeat_sends_skill_dependencies_and_hot_skills():
     # Case 1: One skill fully loaded
     worker.add_to_hot_cache("sd_v1.5")
     worker.add_to_hot_cache("vae")
-    await worker._send_heartbeats_to_all()
+    # Simulate Heartbeat
+    for _, client in worker._clients:
+        await worker._send_single_heartbeat(client)
 
     heartbeat = transport.heartbeats[0]
     assert heartbeat.skill_dependencies == skill_deps
@@ -200,7 +204,9 @@ async def test_heartbeat_sends_skill_dependencies_and_hot_skills():
 
     # Case 2: A model is removed, making the skill "cold"
     worker.remove_from_hot_cache("sd_v1.5")
-    await worker._send_heartbeats_to_all()
+    # Simulate Heartbeat
+    for _, client in worker._clients:
+        await worker._send_single_heartbeat(client)
 
     heartbeat = transport.heartbeats[0]
     assert heartbeat.hot_skills is None
@@ -343,7 +349,9 @@ async def test_worker_custom_usage_checker():
         return mock_usage
 
     worker.set_usage_checker(my_checker)
-    await worker._send_heartbeats_to_all()
+    # Simulate Heartbeat
+    for _, client in worker._clients:
+        await worker._send_single_heartbeat(client)
 
     assert len(transport.heartbeats) == 1
     hb = transport.heartbeats[0]
@@ -372,7 +380,7 @@ def test_worker_hash_sync_between_registration_and_heartbeat():
     reg_hash = worker._calculate_contract_hash(current_skills)
 
     # Simulation: Heartbeat logic
-    # (Inside _send_heartbeats_to_all, it calls _calculate_contract_hash)
+    # (It calls _calculate_contract_hash inside _send_single_heartbeat)
     hb_hash = worker._calculate_contract_hash(current_skills)
 
     assert reg_hash == hb_hash == expected_hash

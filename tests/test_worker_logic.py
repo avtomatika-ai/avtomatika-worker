@@ -42,17 +42,18 @@ async def test_validate_config_warns_on_unused_skill_type_limits(mocker):
 async def test_debounced_heartbeat_sender(mocker):
     """
     Tests that _debounced_heartbeat_sender waits for the correct delay
-    and then sends a heartbeat.
+    and then sends heartbeats.
     """
-    worker = Worker()
+    transport = mocker.AsyncMock(spec=Transport)
+    worker = Worker(clients=[({"url": "http://test", "weight": 1}, transport)])
     worker._config.HEARTBEAT_DEBOUNCE_DELAY = 0.01
-    mock_send_heartbeats = mocker.patch.object(worker, "_send_heartbeats_to_all", new_callable=mocker.AsyncMock)
+    mock_send_single = mocker.patch.object(worker, "_send_single_heartbeat", new_callable=mocker.AsyncMock)
     mock_sleep = mocker.patch("avtomatika_worker.worker.sleep", new_callable=mocker.AsyncMock)
 
     await worker._debounced_heartbeat_sender()
 
     mock_sleep.assert_called_once_with(0.01)
-    mock_send_heartbeats.assert_called_once()
+    mock_send_single.assert_called_once_with(transport)
 
 
 @pytest.mark.asyncio

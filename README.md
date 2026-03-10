@@ -106,6 +106,8 @@ The SDK supports both human-readable and JSON logging.
 | `WORKER_PORT` | Port for health-check server. | `8083` |
 | `WORKER_SHUTDOWN_TIMEOUT`| Max seconds to wait for tasks during shutdown. | `30.0` |
 | `WORKER_ENABLE_WEBSOCKETS`| Enable real-time commands (e.g., cancellation). | `false` |
+| `REGISTRATION_RETRY_INITIAL_DELAY`| Initial delay for registration retries (sec). | `1.0` |
+| `REGISTRATION_RETRY_MAX_DELAY`| Maximum delay for registration retries (sec). | `60.0` |
 | `TASK_FILES_DIR` | Local directory for temporary S3 payloads. | `/tmp/payloads` |
 | `WORKER_SKILLS_DIR` | Directory to dynamically load skills from. | `skills` |
 

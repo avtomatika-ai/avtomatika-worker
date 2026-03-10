@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from asyncio import (
+    FIRST_COMPLETED,
     CancelledError,
     Event,
     Task,
@@ -17,8 +18,10 @@ from asyncio import (
     run,
     sleep,
     to_thread,
+    wait,
     wait_for,
 )
+from asyncio import TimeoutError as AsyncTimeoutError
 from contextlib import suppress
 from dataclasses import fields, is_dataclass, make_dataclass, replace
 from importlib.util import module_from_spec, spec_from_file_location
@@ -47,6 +50,7 @@ from rxon.constants import (
 )
 from rxon.exceptions import RxonError
 from rxon.models import (
+    DeviceUsage,
     FileMetadata,
     HardwareDevice,
     Heartbeat,
@@ -64,7 +68,7 @@ from rxon.models import (
 from rxon.schema import extract_json_schema, extract_output_schema_from_func, extract_schema_from_func
 from rxon.security import create_client_ssl_context
 from rxon.utils import to_dict
-from rxon.validators import validate_identifier
+from rxon.validators import is_valid_identifier, validate_identifier
 
 from .config import WorkerConfig
 from .logging import clear_context, set_context, setup_logging
@@ -78,6 +82,19 @@ try:
     _PYDANTIC_INSTALLED = True
 except ImportError:
     _PYDANTIC_INSTALLED = False
+
+__all__ = [
+    "Worker",
+    "SkillBlueprint",
+    "ResourcesUsage",
+    "DeviceUsage",
+    "is_valid_identifier",
+    "validate_identifier",
+    "ParamValidationError",
+    "worker_extract_json_schema",
+    "worker_extract_output_schema_from_func",
+    "worker_extract_schema_from_func",
+]
 
 
 def worker_extract_json_schema(schema_type: Any) -> dict[str, Any] | None:
@@ -255,6 +272,7 @@ class Worker:
                 o["current_weight"] = 0
                 self._total_orchestrator_weight += o.get("weight", 1)
         self._clients = clients or []
+        self._comm_tasks: list[Task] = []
         self._usage_checker: Callable[[], ResourcesUsage] | None = None
         if not self._clients and self._http_session:
             self._init_clients()
@@ -460,7 +478,8 @@ class Worker:
 
     async def _debounced_heartbeat_sender(self) -> None:
         await sleep(self._config.HEARTBEAT_DEBOUNCE_DELAY)
-        await self._send_heartbeats_to_all()
+        for _, client in self._clients:
+            await self._send_single_heartbeat(client)
 
     def _schedule_heartbeat_debounce(self) -> None:
         if self._debounce_task and not self._debounce_task.done():
@@ -485,10 +504,23 @@ class Worker:
                 task = create_task(self._process_task(task_data_dict))
                 self._active_tasks[task_data.task_id] = task
         except RxonError as e:
-            logger.error(f"Error polling tasks: {e}")
+            logger.error(f"Error polling tasks from {client}: {e}")
 
     async def _start_polling(self) -> None:
-        await self._registered_event.wait()
+        try:
+            # Wait for either registration OR shutdown
+            done, pending = await wait(
+                [
+                    create_task(self._registered_event.wait()),
+                    create_task(self._shutdown_event.wait()),
+                ],
+                return_when=FIRST_COMPLETED,
+            )
+            for t in pending:
+                t.cancel()
+        except Exception:
+            pass
+
         while not self._shutdown_event.is_set():
             if self._get_current_state()["status"] == "busy":
                 await sleep(self._config.IDLE_POLL_DELAY)
@@ -614,9 +646,6 @@ class Worker:
                     error=error,
                 )
             else:
-                # RUNTIME VALIDATION depends on function annotations (Pydantic/Dataclass)
-                # Raw JSON Schema validation is removed to keep it lean.
-
                 params = await self._s3_manager.process_params(params, task_id, metadata=task_payload.params_metadata)
                 validated_params = self._prepare_task_params(handler_data["func"], params)
                 deps = self._prepare_dependencies(handler_data["func"], job_id, task_id)
@@ -747,15 +776,6 @@ class Worker:
                 self._current_load_by_type[skill_type_for_limit] -= 1
             self._schedule_heartbeat_debounce()
 
-    async def _manage_orchestrator_communications(self) -> None:
-        await self._register_with_all_orchestrators()
-        self._registered_event.set()
-        if self._config.ENABLE_WEBSOCKETS:
-            create_task(self._start_websocket_manager())
-        while not self._shutdown_event.is_set():
-            await self._send_heartbeats_to_all()
-            await sleep(self._config.HEARTBEAT_INTERVAL)
-
     @staticmethod
     def _from_dict(cls: type, data: Any) -> Any:
         if not data:
@@ -766,12 +786,10 @@ class Worker:
             return data
 
         if hasattr(cls, "_fields"):
-            # NamedTuple support
             fields_list = cast(Any, cls)._fields
             filtered_data = {k: v for k, v in data.items() if k in fields_list}
             return cls(**filtered_data)
         elif is_dataclass(cls):
-            # Dataclass support
             known_field_names = {f.name for f in fields(cls)}
             filtered_data = {k: v for k, v in data.items() if k in known_field_names}
             return cls(**filtered_data)
@@ -789,7 +807,7 @@ class Worker:
         }
         return cast(str, calculate_dict_hash(combined_contract))
 
-    async def _register_with_all_orchestrators(self) -> None:
+    def _create_registration_payload(self) -> WorkerRegistration:
         state = self._get_current_state()
         devices = None
         if self._config.RESOURCES.get("devices"):
@@ -815,7 +833,7 @@ class Worker:
         skills_hash = self._calculate_contract_hash(state["supported_skills"])
         self._last_synced_skills_hash = skills_hash
 
-        registration = WorkerRegistration(
+        return WorkerRegistration(
             worker_id=self._config.WORKER_ID,
             worker_type=self._config.WORKER_TYPE,
             supported_skills=state["supported_skills"],
@@ -834,7 +852,77 @@ class Worker:
             ),
             skills_hash=skills_hash,
         )
-        await gather(*[self._safe_register(client, registration) for _, client in self._clients])
+
+    async def _register_client_with_retry(self, client: Transport) -> None:
+        delay = self._config.REGISTRATION_RETRY_INITIAL_DELAY
+        while not self._shutdown_event.is_set():
+            registration = self._create_registration_payload()
+            try:
+                await self._safe_register(client, registration)
+                self._registered_event.set()
+                return
+            except Exception:
+                # _safe_register already logs the error
+                pass
+
+            logger.info(f"Retrying registration for {client} in {delay:.1f}s...")
+            try:
+                await wait_for(self._shutdown_event.wait(), timeout=delay)
+                return
+            except (TimeoutError, AsyncTimeoutError):
+                delay = min(delay * 2, self._config.REGISTRATION_RETRY_MAX_DELAY)
+
+    async def _manage_single_orchestrator(self, client: Transport) -> None:
+        """Maintains registration and heartbeats for a single orchestrator."""
+        while not self._shutdown_event.is_set():
+            await self._register_client_with_retry(client)
+            if self._shutdown_event.is_set():
+                break
+
+            while not self._shutdown_event.is_set():
+                try:
+                    await self._send_single_heartbeat(client)
+                    try:
+                        await wait_for(self._shutdown_event.wait(), timeout=self._config.HEARTBEAT_INTERVAL)
+                        break
+                    except (TimeoutError, AsyncTimeoutError):
+                        continue
+                except RxonError as e:
+                    err_msg = str(e).lower()
+                    if "not found" in err_msg or "unauthorized" in err_msg:
+                        logger.warning(f"Orchestrator {client} lost our session. Re-registering...")
+                        self._last_synced_skills_hash = None
+                        break
+                    else:
+                        logger.warning(f"Heartbeat failed for {client}: {e}")
+                        try:
+                            await wait_for(self._shutdown_event.wait(), timeout=self._config.HEARTBEAT_INTERVAL)
+                            break
+                        except (TimeoutError, AsyncTimeoutError):
+                            continue
+                except Exception as e:
+                    logger.error(f"Unexpected error in heartbeat loop for {client}: {e}")
+                    try:
+                        await wait_for(self._shutdown_event.wait(), timeout=self._config.HEARTBEAT_INTERVAL)
+                        break
+                    except (TimeoutError, AsyncTimeoutError):
+                        continue
+
+    async def _register_with_all_orchestrators(self) -> None:
+        """Starts background registration for all orchestrators. Blocks until at least one succeeds."""
+        try:
+            # Wait for either registration OR shutdown
+            done, pending = await wait(
+                [
+                    create_task(self._registered_event.wait()),
+                    create_task(self._shutdown_event.wait()),
+                ],
+                return_when=FIRST_COMPLETED,
+            )
+            for t in pending:
+                t.cancel()
+        except Exception:
+            pass
 
     @staticmethod
     async def _safe_register(client: Transport, registration: WorkerRegistration) -> None:
@@ -844,21 +932,20 @@ class Worker:
                 logger.warning(f"Registration warning from {client}: {warning}")
         except RxonError as e:
             logger.error(f"Registration failed for {client}: {e}")
+            raise
 
     def _get_resources_usage(self) -> ResourcesUsage:
         """Collects current resource usage metrics."""
-        # HLN: Usage can be customized via a checker
         if self._usage_checker is not None:
             return self._usage_checker()
 
-        # Basic reporting using psutil if available
         cpu_load = 0.0
         ram_used = 0.0
         try:
             import psutil
 
             cpu_load = psutil.cpu_percent()
-            ram_used = psutil.virtual_memory().used / (1024**3)  # GB
+            ram_used = psutil.virtual_memory().used / (1024**3)
         except ImportError:
             pass
 
@@ -868,7 +955,7 @@ class Worker:
         """Sets a custom callback for resource monitoring."""
         self._usage_checker = checker
 
-    async def _send_heartbeats_to_all(self) -> None:
+    def _create_heartbeat_payload(self) -> Heartbeat:
         state = self._get_current_state()
         hot_skills = None
         if self._skill_dependencies:
@@ -886,13 +973,12 @@ class Worker:
         current_skills = state["supported_skills"]
         current_hash = self._calculate_contract_hash(current_skills)
 
-        # HLN OPTIMIZATION: Only send skills if hash changed
         skills_to_send = None
         if current_hash != self._last_synced_skills_hash:
             logger.info(f"Worker contract changed (hash: {current_hash}). Sending full update.")
             skills_to_send = current_skills
 
-        heartbeat = Heartbeat(
+        return Heartbeat(
             worker_id=self._config.WORKER_ID,
             status=state["status"],
             usage=self._get_resources_usage(),
@@ -903,35 +989,33 @@ class Worker:
             hot_skills=hot_skills or None,
             skills_hash=current_hash,
         )
-        await gather(*[self._safe_heartbeat(client, heartbeat, current_hash) for _, client in self._clients])
 
-    async def _safe_heartbeat(self, client: Transport, heartbeat: Heartbeat, current_hash: str) -> None:
-        try:
-            resp = await client.send_heartbeat(heartbeat)
-            # If heartbeat accepted, update the synced hash
-            self._last_synced_skills_hash = current_hash
+    async def _send_single_heartbeat(self, client: Transport) -> None:
+        heartbeat = self._create_heartbeat_payload()
+        resp = await client.send_heartbeat(heartbeat)
+        if resp:
+            from rxon.constants import HB_RESP_CANCEL_TASKS, HB_RESP_REQUIRE_FULL_SYNC
 
-            if resp:
-                from rxon.constants import HB_RESP_CANCEL_TASKS, HB_RESP_REQUIRE_FULL_SYNC
+            if resp.get(HB_RESP_REQUIRE_FULL_SYNC):
+                logger.warning(f"Orchestrator {client} requested Full Sync. Resetting state.")
+                self._last_synced_skills_hash = None
 
-                # HLN SELF-HEALING: Forced Full Sync from Orchestrator
-                if resp.get(HB_RESP_REQUIRE_FULL_SYNC):
-                    logger.warning(f"Orchestrator {client} requested Full Sync. Resetting state.")
-                    self._last_synced_skills_hash = None
+            if HB_RESP_CANCEL_TASKS in resp:
+                for task_id in resp[HB_RESP_CANCEL_TASKS]:
+                    if task_id in self._active_tasks:
+                        logger.warning(f"Task {task_id} marked for cancellation via heartbeat feedback loop.")
+                        self._active_tasks[task_id].cancel()
 
-                if HB_RESP_CANCEL_TASKS in resp:
-                    for task_id in resp[HB_RESP_CANCEL_TASKS]:
-                        if task_id in self._active_tasks:
-                            logger.warning(f"Task {task_id} marked for cancellation via heartbeat feedback loop.")
-                            self._active_tasks[task_id].cancel()
-        except RxonError as e:
-            # HLN SELF-HEALING: If orchestrator doesn't know us, re-register
-            if "not found" in str(e).lower() or "unauthorized" in str(e).lower():
-                logger.warning(f"Orchestrator {client} lost our session. Re-registering...")
-                self._last_synced_skills_hash = None  # Reset hash to force full sync
-                await self._register_with_all_orchestrators()
-            else:
-                logger.warning(f"Heartbeat failed for {client}: {e}")
+    async def _manage_orchestrator_communications(self) -> None:
+        """Starts independent managers for each orchestrator."""
+        for _, client in self._clients:
+            self._comm_tasks.append(create_task(self._manage_single_orchestrator(client)))
+
+        if self._config.ENABLE_WEBSOCKETS:
+            self._comm_tasks.append(create_task(self._start_websocket_manager()))
+
+        await self._register_with_all_orchestrators()
+        await self._shutdown_event.wait()
 
     async def main(self) -> None:
         self._config.validate()
@@ -963,6 +1047,11 @@ class Worker:
         polling_task = create_task(self._start_polling())
         await self._shutdown_event.wait()
         logger.info("Shutdown signal received. Starting graceful shutdown...")
+
+        # Stop all sub-tasks
+        for task in self._comm_tasks:
+            task.cancel()
+
         polling_task.cancel()
         logger.info("Sending final 'offline' heartbeat to all orchestrators...")
         with suppress(Exception):
@@ -985,7 +1074,7 @@ class Worker:
                 await wait_for(
                     gather(*self._active_tasks.values(), return_exceptions=True), timeout=self._config.SHUTDOWN_TIMEOUT
                 )
-            except TimeoutError:
+            except (TimeoutError, AsyncTimeoutError):
                 logger.warning("Shutdown timeout reached. Some tasks may be interrupted.")
             except CancelledError:
                 pass

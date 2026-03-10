@@ -11,7 +11,11 @@ Este documento describe cómo crear un Worker personalizado compatible con el Or
 Los Workers creados con el SDK implementan un modelo de interacción híbrido con el Orquestador:
 - **Modelo PULL para la Obtención de Tareas:** El worker inicia la conexión con el Orquestador y "tira" de las tareas de su cola personal. Esto permite que los Workers operen desde cualquier red (incluyendo detrás de NAT o firewalls corporativos) sin necesidad de una dirección IP pública.
 - **WebSocket para Comunicación en Tiempo Real:** Un canal bidireccional opcional para recibir comandos (ej., cancelación de tareas) y enviar el progreso de ejecución intermedio.
-- **Optimización HLN:** El SDK utiliza el protocolo **Reverse Axon (RXON)**, que reduce el tráfico mediante el hashing de listas de habilidades y enviando solo las actualizaciones cuando ocurren cambios.
+- **Optimización HLN:** El SDK utiliza el protocolo **Reverse Axon (RXON)**, que reduce el tráfico mediante el hashing de listas de habilidades y el envío de actualizaciones solo cuando ocurren cambios.
+- **Robustez de Conexión:** 
+    - **Orquestadores Independientes:** Cada conexión con un orquestador es gestionada por una tarea separada. El fallo de un servidor no bloquea las comunicaciones con otros.
+    - **Reintentos de Registro:** Reintentos infinitos con retroceso exponencial si un orquestador está fuera de línea.
+    - **Inicio No Bloqueante:** El worker comienza a solicitar tareas tan pronto como se registra con éxito en al menos un orquestador.
 
 ## Cómo Crear un Worker con el SDK
 

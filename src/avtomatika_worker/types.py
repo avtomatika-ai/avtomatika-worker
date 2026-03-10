@@ -57,4 +57,6 @@ __all__ = [
     "INTERNAL_ERROR",
     "CONTRACT_VIOLATION_ERROR",
     "ParamValidationError",
+    "CapacityChecker",
+    "Middleware",
 ]
