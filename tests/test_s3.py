@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from obstore.store import S3Store
+from rxon.exceptions import IntegrityError, RxonError
 from rxon.models import FileMetadata
 
 from avtomatika_worker.config import WorkerConfig
@@ -140,7 +141,7 @@ async def test_upload_to_s3_file(s3_manager):
             patch("avtomatika_worker.s3.obstore_put", new_callable=AsyncMock) as mock_put,
             patch.object(s3_manager, "_get_store", return_value=MagicMock()),
         ):
-            mock_put.return_value = MagicMock(e_tag='"etag"')
+            mock_put.return_value = {"e_tag": '"etag"'}
             meta = await s3_manager._upload_to_s3(local_path)
 
         assert meta.uri == "s3://test-bucket/test-upload.txt"
@@ -225,3 +226,111 @@ async def test_cleanup(s3_manager):
     await s3_manager.cleanup(task_id)
 
     assert not os.path.exists(task_dir)
+
+
+@pytest.mark.asyncio
+async def test_process_s3_uri_integrity_size_mismatch(s3_manager):
+    """Tests that _process_s3_uri raises IntegrityError on size mismatch."""
+    task_id = "integrity-size"
+    verify_meta = FileMetadata(uri="s3://bucket/file", size=100)
+
+    with patch("avtomatika_worker.s3.obstore_get", new_callable=AsyncMock) as mock_get:
+        # Mock returns 50 bytes instead of 100
+        mock_get.return_value = MockGetResult(data=b"x" * 50)
+
+        with patch.object(s3_manager, "_get_store", return_value=MagicMock()):
+            with pytest.raises(IntegrityError) as exc:
+                await s3_manager._process_s3_uri("s3://bucket/file", task_id, verify_meta=verify_meta)
+            assert "Size mismatch" in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_process_s3_uri_integrity_etag_mismatch(s3_manager):
+    """Tests that _process_s3_uri raises IntegrityError on ETag mismatch."""
+    task_id = "integrity-etag"
+    verify_meta = FileMetadata(uri="s3://bucket/file", size=12, etag="expected_hash")
+
+    with patch("avtomatika_worker.s3.obstore_get", new_callable=AsyncMock) as mock_get:
+        # Mock returns different ETag
+        result = MockGetResult()
+        result.meta.e_tag = '"actual_hash"'
+        mock_get.return_value = result
+
+        with patch.object(s3_manager, "_get_store", return_value=MagicMock()):
+            with pytest.raises(IntegrityError) as exc:
+                await s3_manager._process_s3_uri("s3://bucket/file", task_id, verify_meta=verify_meta)
+            assert "ETag mismatch" in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_upload_to_s3_retry_on_transient_error(s3_manager):
+    """Tests that _upload_to_s3 retries on transient errors (e.g. 500)."""
+    local_path = os.path.join(s3_manager._config.TASK_FILES_DIR, "retry.txt")
+    with open(local_path, "w") as f:
+        f.write("content")
+
+    try:
+        with (
+            patch("avtomatika_worker.s3.obstore_put", new_callable=AsyncMock) as mock_put,
+            patch.object(s3_manager, "_get_store", return_value=MagicMock()),
+            patch("avtomatika_worker.s3.sleep", new_callable=AsyncMock) as mock_sleep,
+        ):
+            # First call fails, second succeeds
+            mock_put.side_effect = [Exception("500 Internal Error"), {"e_tag": '"ok"'}]
+            meta = await s3_manager._upload_to_s3(local_path)
+
+            assert meta.etag == "ok"
+            assert mock_put.await_count == 2
+            mock_sleep.assert_awaited_once()
+    finally:
+        if os.path.exists(local_path):
+            os.remove(local_path)
+
+
+@pytest.mark.asyncio
+async def test_upload_to_s3_permanent_error(s3_manager):
+    """Tests that _upload_to_s3 fails fast on permanent errors (e.g. 403 Forbidden)."""
+    local_path = os.path.join(s3_manager._config.TASK_FILES_DIR, "fatal.txt")
+    with open(local_path, "w") as f:
+        f.write("content")
+
+    try:
+        with (
+            patch("avtomatika_worker.s3.obstore_put", new_callable=AsyncMock) as mock_put,
+            patch.object(s3_manager, "_get_store", return_value=MagicMock()),
+        ):
+            # Error 403 should stop retries
+            mock_put.side_effect = Exception("403 Forbidden: Access Denied")
+            with pytest.raises(RxonError) as exc:
+                await s3_manager._upload_to_s3(local_path)
+            assert "Access Denied" in str(exc.value)
+            assert mock_put.await_count == 1
+    finally:
+        if os.path.exists(local_path):
+            os.remove(local_path)
+
+
+@pytest.mark.asyncio
+async def test_upload_to_s3_empty_folder(s3_manager):
+    """Tests uploading an empty folder."""
+    with tempfile.TemporaryDirectory(dir=s3_manager._config.TASK_FILES_DIR) as tmpdir:
+        with (
+            patch("avtomatika_worker.s3.obstore_put", new_callable=AsyncMock) as mock_put,
+            patch.object(s3_manager, "_get_store", return_value=MagicMock()),
+        ):
+            meta = await s3_manager._upload_to_s3(tmpdir)
+
+        assert meta.size == 0
+        assert mock_put.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_process_params_invalid_uri(s3_manager):
+    """Tests that process_params handles invalid URIs by propagating errors."""
+    params = {"file": "s3://invalid-uri"}  # missing bucket/key or malformed
+
+    with (
+        patch("avtomatika_worker.s3.parse_uri", side_effect=ValueError("Invalid URI")),
+        pytest.raises(ValueError, match="Invalid URI"),
+    ):
+        await s3_manager.process_params(params, "task-1")

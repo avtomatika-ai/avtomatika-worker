@@ -23,7 +23,7 @@ Los Workers creados con el SDK implementan un modelo de interacción híbrido co
 
 Asegúrese de que el SDK esté instalado en su entorno. Recomendado para todas las funciones (S3 y Pydantic):
 ```bash
-pip install "avtomatika-worker[s3,pydantic]"
+pip install "avtomatika-worker[s3,pydantic,metrics]"
 ```
 
 Si está trabajando en el repositorio principal, puede instalarlo en modo editable:
@@ -116,8 +116,12 @@ ORCHESTRATORS_CONFIG='[
     {"url": "http://main-orchestrator:8080", "priority": 1, "weight": 5},
     {"url": "http://backup-orchestrator:8080", "priority": 2, "weight": 1}
 ]'
-MULTI_ORCHESTRATOR_MODE=ROUND_ROBIN  # O FAILOVER
+MULTI_ORCHESTRATOR_MODE=WATERFALL  # O ROUND_ROBIN, FAILOVER
 ```
+
+- **WATERFALL (Por defecto):** Sondea los orquestadores en orden de prioridad. Siempre regresa al de mayor prioridad después de cualquier tarea.
+- **ROUND_ROBIN:** Distribuye las solicitudes según los pesos.
+- **FAILOVER:** Sondea al siguiente solo si el anterior está vacío.
 
 ### Paso 5: Comunicación en Tiempo Real (WebSocket)
 
@@ -177,7 +181,28 @@ async def process_video(params: dict, files: TaskFiles):
 
 > **Nota:** El SDK limpia automáticamente todo el directorio de la tarea una vez que se completa.
 
-### Paso 8: Comprobaciones de Salud (Health Checks)
+### Paso 8: Observabilidad (OpenTelemetry)
+
+El SDK proporciona soporte integrado para **trazado distribuido** y **métricas** utilizando OpenTelemetry.
+
+1.  **Trazado Distribuido:** Cada ejecución de tarea está envuelta en un Span (`task.{type}`). Las operaciones de S3 son spans hijos.
+2.  **Métricas:** Las métricas compatibles con Prometheus están disponibles en `http://localhost:8083/metrics` (requiere el extra `metrics`).
+3.  **Inyección de Dependencias:** Puede solicitar el `ObservabilityManager` en su manejador de habilidades para crear spans personalizados.
+
+```python
+from avtomatika_worker import Worker, ObservabilityManager
+
+@worker.skill()
+async def monitored_task(params: dict, obs: ObservabilityManager):
+    with obs.tracer.start_as_current_span("mi-paso-personalizado"):
+        # ... lógica ...
+        pass
+    return {"status": "success"}
+```
+
+Habilítelo a través de la variable de entorno: `WORKER_ENABLE_METRICS=true`.
+
+### Paso 9: Comprobaciones de Salud (Health Checks)
 
 Por defecto, el SDK inicia un pequeño servidor aiohttp en `0.0.0.0:8083`. Puede comprobar el estado del worker en `/health`.
 Esto es útil para Kubernetes (probas de Liveness/Readiness) o sistemas de monitoreo.

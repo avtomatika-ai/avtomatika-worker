@@ -9,6 +9,7 @@
 from importlib.metadata import PackageNotFoundError, version
 
 from .logging import setup_logging
+from .observability import ObservabilityManager
 from .task_files import TaskFiles
 from .worker import DeviceUsage, ResourcesUsage, SkillBlueprint, Worker, is_valid_identifier, validate_identifier
 
@@ -17,6 +18,7 @@ __all__ = [
     "SkillBlueprint",
     "TaskFiles",
     "setup_logging",
+    "ObservabilityManager",
     "ResourcesUsage",
     "DeviceUsage",
     "is_valid_identifier",

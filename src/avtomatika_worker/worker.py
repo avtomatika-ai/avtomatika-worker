@@ -72,6 +72,7 @@ from rxon.validators import is_valid_identifier, validate_identifier
 
 from .config import WorkerConfig
 from .logging import clear_context, set_context, setup_logging
+from .observability import ObservabilityManager
 from .s3 import S3Manager
 from .task_files import TaskFiles
 from .types import CapacityChecker, Middleware, ParamValidationError
@@ -239,8 +240,23 @@ class Worker:
         if skills_dir:
             self._config.WORKER_SKILLS_DIR = skills_dir
 
+        from importlib.metadata import PackageNotFoundError
+        from importlib.metadata import version as get_version
+
+        try:
+            pkg_version = get_version("avtomatika-worker")
+        except PackageNotFoundError:
+            pkg_version = "unknown"
+
         setup_logging(worker_id=self._config.WORKER_ID)
-        self._s3_manager = S3Manager(self._config)
+        self._observability = ObservabilityManager(
+            enabled=self._config.WORKER_ENABLE_METRICS,
+            service_name=self._config.WORKER_TYPE,
+            worker_id=self._config.WORKER_ID,
+            worker_type=self._config.WORKER_TYPE,
+            version=pkg_version,
+        )
+        self._s3_manager = S3Manager(self._config, observability=self._observability)
         self._config.WORKER_TYPE = worker_type
         if max_concurrent_tasks is not None:
             self._config.MAX_CONCURRENT_TASKS = max_concurrent_tasks
@@ -486,10 +502,11 @@ class Worker:
             self._debounce_task.cancel()
         self._debounce_task = create_task(self._debounced_heartbeat_sender())
 
-    async def _poll_for_tasks(self, client: Transport) -> None:
+    async def _poll_for_tasks_with_status(self, client: Transport) -> bool:
+        """Polls for tasks and returns True if a task was received."""
         current_state = self._get_current_state()
         if current_state["status"] == "busy":
-            return
+            return False
         try:
             task_data = await client.poll_task(timeout=self._config.TASK_POLL_TIMEOUT)
             if task_data:
@@ -503,8 +520,13 @@ class Worker:
                 self._schedule_heartbeat_debounce()
                 task = create_task(self._process_task(task_data_dict))
                 self._active_tasks[task_data.task_id] = task
+                return True
         except RxonError as e:
             logger.error(f"Error polling tasks from {client}: {e}")
+        return False
+
+    async def _poll_for_tasks(self, client: Transport) -> None:
+        await self._poll_for_tasks_with_status(client)
 
     async def _start_polling(self) -> None:
         try:
@@ -525,15 +547,28 @@ class Worker:
             if self._get_current_state()["status"] == "busy":
                 await sleep(self._config.IDLE_POLL_DELAY)
                 continue
-            if self._config.MULTI_ORCHESTRATOR_MODE == "ROUND_ROBIN":
+
+            any_task_found = False
+            if self._config.MULTI_ORCHESTRATOR_MODE == "WATERFALL":
+                for _, client in self._clients:
+                    if self._get_current_state()["status"] == "busy":
+                        break
+                    task_found = await self._poll_for_tasks_with_status(client)
+                    if task_found:
+                        any_task_found = True
+                        break
+            elif self._config.MULTI_ORCHESTRATOR_MODE == "ROUND_ROBIN":
                 if client := self._get_next_client():
-                    await self._poll_for_tasks(client)
+                    any_task_found = await self._poll_for_tasks_with_status(client)
             else:
                 for _, client in self._clients:
                     if self._get_current_state()["status"] == "busy":
                         break
-                    await self._poll_for_tasks(client)
-            if self._current_load == 0:
+                    task_found = await self._poll_for_tasks_with_status(client)
+                    if task_found:
+                        any_task_found = True
+
+            if not any_task_found:
                 await sleep(self._config.IDLE_POLL_DELAY)
 
     @staticmethod
@@ -567,9 +602,11 @@ class Worker:
         return params
 
     def _prepare_dependencies(self, handler: Callable, job_id: str, task_id: str) -> dict[str, Any]:
-        deps = {}
+        deps: dict[str, Any] = {}
         task_dir = join(self._config.TASK_FILES_DIR, task_id)
-        task_files = TaskFiles(task_dir, job_id=job_id, task_id=task_id, s3_manager=self._s3_manager)
+        task_files = TaskFiles(
+            task_dir, job_id=job_id, task_id=task_id, s3_manager=self._s3_manager, observability=self._observability
+        )
         try:
             hints = get_type_hints(handler)
         except Exception:
@@ -579,6 +616,8 @@ class Worker:
             types = get_args(annotation) if origin else (annotation,)
             if TaskFiles in types:
                 deps[name] = task_files
+            if ObservabilityManager in types:
+                deps[name] = self._observability
         return deps
 
     async def _process_task(self, task_data_raw: dict[str, Any]) -> None:
@@ -595,49 +634,152 @@ class Worker:
         skill_type_for_limit = handler_data.get("type") if handler_data else None
         result_obj: TaskResult | None = None
 
-        async def send_event_wrapper(event_type: str, payload: dict[str, Any], priority: float = 0.0) -> None:
-            if handler_data and (events_schema := handler_data["info"].events_schema):
-                if event_type in events_schema:
-                    from rxon.schema import validate_data
+        from time import perf_counter
 
-                    is_valid, error_msg = validate_data(payload, events_schema[event_type])
-                    if not is_valid:
-                        full_error = f"Local contract violation for event '{event_type}': {error_msg}"
-                        logger.error(full_error)
-                        return
-                elif event_type != EVENT_TYPE_PROGRESS:
-                    if self._config.STRICT_EVENT_VALIDATION:
-                        logger.error(f"Contract violation: Emitting undeclared event type '{event_type}'. Blocked.")
-                        return
-                    else:
-                        logger.warning(f"Emitting undeclared event type '{event_type}'. Allowed by config.")
+        start_time = perf_counter()
 
-            from time import time
-            from uuid import uuid4
+        with self._observability.start_task_span(skill_name, task_id, job_id) as span:
 
-            event_payload = WorkerEventPayload(
-                event_id=str(uuid4()),
-                worker_id=self._config.WORKER_ID,
-                origin_worker_id=self._config.WORKER_ID,
-                event_type=event_type,
-                payload=payload,
-                bubbling_chain=[],
-                target_job_id=job_id,
-                target_task_id=task_id,
-                trace_context=task_payload.tracing_context,
-                priority=priority,
-                timestamp=time(),
-            )
-            await client.emit_event(event_payload)
+            async def send_event_wrapper(event_type: str, payload: dict[str, Any], priority: float = 0.0) -> None:
+                if handler_data and (events_schema := handler_data["info"].events_schema):
+                    if event_type in events_schema:
+                        from rxon.schema import validate_data
 
-        async def send_progress_wrapper(task_id_arg, job_id_arg, progress, message=""):
-            await send_event_wrapper(EVENT_TYPE_PROGRESS, {"progress": progress, "message": message})
+                        is_valid, error_msg = validate_data(payload, events_schema[event_type])
+                        if not is_valid:
+                            full_error = f"Local contract violation for event '{event_type}': {error_msg}"
+                            logger.error(full_error)
+                            return
+                    elif event_type != EVENT_TYPE_PROGRESS:
+                        if self._config.STRICT_EVENT_VALIDATION:
+                            logger.error(f"Contract violation: Emitting undeclared event type '{event_type}'. Blocked.")
+                            return
+                        else:
+                            logger.warning(f"Emitting undeclared event type '{event_type}'. Allowed by config.")
 
-        try:
-            if not handler_data:
-                message = f"Unsupported skill: {skill_name}"
-                logger.warning(message)
-                error = TaskError(code=ERROR_CODE_PERMANENT, message=message)
+                from time import time
+                from uuid import uuid4
+
+                event_payload = WorkerEventPayload(
+                    event_id=str(uuid4()),
+                    worker_id=self._config.WORKER_ID,
+                    origin_worker_id=self._config.WORKER_ID,
+                    event_type=event_type,
+                    payload=payload,
+                    bubbling_chain=[],
+                    target_job_id=job_id,
+                    target_task_id=task_id,
+                    trace_context=task_payload.tracing_context,
+                    priority=priority,
+                    timestamp=time(),
+                )
+                await client.emit_event(event_payload)
+
+            async def send_progress_wrapper(task_id_arg, job_id_arg, progress, message=""):
+                await send_event_wrapper(EVENT_TYPE_PROGRESS, {"progress": progress, "message": message})
+
+            try:
+                if not handler_data:
+                    message = f"Unsupported skill: {skill_name}"
+                    logger.warning(message)
+                    error = TaskError(code=ERROR_CODE_PERMANENT, message=message)
+                    result_obj = TaskResult(
+                        job_id=job_id,
+                        task_id=task_id,
+                        worker_id=self._config.WORKER_ID,
+                        status=TASK_STATUS_FAILURE,
+                        error=error,
+                    )
+                    if span:
+                        self._observability.set_span_status_error(span, message)
+                else:
+                    params = await self._s3_manager.process_params(
+                        params, task_id, metadata=task_payload.params_metadata
+                    )
+                    validated_params = self._prepare_task_params(handler_data["func"], params)
+                    deps = self._prepare_dependencies(handler_data["func"], job_id, task_id)
+                    handler_kwargs = {
+                        "params": validated_params,
+                        "task_id": task_id,
+                        "job_id": job_id,
+                        "tracing_context": task_payload.tracing_context,
+                        "priority": task_payload.priority,
+                        "deadline": task_payload.deadline,
+                        "send_progress": send_progress_wrapper,
+                        "send_event": send_event_wrapper,
+                        "add_to_hot_cache": self.add_to_hot_cache,
+                        "remove_from_hot_cache": self.remove_from_hot_cache,
+                        **deps,
+                    }
+                    middleware_context = {
+                        "task_id": task_id,
+                        "job_id": job_id,
+                        "skill_name": skill_name,
+                        "params": validated_params,
+                        "handler_kwargs": handler_kwargs,
+                        "observability": self._observability,
+                        "s3_manager": self._s3_manager,
+                    }
+
+                    async def _execution_logic() -> Any:
+                        handler = handler_data["func"]
+                        final_kwargs = middleware_context["handler_kwargs"]
+                        if iscoroutinefunction(handler):
+                            return await handler(**final_kwargs)
+                        else:
+                            return await to_thread(handler, **final_kwargs)
+
+                    handler_chain = _execution_logic
+                    for middleware in reversed(self._middlewares):
+
+                        def make_wrapper(mw: Middleware, next_handler: Callable) -> Callable:
+                            async def wrapper():
+                                return await mw(middleware_context, next_handler)
+
+                            return wrapper
+
+                        handler_chain = make_wrapper(middleware, handler_chain)
+                    handler_result = await handler_chain()
+
+                    # FAIL FAST: Validate output schema locally before sending
+                    skill_info = handler_data["info"]
+                    if skill_info.output_schema:
+                        from rxon.schema import validate_data
+
+                        is_valid, error_msg = validate_data(handler_result.get("data"), skill_info.output_schema)
+                        if not is_valid:
+                            full_error = f"Local contract violation: output does not match schema. {error_msg}"
+                            logger.error(full_error)
+                            handler_result["status"] = TASK_STATUS_FAILURE
+                            handler_result["error"] = {"code": ERROR_CODE_CONTRACT_VIOLATION, "message": full_error}
+
+                    updated_data, metadata_map = await self._s3_manager.process_result(
+                        handler_result.get("data", {}), s3_prefix=job_id
+                    )
+                    task_error = None
+                    if "error" in handler_result:
+                        err_data = handler_result["error"]
+                        if isinstance(err_data, dict):
+                            valid_err_fields = {k: v for k, v in err_data.items() if k in TaskError._fields}
+                            task_error = TaskError(**valid_err_fields)
+                        else:
+                            task_error = TaskError(code=ERROR_CODE_TRANSIENT, message=str(err_data))
+                    result_obj = TaskResult(
+                        job_id=job_id,
+                        task_id=task_id,
+                        worker_id=self._config.WORKER_ID,
+                        status=handler_result.get("status", TASK_STATUS_SUCCESS),
+                        data=updated_data,
+                        error=task_error,
+                        data_metadata=metadata_map if metadata_map else None,
+                    )
+                    if span and result_obj.status == TASK_STATUS_FAILURE:
+                        self._observability.set_span_status_error(
+                            span, task_error.message if task_error else "Unknown failure"
+                        )
+            except ParamValidationError as e:
+                logger.error(f"Task {task_id} failed validation: {e}")
+                error = TaskError(code=ERROR_CODE_INVALID_INPUT, message=str(e))
                 result_obj = TaskResult(
                     job_id=job_id,
                     task_id=task_id,
@@ -645,136 +787,60 @@ class Worker:
                     status=TASK_STATUS_FAILURE,
                     error=error,
                 )
-            else:
-                params = await self._s3_manager.process_params(params, task_id, metadata=task_payload.params_metadata)
-                validated_params = self._prepare_task_params(handler_data["func"], params)
-                deps = self._prepare_dependencies(handler_data["func"], job_id, task_id)
-                handler_kwargs = {
-                    "params": validated_params,
-                    "task_id": task_id,
-                    "job_id": job_id,
-                    "tracing_context": task_payload.tracing_context,
-                    "priority": task_payload.priority,
-                    "deadline": task_payload.deadline,
-                    "send_progress": send_progress_wrapper,
-                    "send_event": send_event_wrapper,
-                    "add_to_hot_cache": self.add_to_hot_cache,
-                    "remove_from_hot_cache": self.remove_from_hot_cache,
-                    **deps,
-                }
-                middleware_context = {
-                    "task_id": task_id,
-                    "job_id": job_id,
-                    "skill_name": skill_name,
-                    "params": validated_params,
-                    "handler_kwargs": handler_kwargs,
-                }
-
-                async def _execution_logic() -> Any:
-                    handler = handler_data["func"]
-                    final_kwargs = middleware_context["handler_kwargs"]
-                    if iscoroutinefunction(handler):
-                        return await handler(**final_kwargs)
-                    else:
-                        return await to_thread(handler, **final_kwargs)
-
-                handler_chain = _execution_logic
-                for middleware in reversed(self._middlewares):
-
-                    def make_wrapper(mw: Middleware, next_handler: Callable) -> Callable:
-                        async def wrapper():
-                            return await mw(middleware_context, next_handler)
-
-                        return wrapper
-
-                    handler_chain = make_wrapper(middleware, handler_chain)
-                handler_result = await handler_chain()
-
-                # FAIL FAST: Validate output schema locally before sending
-                skill_info = handler_data["info"]
-                if skill_info.output_schema:
-                    from rxon.schema import validate_data
-
-                    is_valid, error_msg = validate_data(handler_result.get("data"), skill_info.output_schema)
-                    if not is_valid:
-                        full_error = f"Local contract violation: output does not match schema. {error_msg}"
-                        logger.error(full_error)
-                        handler_result["status"] = TASK_STATUS_FAILURE
-                        handler_result["error"] = {"code": ERROR_CODE_CONTRACT_VIOLATION, "message": full_error}
-
-                updated_data, metadata_map = await self._s3_manager.process_result(
-                    handler_result.get("data", {}), s3_prefix=job_id
+                if span:
+                    self._observability.set_span_status_error(span, str(e))
+            except CancelledError:
+                logger.info(f"Task {task_id} was cancelled.")
+                result_obj = TaskResult(
+                    job_id=job_id, task_id=task_id, worker_id=self._config.WORKER_ID, status=TASK_STATUS_CANCELLED
                 )
-                task_error = None
-                if "error" in handler_result:
-                    err_data = handler_result["error"]
-                    if isinstance(err_data, dict):
-                        valid_err_fields = {k: v for k, v in err_data.items() if k in TaskError._fields}
-                        task_error = TaskError(**valid_err_fields)
-                    else:
-                        task_error = TaskError(code=ERROR_CODE_TRANSIENT, message=str(err_data))
+                if span:
+                    self._observability.set_span_status_error(span, "Task cancelled")
+                raise
+            except ValueError as e:
+                logger.error(f"Data integrity or validation error for task {task_id}: {e}")
+                error = TaskError(code=ERROR_CODE_INTEGRITY_MISMATCH, message=str(e))
                 result_obj = TaskResult(
                     job_id=job_id,
                     task_id=task_id,
                     worker_id=self._config.WORKER_ID,
-                    status=handler_result.get("status", TASK_STATUS_SUCCESS),
-                    data=updated_data,
-                    error=task_error,
-                    data_metadata=metadata_map if metadata_map else None,
+                    status=TASK_STATUS_FAILURE,
+                    error=error,
                 )
-        except ParamValidationError as e:
-            logger.error(f"Task {task_id} failed validation: {e}")
-            error = TaskError(code=ERROR_CODE_INVALID_INPUT, message=str(e))
-            result_obj = TaskResult(
-                job_id=job_id,
-                task_id=task_id,
-                worker_id=self._config.WORKER_ID,
-                status=TASK_STATUS_FAILURE,
-                error=error,
-            )
-        except CancelledError:
-            logger.info(f"Task {task_id} was cancelled.")
-            result_obj = TaskResult(
-                job_id=job_id, task_id=task_id, worker_id=self._config.WORKER_ID, status=TASK_STATUS_CANCELLED
-            )
-            raise
-        except ValueError as e:
-            logger.error(f"Data integrity or validation error for task {task_id}: {e}")
-            error = TaskError(code=ERROR_CODE_INTEGRITY_MISMATCH, message=str(e))
-            result_obj = TaskResult(
-                job_id=job_id,
-                task_id=task_id,
-                worker_id=self._config.WORKER_ID,
-                status=TASK_STATUS_FAILURE,
-                error=error,
-            )
-        except Exception as e:
-            logger.exception(f"An unexpected error occurred while processing task {task_id}:")
-            error = TaskError(code=ERROR_CODE_TRANSIENT, message=str(e))
-            result_obj = TaskResult(
-                job_id=job_id,
-                task_id=task_id,
-                worker_id=self._config.WORKER_ID,
-                status=TASK_STATUS_FAILURE,
-                error=error,
-            )
-        finally:
-            await self._s3_manager.cleanup(task_id)
-            if result_obj:
-                try:
-                    accepted = await client.send_result(result_obj)
-                    if not accepted:
-                        logger.warning(
-                            f"Task {task_id} result was IGNORED by orchestrator (possibly deadline exceeded)."
-                        )
-                except RxonError as e:
-                    logger.error(f"Failed to send task result: {e}")
-            clear_context("task_id", "job_id")
-            self._active_tasks.pop(task_id, None)
-            self._current_load -= 1
-            if skill_type_for_limit:
-                self._current_load_by_type[skill_type_for_limit] -= 1
-            self._schedule_heartbeat_debounce()
+                if span:
+                    self._observability.set_span_status_error(span, str(e))
+            except Exception as e:
+                logger.exception(f"An unexpected error occurred while processing task {task_id}:")
+                error = TaskError(code=ERROR_CODE_TRANSIENT, message=str(e))
+                result_obj = TaskResult(
+                    job_id=job_id,
+                    task_id=task_id,
+                    worker_id=self._config.WORKER_ID,
+                    status=TASK_STATUS_FAILURE,
+                    error=error,
+                )
+                if span:
+                    self._observability.set_span_status_error(span, str(e))
+            finally:
+                await self._s3_manager.cleanup(task_id)
+                final_status = result_obj.status if result_obj else "unknown"
+                duration = perf_counter() - start_time
+                self._observability.record_task_finished(skill_name, final_status, duration)
+                if result_obj:
+                    try:
+                        accepted = await client.send_result(result_obj)
+                        if not accepted:
+                            logger.warning(
+                                f"Task {task_id} result was IGNORED by orchestrator (possibly deadline exceeded)."
+                            )
+                    except RxonError as e:
+                        logger.error(f"Failed to send task result: {e}")
+                clear_context("task_id", "job_id")
+                self._active_tasks.pop(task_id, None)
+                self._current_load -= 1
+                if skill_type_for_limit:
+                    self._current_load_by_type[skill_type_for_limit] -= 1
+                self._schedule_heartbeat_debounce()
 
     @staticmethod
     def _from_dict(cls: type, data: Any) -> Any:
@@ -993,6 +1059,9 @@ class Worker:
     async def _send_single_heartbeat(self, client: Transport) -> None:
         heartbeat = self._create_heartbeat_payload()
         resp = await client.send_heartbeat(heartbeat)
+        if resp and not isinstance(resp, str):  # resp can be "error" or dict/model
+            # After successful heartbeat, we can mark skills as synced
+            self._last_synced_skills_hash = heartbeat.skills_hash
         if resp:
             from rxon.constants import HB_RESP_CANCEL_TASKS, HB_RESP_REQUIRE_FULL_SYNC
 
@@ -1053,6 +1122,9 @@ class Worker:
             task.cancel()
 
         polling_task.cancel()
+        logger.info("Waiting for active S3 operations to complete...")
+        await self._s3_manager.wait_all_done()
+
         logger.info("Sending final 'offline' heartbeat to all orchestrators...")
         with suppress(Exception):
             heartbeat = Heartbeat(
@@ -1110,7 +1182,15 @@ class Worker:
         async def health_handler(_):
             return web.Response(text="OK")
 
+        async def metrics_handler(_):
+            if not self._observability.enabled:
+                return web.Response(status=404, text="Metrics are disabled")
+            return web.Response(
+                body=self._observability.generate_latest(), content_type=self._observability.content_type
+            )
+
         app.router.add_get("/health", health_handler)
+        app.router.add_get("/metrics", metrics_handler)
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.TCPSite(runner, "0.0.0.0", self._config.WORKER_PORT)

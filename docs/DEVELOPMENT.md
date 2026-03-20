@@ -23,7 +23,7 @@ Workers created with the SDK implement a hybrid interaction model with the Orche
 
 Ensure the SDK is installed in your environment. Recommended for full features (S3 and Pydantic):
 ```bash
-pip install "avtomatika-worker[s3,pydantic]"
+pip install "avtomatika-worker[s3,pydantic,metrics]"
 ```
 
 If you are working in the main repository, you can install it in editable mode:
@@ -116,8 +116,12 @@ ORCHESTRATORS_CONFIG='[
     {"url": "http://main-orchestrator:8080", "priority": 1, "weight": 5},
     {"url": "http://backup-orchestrator:8080", "priority": 2, "weight": 1}
 ]'
-MULTI_ORCHESTRATOR_MODE=ROUND_ROBIN  # Or FAILOVER
+MULTI_ORCHESTRATOR_MODE=WATERFALL  # Or ROUND_ROBIN, FAILOVER
 ```
+
+- **WATERFALL (Default):** Polls orchestrators in order of priority. Always returns to the highest-priority one after any task.
+- **ROUND_ROBIN:** Distributes requests based on weights.
+- **FAILOVER:** Polls the next one only if the previous is empty.
 
 ### Step 5: Real-time Communication (WebSocket)
 
@@ -177,7 +181,28 @@ async def process_video(params: dict, files: TaskFiles):
 
 > **Note:** The SDK automatically cleans up the entire task directory after the task completes.
 
-### Step 8: Health Checks
+### Step 8: Observability (OpenTelemetry)
+
+The SDK provides integrated support for **distributed tracing** and **metrics** using OpenTelemetry.
+
+1.  **Distributed Tracing:** Every task execution is wrapped in a Span (`task.{type}`). S3 operations are child spans.
+2.  **Metrics:** Prometheus-compatible metrics are available at `http://localhost:8083/metrics` (requires `metrics` extra).
+3.  **Dependency Injection:** You can request the `ObservabilityManager` in your skill handler to create custom spans.
+
+```python
+from avtomatika_worker import Worker, ObservabilityManager
+
+@worker.skill()
+async def monitored_task(params: dict, obs: ObservabilityManager):
+    with obs.tracer.start_as_current_span("my-custom-step"):
+        # ... logic ...
+        pass
+    return {"status": "success"}
+```
+
+Enable it via environment variable: `WORKER_ENABLE_METRICS=true`.
+
+### Step 9: Health Checks
 
 By default, the SDK starts a small aiohttp server on `0.0.0.0:8083`. You can check the worker status at `/health`.
 This is useful for Kubernetes (Liveness/Readiness probes) or monitoring systems.

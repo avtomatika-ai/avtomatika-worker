@@ -23,7 +23,7 @@
 
 Убедитесь, что SDK установлен в вашей среде. Рекомендуется установить со всеми основными расширениями (S3 и Pydantic):
 ```bash
-pip install "avtomatika-worker[s3,pydantic]"
+pip install "avtomatika-worker[s3,pydantic,metrics]"
 ```
 
 Если вы работаете в основном репозитории, вы можете установить его в режиме редактирования:
@@ -116,8 +116,12 @@ ORCHESTRATORS_CONFIG='[
     {"url": "http://main-orchestrator:8080", "priority": 1, "weight": 5},
     {"url": "http://backup-orchestrator:8080", "priority": 2, "weight": 1}
 ]'
-MULTI_ORCHESTRATOR_MODE=ROUND_ROBIN  # Или FAILOVER
+MULTI_ORCHESTRATOR_MODE=WATERFALL  # Или ROUND_ROBIN, FAILOVER
 ```
+
+- **WATERFALL (По умолчанию):** Опрашивает оркестраторы в порядке приоритета. Всегда возвращается к самому приоритетному после выполнения любой задачи.
+- **ROUND_ROBIN:** Распределяет запросы на основе весов.
+- **FAILOVER:** Опрашивает следующий сервер, только если предыдущий пуст.
 
 ### Шаг 5: Связь в реальном времени (WebSocket)
 
@@ -177,7 +181,28 @@ async def process_video(params: dict, files: TaskFiles):
 
 > **Примечание:** SDK автоматически очищает всю директорию задачи после её завершения.
 
-### Шаг 8: Проверки здоровья (Health Checks)
+### Шаг 8: Наблюдаемость (OpenTelemetry)
+
+SDK предоставляет встроенную поддержку **распределенной трассировки** и **метрик** с использованием OpenTelemetry.
+
+1.  **Трассировка:** Каждое выполнение задачи оборачивается в Span (`task.{type}`). Операции с S3 являются дочерними спанами.
+2.  **Метрики:** Метрики в формате Prometheus доступны по адресу `http://localhost:8083/metrics` (требуется расширение `metrics`).
+3.  **Внедрение зависимостей:** Вы можете запросить `ObservabilityManager` в вашем обработчике навыков для создания кастомных спанов.
+
+```python
+from avtomatika_worker import Worker, ObservabilityManager
+
+@worker.skill()
+async def monitored_task(params: dict, obs: ObservabilityManager):
+    with obs.tracer.start_as_current_span("my-custom-step"):
+        # ... логика ...
+        pass
+    return {"status": "success"}
+```
+
+Включите поддержку через переменную окружения: `WORKER_ENABLE_METRICS=true`.
+
+### Шаг 9: Проверки здоровья (Health Checks)
 
 По умолчанию SDK запускает небольшой aiohttp-сервер на `0.0.0.0:8083`. Вы можете проверить статус воркера по адресу `/health`.
 Это полезно для Kubernetes (Liveness/Readiness пробы) или систем мониторинга.

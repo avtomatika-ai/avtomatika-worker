@@ -167,14 +167,15 @@ async def test_start_polling_round_robin(mocker):
     # We only want to test one iteration of the polling loop
     async def poll_side_effect(*args, **kwargs):
         worker._shutdown_event.set()
+        return False
 
-    worker._poll_for_tasks = mocker.AsyncMock(side_effect=poll_side_effect)
+    worker._poll_for_tasks_with_status = mocker.AsyncMock(side_effect=poll_side_effect)
     worker._registered_event.set()
 
     await worker._start_polling()
 
     # With equal weights, the first one should be chosen
-    worker._poll_for_tasks.assert_called_once_with(client1)
+    worker._poll_for_tasks_with_status.assert_called_once_with(client1)
 
 
 @pytest.mark.asyncio
@@ -314,9 +315,9 @@ async def test_run_health_check_server(mocker):
     await worker._run_health_check_server()
 
     mock_app_class.assert_called_once_with()  # Application()
-    mock_app_instance.router.add_get.assert_called_once_with(
-        "/health", mocker.ANY
-    )  # Assuming internal call to app.router.add_get
+    assert mock_app_instance.router.add_get.call_count == 2
+    mock_app_instance.router.add_get.assert_any_call("/health", mocker.ANY)
+    mock_app_instance.router.add_get.assert_any_call("/metrics", mocker.ANY)
 
     mock_runner_class.assert_called_once_with(mock_app_instance)  # AppRunner(app)
     mock_runner_instance.setup.assert_called_once()

@@ -16,12 +16,13 @@ pip install avtomatika-worker
 
 Recommended for full features:
 ```bash
-pip install "avtomatika-worker[s3,pydantic]"
+pip install "avtomatika-worker[s3,pydantic,metrics]"
 ```
 
 Extras:
 - `[s3]` — for S3 payload offloading (requires `obstore`).
 - `[pydantic]` — for Pydantic-based parameter validation.
+- `[metrics]` — for OpenTelemetry tracing and metrics.
 - `[dev]` — for development features like CLI `--reload`.
 
 ## Quick Start
@@ -80,20 +81,27 @@ worker run --app app.main:worker
 ### 2. Optimized Network Traffic (HLN Protocol)
 - **Skills Hashing:** Workers only send the full skill list when it actually changes. Periodic heartbeats use a lightweight `skills_hash`.
 - **Self-Healing Sync:** If the orchestrator loses worker metadata, it can trigger a `Full Sync` via heartbeat response, ensuring seamless recovery.
-- **Intelligent Transports:** Events are sent via WebSocket if available, falling back to HTTP automatically.
 
-### 3. Fail-Fast Validation
+### 3. Multi-Orchestrator Support (Waterfall Priority)
+- **Waterfall Strategy:** By default, the worker polls orchestrators in order of their priority. It always returns to the highest-priority orchestrator after completing any task, ensuring VIP tasks are handled first.
+- **Failover & Round Robin:** Alternative strategies for load balancing and high availability.
+
+### 4. Observability (OpenTelemetry)
+- **Distributed Tracing:** Every task execution creates an OpenTelemetry Span. S3 operations are tracked as child spans, providing full visibility in Jaeger/Tempo.
+- **Metrics:** Built-in Prometheus-compatible metrics for task count, duration, and S3 performance. Available at `http://localhost:8083/metrics` (if `[metrics]` extra is installed).
+
+### 5. Fail-Fast Validation
 - **Local Enforcement:** The SDK validates task results and events against their declared schemas locally. Errors are logged immediately, preventing the transmission of "broken" data.
 
-### 4. Structured Logging
+### 6. Structured Logging
 The SDK supports both human-readable and JSON logging.
 - `LOG_FORMAT=json` — for production (ELK, Grafana Loki).
 - `LOG_FORMAT=text` — for development (default).
 - All logs automatically include `worker_id`, `task_id`, and `job_id` context.
 
-### 5. File System & S3 Offloading
+### 7. File System & S3 Reliability
 - **TaskFiles**: Async helper for isolated task workspaces.
-- **S3 Payload Offloading**: Automatic download/upload of large files via S3 URIs in task parameters (requires `[s3]` extra).
+- **S3 SDK**: High-performance async uploads/downloads with automatic retries and **Graceful Shutdown** (waits for pending uploads before exit).
 
 ## Configuration Reference
 
@@ -106,6 +114,8 @@ The SDK supports both human-readable and JSON logging.
 | `WORKER_PORT` | Port for health-check server. | `8083` |
 | `WORKER_SHUTDOWN_TIMEOUT`| Max seconds to wait for tasks during shutdown. | `30.0` |
 | `WORKER_ENABLE_WEBSOCKETS`| Enable real-time commands (e.g., cancellation). | `false` |
+| `MULTI_ORCHESTRATOR_MODE` | Polling strategy: `WATERFALL`, `ROUND_ROBIN`, `FAILOVER`. | `WATERFALL` |
+| `WORKER_ENABLE_METRICS` | Enable OpenTelemetry metrics and tracing. | `false` |
 | `REGISTRATION_RETRY_INITIAL_DELAY`| Initial delay for registration retries (sec). | `1.0` |
 | `REGISTRATION_RETRY_MAX_DELAY`| Maximum delay for registration retries (sec). | `60.0` |
 | `TASK_FILES_DIR` | Local directory for temporary S3 payloads. | `/tmp/payloads` |

@@ -16,12 +16,13 @@ pip install avtomatika-worker
 
 Recomendado para todas las funciones:
 ```bash
-pip install "avtomatika-worker[s3,pydantic]"
+pip install "avtomatika-worker[s3,pydantic,metrics]"
 ```
 
 Extras:
 - `[s3]` — para descarga de S3 (requiere `obstore`).
 - `[pydantic]` — para validación de parámetros basada en Pydantic.
+- `[metrics]` — para OpenTelemetry (trazas и métricas).
 - `[dev]` — para funciones de desarrollo como CLI `--reload`.
 
 ## Inicio Rápido
@@ -80,20 +81,28 @@ worker run --app app.main:worker
 ### 2. Tráfico de Red Optimizado (Protocolo HLN)
 - **Hashing de Skills:** Los workers solo envían la lista completa de habilidades cuando realmente cambia. Los latidos periódicos utilizan un `skills_hash` ligero.
 - **Sincronización Autorrecuperable (Self-Healing):** Si el orquestador pierde los metadatos del worker, puede solicitar una sincronización completa a través de la respuesta del latido, asegurando una recuperación perfecta.
-- **Transportes Inteligentes:** Los eventos se envían a través de WebSocket si está disponible, recurriendo a HTTP automáticamente.
 
-### 3. Validación Fail-Fast
+### 3. Soporte para Múltiples Orquestadores (Waterfall Priority)
+- **Estrategia Waterfall:** Por defecto, el worker sondea los orquestadores en orden de su prioridad. Siempre regresa al orquestador de mayor prioridad después de completar cualquier tarea, asegurando que las tareas VIP se manejen primero.
+- **Failover и Round Robin:** Estrategias alternativas para el equilibrio de carga и la alta disponibilidad.
+
+### 4. Observabilidad (OpenTelemetry)
+- **Trazado Distribuido:** Cada ejecución de tarea crea un Span de OpenTelemetry. Las operaciones de S3 se rastrean como spans hijos, proporcionando una visibilidad completa en Jaeger/Tempo.
+- **Métricas:** Métricas integradas compatibles con Prometheus para el conteo de tareas, duración и rendimiento de S3. Disponibles en `http://localhost:8083/metrics` (si el extra `[metrics]` está instalado).
+
+### 5. Validación Fail-Fast
 - **Cumplimiento Local:** El SDK valida los resultados de las tareas и los eventos contra sus esquemas declarados localmente. Los errores se registran de inmediato, evitando la transmisión de datos "rotos".
 
-### 4. Registro Estructurado (Logging)
-El SDK admite el registro tanto en formato legible por humanos como en JSON.
+### 6. Registro Estructurado (Logging)
+The SDK supports both human-readable and JSON logging.
 - `LOG_FORMAT=json` — para producción (ELK, Grafana Loki).
 - `LOG_FORMAT=text` — para desarrollo (por defecto).
-- Todos los registros incluyen automáticamente el contexto de `worker_id`, `task_id` и `job_id`.
+- All logs automatically include `worker_id`, `task_id`, and `job_id` context.
 
-### 5. Sistema de Archivos y Descarga de S3
+### 7. Fiabilidad del Sistema de Archivos y S3
 - **TaskFiles**: Asistente asíncrono para espacios de trabajo de tareas aislados.
-- **S3 Payload Offloading**: Descarga/carga automática de archivos grandes mediante URIs de S3 en los parámetros de la tarea (requiere extra `[s3]`).
+- **S3 SDK**: Cargas/descargas asíncronas de alto rendimiento con reintentos automáticos и **Graceful Shutdown** (espera las cargas pendientes antes de salir).
+
 
 ## Referencia de Configuración
 
@@ -106,6 +115,8 @@ El SDK admite el registro tanto en formato legible por humanos como en JSON.
 | `WORKER_PORT` | Puerto para el servidor de health-check. | `8083` |
 | `WORKER_SHUTDOWN_TIMEOUT`| Segundos máx. para esperar tareas durante el cierre. | `30.0` |
 | `WORKER_ENABLE_WEBSOCKETS`| Habilitar comandos en tiempo real (ej. cancelación). | `false` |
+| `MULTI_ORCHESTRATOR_MODE` | Estrategia de sondeo: `WATERFALL`, `ROUND_ROBIN`, `FAILOVER`. | `WATERFALL` |
+| `WORKER_ENABLE_METRICS` | Habilitar OpenTelemetry (métricas и trazado). | `false` |
 | `REGISTRATION_RETRY_INITIAL_DELAY`| Retraso inicial para reintentos de registro (seg). | `1.0` |
 | `REGISTRATION_RETRY_MAX_DELAY`| Retraso máximo para reintentos de registro (seg). | `60.0` |
 | `TASK_FILES_DIR` | Directorio local para cargas temporales de S3. | `/tmp/payloads` |

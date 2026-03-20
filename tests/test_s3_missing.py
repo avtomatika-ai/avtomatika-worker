@@ -46,3 +46,42 @@ async def test_s3_missing_dependency():
     # Cleanup: remove the modified module so subsequent tests import the correct one
     if "avtomatika_worker.s3" in sys.modules:
         del sys.modules["avtomatika_worker.s3"]
+
+
+@pytest.mark.asyncio
+async def test_metrics_missing_dependency():
+    """
+    Tests that ObservabilityManager enters No-op mode when 'opentelemetry' is not installed.
+    """
+    if "avtomatika_worker.observability" in sys.modules:
+        del sys.modules["avtomatika_worker.observability"]
+
+    # Simulate missing OTel
+    with patch.dict(
+        sys.modules,
+        {
+            "opentelemetry": None,
+            "opentelemetry.metrics": None,
+            "opentelemetry.trace": None,
+            "opentelemetry.sdk": None,
+            "opentelemetry.exporter": None,
+            "opentelemetry.exporter.prometheus": None,
+            "prometheus_client": None,
+        },
+    ):
+        import avtomatika_worker.observability as obs_module
+
+        assert obs_module._HAS_OTEL is False
+
+        manager = obs_module.ObservabilityManager(enabled=True)
+        assert manager.enabled is False
+
+        # Verify no crashes on standard calls
+        with manager.start_task_span("task", "t1", "j1") as span:
+            assert span is None
+
+        manager.record_task_finished("task", "success", 1.0)
+        assert manager.generate_latest() == b""
+
+    if "avtomatika_worker.observability" in sys.modules:
+        del sys.modules["avtomatika_worker.observability"]

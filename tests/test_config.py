@@ -34,7 +34,7 @@ def test_worker_config_defaults():
         assert config.TASK_POLL_ERROR_DELAY == 5.0
         assert config.IDLE_POLL_DELAY == 0.01
         assert not config.ENABLE_WEBSOCKETS
-        assert config.MULTI_ORCHESTRATOR_MODE == "FAILOVER"
+        assert config.MULTI_ORCHESTRATOR_MODE == "WATERFALL"
 
 
 def test_worker_config_custom_values():

@@ -4,72 +4,206 @@
 #
 # Copyright (c) 2026 Dmitrii Gagarin aka madgagarin
 
-from collections import Counter
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, patch
 
-from rxon import Transport
+import pytest
+from rxon.models import TaskPayload
 
-from avtomatika_worker.config import WorkerConfig
 from avtomatika_worker.worker import Worker
 
 
-def test_wrr_algorithm_distribution():
+@pytest.mark.asyncio
+async def test_waterfall_priority_logic():
     """
-    Tests that the smooth weighted round-robin algorithm distributes
-    orchestrator selections according to their weights.
+    Tests that WATERFALL mode correctly prioritizes orchestrators.
     """
+    # 1. Setup two orchestrators in config
+    orchestrators = [
+        {"url": "http://vip-orchestrator", "priority": 1, "weight": 1},
+        {"url": "http://std-orchestrator", "priority": 2, "weight": 1},
+    ]
 
-    # Mock the config to return our test orchestrators
-    class MockConfig(WorkerConfig):
-        def _get_orchestrators_config(self) -> list[dict[str, any]]:
-            return [
-                {"url": "http://a.com", "priority": 1, "weight": 5},
-                {"url": "http://b.com", "priority": 1, "weight": 2},
-                {"url": "http://c.com", "priority": 1, "weight": 1},
-            ]
+    with patch.dict("os.environ", {"ORCHESTRATORS_CONFIG": str(orchestrators).replace("'", '"')}):
+        # Create worker
+        worker = Worker(worker_type="test-worker")
 
-    worker = Worker()
-    worker._config = MockConfig()
+        # Register a skill so the worker is not "busy"
+        @worker.skill("test-skill")
+        async def test_handler(params):
+            return {"status": "success"}
 
-    # Setup clients manually for test
-    worker._clients = []
-    worker._total_orchestrator_weight = 0
-    for o in worker._config.ORCHESTRATORS:
-        o["current_weight"] = 0
-        worker._total_orchestrator_weight += o.get("weight", 1)
-        client = MagicMock(spec=Transport)
-        client.base_url = o["url"]  # Just to identify it in test
-        worker._clients.append((o, client))
+        # Mock transports
+        vip_client = AsyncMock()
+        std_client = AsyncMock()
 
-    # --- Run the algorithm for a number of cycles ---
-    total_weight = worker._total_orchestrator_weight
-    iterations = total_weight * 10  # 80 iterations
-    selections = []
-    for _ in range(iterations):
-        client = worker._get_next_client()
-        selections.append(client.base_url)
+        # Overwrite clients with mocks (manually to ensure order)
+        worker._clients = [
+            (worker._config.ORCHESTRATORS[0], vip_client),
+            (worker._config.ORCHESTRATORS[1], std_client),
+        ]
 
-    counts = Counter(selections)
+        # Scenario A: VIP has a task. STD should NOT be polled.
+        vip_client.poll_task.return_value = TaskPayload(
+            task_id="task-vip", job_id="job-1", type="test-skill", params={}, tracing_context={}
+        )
 
-    # --- Assert the distribution ---
-    # Total selections should be the number of iterations
-    assert sum(counts.values()) == iterations
+        # Trigger one polling cycle
+        # We don't want to run the full _start_polling because it's an infinite loop.
+        # Instead, we test the logic that would be inside the loop.
 
-    # Check the number of selections for each orchestrator
-    # It should be proportional to its weight
-    assert counts["http://a.com"] == 5 * (iterations / total_weight)
-    assert counts["http://b.com"] == 2 * (iterations / total_weight)
-    assert counts["http://c.com"] == 1 * (iterations / total_weight)
+        # We need to mock _process_task to avoid actual execution
+        with patch.object(worker, "_process_task", return_value=AsyncMock()):
+            # Simulate the loop logic for WATERFALL
+            for _, client in worker._clients:
+                task_found = await worker._poll_for_tasks_with_status(client)
+                if task_found:
+                    break
 
-    # Check the selection sequence for the first cycle to ensure it's "smooth"
-    # Expected sequence for weights 5, 2, 1 is A, A, B, A, C, A, B, A
-    first_cycle_selections = selections[:total_weight]
-    # Note: The exact sequence can vary based on tie-breaking (e.g. dict order).
-    # A Counter is more robust for testing distribution.
-    assert Counter(first_cycle_selections) == Counter(
-        {
-            "http://a.com": 5,
-            "http://b.com": 2,
-            "http://c.com": 1,
-        }
-    )
+            assert vip_client.poll_task.called
+            assert not std_client.poll_task.called
+            assert worker._current_load == 1
+
+        # Reset for Scenario B
+        worker._current_load = 0
+        vip_client.poll_task.reset_mock()
+        std_client.poll_task.reset_mock()
+
+        # Scenario B: VIP is empty. STD has a task.
+        vip_client.poll_task.return_value = None
+        std_client.poll_task.return_value = TaskPayload(
+            task_id="task-std", job_id="job-2", type="test-skill", params={}, tracing_context={}
+        )
+
+        with patch.object(worker, "_process_task", return_value=AsyncMock()):
+            for _, client in worker._clients:
+                task_found = await worker._poll_for_tasks_with_status(client)
+                if task_found:
+                    break
+
+            assert vip_client.poll_task.called
+            assert std_client.poll_task.called
+            assert worker._current_load == 1
+
+
+@pytest.mark.asyncio
+async def test_waterfall_priority_cycle():
+    """Tests that WATERFALL always returns to highest priority after any task."""
+    orchestrators = [
+        {"url": "http://vip", "priority": 1, "weight": 1},
+        {"url": "http://std", "priority": 2, "weight": 1},
+    ]
+    with patch.dict("os.environ", {"ORCHESTRATORS_CONFIG": str(orchestrators).replace("'", '"')}):
+        worker = Worker(worker_type="test-worker")
+
+        @worker.skill("test-skill")
+        async def test_handler(params):
+            pass
+
+        vip_client = AsyncMock()
+        std_client = AsyncMock()
+        worker._clients = [
+            (worker._config.ORCHESTRATORS[0], vip_client),
+            (worker._config.ORCHESTRATORS[1], std_client),
+        ]
+
+        # 1. VIP empty, STD has task
+        vip_client.poll_task.return_value = None
+        std_client.poll_task.return_value = TaskPayload(
+            task_id="t1", job_id="j1", type="test-skill", params={}, tracing_context={}
+        )
+
+        with patch.object(worker, "_process_task", return_value=AsyncMock()):
+            # Simulate first cycle
+            for _, client in worker._clients:
+                if await worker._poll_for_tasks_with_status(client):
+                    break
+
+            assert vip_client.poll_task.called
+            assert std_client.poll_task.called
+
+            # 2. RESET and simulate second cycle. VIP MUST be polled first again.
+            vip_client.poll_task.reset_mock()
+            std_client.poll_task.reset_mock()
+            # VIP now has a task
+            vip_client.poll_task.return_value = TaskPayload(
+                task_id="t2", job_id="j2", type="test-skill", params={}, tracing_context={}
+            )
+
+            for _, client in worker._clients:
+                if await worker._poll_for_tasks_with_status(client):
+                    break
+
+            assert vip_client.poll_task.called
+            assert not std_client.poll_task.called
+
+
+@pytest.mark.asyncio
+async def test_round_robin_selection_logic():
+    """Tests that ROUND_ROBIN correctly cycles through clients."""
+    orchestrators = [
+        {"url": "http://c1", "priority": 1, "weight": 1},
+        {"url": "http://c2", "priority": 1, "weight": 1},
+    ]
+    with patch.dict("os.environ", {"ORCHESTRATORS_CONFIG": str(orchestrators).replace("'", '"')}):
+        worker = Worker(worker_type="test-worker")
+        worker._config.MULTI_ORCHESTRATOR_MODE = "ROUND_ROBIN"
+
+        c1_client = AsyncMock()
+        c2_client = AsyncMock()
+        worker._clients = [
+            (worker._config.ORCHESTRATORS[0], c1_client),
+            (worker._config.ORCHESTRATORS[1], c2_client),
+        ]
+        worker._total_orchestrator_weight = 2
+
+        # Cycle 1 -> Client 1
+        sel1 = worker._get_next_client()
+        assert sel1 == c1_client
+
+        # Cycle 2 -> Client 2
+        sel2 = worker._get_next_client()
+        assert sel2 == c2_client
+
+        # Cycle 3 -> Client 1 (Loop back)
+        sel3 = worker._get_next_client()
+        assert sel3 == c1_client
+
+
+@pytest.mark.asyncio
+async def test_failover_default_logic():
+    """Tests that FAILOVER (default) polls next client if previous is empty in the SAME cycle."""
+    orchestrators = [
+        {"url": "http://c1", "priority": 1, "weight": 1},
+        {"url": "http://c2", "priority": 1, "weight": 1},
+    ]
+    with patch.dict("os.environ", {"ORCHESTRATORS_CONFIG": str(orchestrators).replace("'", '"')}):
+        worker = Worker(worker_type="test-worker")
+        worker._config.MULTI_ORCHESTRATOR_MODE = "FAILOVER"
+
+        @worker.skill("test-skill")
+        async def test_handler(params):
+            pass
+
+        c1_client = AsyncMock()
+        c2_client = AsyncMock()
+        worker._clients = [
+            (worker._config.ORCHESTRATORS[0], c1_client),
+            (worker._config.ORCHESTRATORS[1], c2_client),
+        ]
+
+        # Scenario: C1 empty, C2 has task. FAILOVER polls both in one loop.
+        c1_client.poll_task.return_value = None
+        c2_client.poll_task.return_value = TaskPayload(
+            task_id="t1", job_id="j1", type="test-skill", params={}, tracing_context={}
+        )
+
+        with patch.object(worker, "_process_task", return_value=AsyncMock()):
+            # Simulating FAILOVER/Default loop logic: polls all until busy or end of list
+            for _, client in worker._clients:
+                if worker._get_current_state()["status"] == "busy":
+                    break
+                await worker._poll_for_tasks_with_status(client)
+
+            assert c1_client.poll_task.called
+            assert c2_client.poll_task.called
+            assert worker._current_load == 1

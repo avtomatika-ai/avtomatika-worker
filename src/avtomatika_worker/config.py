@@ -82,9 +82,10 @@ class WorkerConfig:
         self.IDLE_POLL_DELAY: float = float(getenv("IDLE_POLL_DELAY", "0.01"))
         self.SHUTDOWN_TIMEOUT: float = float(getenv("WORKER_SHUTDOWN_TIMEOUT", "30.0"))
         self.ENABLE_WEBSOCKETS: bool = getenv("WORKER_ENABLE_WEBSOCKETS", "false").lower() == "true"
-        self.MULTI_ORCHESTRATOR_MODE: str = getenv("MULTI_ORCHESTRATOR_MODE", "FAILOVER")
+        self.MULTI_ORCHESTRATOR_MODE: str = getenv("MULTI_ORCHESTRATOR_MODE", "WATERFALL")
         self.WORKER_SKILLS_DIR: str = getenv("WORKER_SKILLS_DIR", "skills")
         self.STRICT_EVENT_VALIDATION: bool = getenv("STRICT_EVENT_VALIDATION", "true").lower() == "true"
+        self.WORKER_ENABLE_METRICS: bool = getenv("WORKER_ENABLE_METRICS", "false").lower() == "true"
 
         # --- Custom Extra Capabilities ---
         # Automatically pick up environment variables starting with WORKER_EXTRA_

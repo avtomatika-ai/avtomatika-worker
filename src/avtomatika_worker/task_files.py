@@ -18,6 +18,7 @@ from aiofiles.ospath import exists as aio_exists
 if TYPE_CHECKING:
     from rxon.models import FileMetadata
 
+    from .observability import ObservabilityManager
     from .s3 import S3Manager
 
 
@@ -28,7 +29,14 @@ class TaskFiles:
     within an isolated workspace for each task.
     """
 
-    def __init__(self, task_dir: str, job_id: str, task_id: str, s3_manager: S3Manager | None = None):
+    def __init__(
+        self,
+        task_dir: str,
+        job_id: str,
+        task_id: str,
+        s3_manager: S3Manager | None = None,
+        observability: ObservabilityManager | None = None,
+    ):
         """
         Initializes TaskFiles with specific directory and identifiers.
         """
@@ -36,6 +44,7 @@ class TaskFiles:
         self._job_id = job_id
         self._task_id = task_id
         self._s3_manager = s3_manager
+        self._observability = observability
 
     async def get_root(self) -> str:
         """
@@ -132,6 +141,9 @@ class TaskFiles:
         if not self._s3_manager:
             raise RuntimeError("S3Manager not configured for this TaskFiles instance.")
         path = await self.path_to(filename)
+        if self._observability:
+            with self._observability.start_s3_span("upload_file", f"file://{filename}"):
+                return await self._s3_manager._upload_to_s3(path, s3_prefix=self._job_id)
         return await self._s3_manager._upload_to_s3(path, s3_prefix=self._job_id)
 
     async def upload_dir(self, dirname: str = "") -> FileMetadata:
@@ -139,12 +151,18 @@ class TaskFiles:
         if not self._s3_manager:
             raise RuntimeError("S3Manager not configured for this TaskFiles instance.")
         path = join(self._task_dir, dirname) if dirname else self._task_dir
+        if self._observability:
+            with self._observability.start_s3_span("upload_dir", f"dir://{dirname or 'root'}"):
+                return await self._s3_manager._upload_to_s3(path, s3_prefix=self._job_id)
         return await self._s3_manager._upload_to_s3(path, s3_prefix=self._job_id)
 
     async def download_file(self, uri: str, filename: str, verify_meta: FileMetadata | None = None) -> str:
         """Downloads a file from S3 to the task directory with optional integrity check."""
         if not self._s3_manager:
             raise RuntimeError("S3Manager not configured for this TaskFiles instance.")
+        if self._observability:
+            with self._observability.start_s3_span("download_file", uri):
+                return await self._s3_manager._process_s3_uri(uri, self._task_id, verify_meta=verify_meta)
         return await self._s3_manager._process_s3_uri(uri, self._task_id, verify_meta=verify_meta)
 
     async def list(self) -> list[str]:
