@@ -6,14 +6,15 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from json import dumps, loads
 from os.path import dirname, join
-from typing import TYPE_CHECKING, Any, AsyncGenerator, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from aiofiles import open as aiopen
 from aiofiles.os import listdir, makedirs
 from aiofiles.ospath import exists as aio_exists
+from orjson import OPT_INDENT_2, dumps, loads
 
 if TYPE_CHECKING:
     from rxon.models import FileMetadata
@@ -125,8 +126,8 @@ class TaskFiles:
 
     async def write_json(self, filename: str, data: Any) -> FileMetadata | None:
         """Writes data as JSON and optionally uploads to S3 if manager is available."""
-        content = dumps(data, indent=2)
-        await self.write(filename, content)
+        content = dumps(data, option=OPT_INDENT_2)
+        await self.write(filename, content, mode="wb")
         if self._s3_manager:
             return await self.upload_file(filename)
         return None

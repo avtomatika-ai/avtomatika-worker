@@ -8,12 +8,12 @@ from __future__ import annotations
 
 from _socket import gaierror, gethostbyname, gethostname
 from contextlib import suppress
-from json import JSONDecodeError, loads
 from logging import getLogger
 from os import environ, getenv
 from typing import Any, cast
 from uuid import uuid4
 
+from orjson import JSONDecodeError, loads
 from rxon.validators import validate_identifier
 
 logger = getLogger(__name__)

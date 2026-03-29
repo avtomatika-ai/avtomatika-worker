@@ -73,16 +73,20 @@ worker run --app app.main:worker
 
 ## Key Features
 
-### 1. Smart Skill Registration
+### 1. Zero-Trust Security (HLN Identity Chain)
+- **Cryptographic Signatures:** When `WORKER_TOKEN` is configured, the SDK automatically signs all registrations, heartbeats, task results, and events using HMAC SHA256. This ensures payload integrity and prevents unauthorized worker spoofing.
+
+### 2. Smart Skill Registration
 - **Zero Configuration:** Names and schemas are inferred from function names and type hints.
 - **Auto-Contracts:** Both `input_schema` and `output_schema` are automatically generated from Pydantic models or standard Dataclasses.
 - **Generic Events:** Declare custom events via `@worker.skill(events={"alert": Schema})` and emit them using the `send_event` helper. Progress is also a system event.
 
-### 2. Optimized Network Traffic (HLN Protocol)
+### 3. Optimized Network Traffic & Performance
 - **Skills Hashing:** Workers only send the full skill list when it actually changes. Periodic heartbeats use a lightweight `skills_hash`.
+- **Thundering Herd Prevention:** The SDK automatically applies `next_heartbeat_jitter_ms` provided by the Orchestrator to prevent network spikes when thousands of workers restart simultaneously.
 - **Self-Healing Sync:** If the orchestrator loses worker metadata, it can trigger a `Full Sync` via heartbeat response, ensuring seamless recovery.
 
-### 3. Multi-Orchestrator Support (Waterfall Priority)
+### 4. Multi-Orchestrator Support (Waterfall Priority)
 - **Waterfall Strategy:** By default, the worker polls orchestrators in order of their priority. It always returns to the highest-priority orchestrator after completing any task, ensuring VIP tasks are handled first.
 - **Failover & Round Robin:** Alternative strategies for load balancing and high availability.
 

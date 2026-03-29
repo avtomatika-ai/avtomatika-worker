@@ -5,9 +5,9 @@
 # Copyright (c) 2026 Dmitrii Gagarin aka madgagarin
 
 import io
-import json
 import logging
 
+import orjson
 import pytest
 from rxon.testing import MockTransport
 
@@ -85,7 +85,7 @@ async def test_worker_logging_context(monkeypatch):
     log_output = log_capture.getvalue().splitlines()
     # Find our log "Inside task"
     task_log = next(line for line in log_output if "Inside task" in line)
-    log_data = json.loads(task_log)
+    log_data = orjson.loads(task_log)
 
     assert log_data["task_id"] == "task-456"
     assert log_data["job_id"] == "job-123"

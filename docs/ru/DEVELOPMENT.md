@@ -106,7 +106,7 @@ worker run --app my_worker:worker --reload
 ```dotenv
 ORCHESTRATOR_URL=http://localhost:8080
 WORKER_ID=report-worker-01
-WORKER_INDIVIDUAL_TOKEN=a-super-secret-token-for-this-worker
+WORKER_TOKEN=a-super-secret-token-for-this-worker
 ```
 
 #### Вариант 2: Расширенное соединение (несколько оркестраторов)

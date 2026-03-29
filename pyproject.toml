@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "avtomatika-worker"
-version = "1.0b11"
+version = "1.0b12"
 description = "Worker SDK for the Avtomatika orchestrator."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -21,10 +21,11 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "rxon==1.0b5",
+    "rxon==1.0b6",
     "aiohttp~=3.13.2",
     "python-json-logger~=4.0.0",
     "aiofiles~=25.1.0",
+    "orjson~=3.10.15",
 ]
 
 [project.scripts]
@@ -79,7 +80,17 @@ target-version = "py311"
 line-length = 120
 
 [tool.ruff.lint]
-select = ["E", "W", "F", "I", "B", "A", "SIM", "C4", "PLC2401"]
+select = ["E", "W", "F", "I", "B", "A", "SIM", "C4", "PLC2401", "UP", "TID"]
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "parents"
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"json".msg = "Use 'orjson' instead of standard 'json' for better performance."
+
+[tool.ruff.lint.pyupgrade]
+# Enforce native union types (X | Y) instead of Union/Optional
+keep-runtime-typing = false
 
 [tool.ruff.lint.isort]
 known-first-party = ["avtomatika_worker"]

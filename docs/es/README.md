@@ -73,16 +73,20 @@ worker run --app app.main:worker
 
 ## Características Clave
 
-### 1. Registro Inteligente de Skills
-- **Configuración Cero:** Los nombres и esquemas se infieren automáticamente de los nombres de las funciones и las pistas de tipo.
-- **Auto-Contratos:** Generación de `input_schema` и `output_schema` a partir de modelos Pydantic o Dataclasses estándar.
-- **Eventos Genéricos:** Declare señales personalizadas mediante `@worker.skill(events={"alert": Schema})` и emítalas usando el ayudante `send_event`. El progreso también es un evento del sistema.
+### 1. Seguridad Zero-Trust (HLN Identity Chain)
+- **Firmas Criptográficas:** Cuando se configura `WORKER_TOKEN`, el SDK firma automáticamente todos los registros, latidos (heartbeats), resultados de tareas y eventos utilizando HMAC SHA256. Esto garantiza la integridad de la carga útil y previene la suplantación de workers no autorizados.
 
-### 2. Tráfico de Red Optimizado (Protocolo HLN)
+### 2. Registro Inteligente de Skills
+- **Configuración Cero:** Los nombres y esquemas se infieren automáticamente de los nombres de las funciones y las pistas de tipo.
+- **Auto-Contratos:** Generación de `input_schema` y `output_schema` a partir de modelos Pydantic o Dataclasses estándar.
+- **Eventos Genéricos:** Declare señales personalizadas mediante `@worker.skill(events={"alert": Schema})` y emítalas usando el ayudante `send_event`. El progreso también es un evento del sistema.
+
+### 3. Tráfico de Red Optimizado y Rendimiento
 - **Hashing de Skills:** Los workers solo envían la lista completa de habilidades cuando realmente cambia. Los latidos periódicos utilizan un `skills_hash` ligero.
+- **Prevención de Thundering Herd:** El SDK aplica automáticamente `next_heartbeat_jitter_ms` proporcionado por el Orquestador para evitar picos de red cuando miles de workers se reinician simultáneamente.
 - **Sincronización Autorrecuperable (Self-Healing):** Si el orquestador pierde los metadatos del worker, puede solicitar una sincronización completa a través de la respuesta del latido, asegurando una recuperación perfecta.
 
-### 3. Soporte para Múltiples Orquestadores (Waterfall Priority)
+### 4. Soporte para Múltiples Orquestadores (Waterfall Priority)
 - **Estrategia Waterfall:** Por defecto, el worker sondea los orquestadores en orden de su prioridad. Siempre regresa al orquestador de mayor prioridad después de completar cualquier tarea, asegurando que las tareas VIP se manejen primero.
 - **Failover и Round Robin:** Estrategias alternativas para el equilibrio de carga и la alta disponibilidad.
 

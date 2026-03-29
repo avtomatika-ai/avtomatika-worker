@@ -21,7 +21,7 @@ from asyncio import (
     wait,
     wait_for,
 )
-from asyncio import TimeoutError as AsyncTimeoutError
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import fields, is_dataclass, make_dataclass, replace
 from importlib.util import module_from_spec, spec_from_file_location
@@ -29,7 +29,9 @@ from inspect import Parameter, iscoroutinefunction, signature
 from logging import getLogger
 from os.path import join
 from signal import SIGINT, SIGTERM
-from typing import Any, Callable, Type, cast, get_args, get_origin, get_type_hints
+from time import perf_counter, time
+from typing import Any, cast, get_args, get_origin, get_type_hints
+from uuid import uuid4
 
 from aiofiles.os import listdir
 from aiofiles.ospath import abspath, exists
@@ -57,6 +59,7 @@ from rxon.models import (
     InstalledArtifact,
     Resources,
     ResourcesUsage,
+    SecurityContext,
     SkillInfo,
     TaskError,
     TaskPayload,
@@ -65,9 +68,9 @@ from rxon.models import (
     WorkerEventPayload,
     WorkerRegistration,
 )
-from rxon.schema import extract_json_schema, extract_output_schema_from_func, extract_schema_from_func
-from rxon.security import create_client_ssl_context
-from rxon.utils import to_dict
+from rxon.schema import extract_json_schema, extract_output_schema_from_func, extract_schema_from_func, validate_data
+from rxon.security import create_client_ssl_context, sign_payload
+from rxon.utils import from_dict, to_dict
 from rxon.validators import is_valid_identifier, validate_identifier
 
 from .config import WorkerConfig
@@ -83,6 +86,13 @@ try:
     _PYDANTIC_INSTALLED = True
 except ImportError:
     _PYDANTIC_INSTALLED = False
+
+    class BaseModel:  # type: ignore
+        pass
+
+    class ValidationError(Exception):  # type: ignore
+        pass
+
 
 __all__ = [
     "Worker",
@@ -106,7 +116,7 @@ def worker_extract_json_schema(schema_type: Any) -> dict[str, Any] | None:
 def _pydantic_extractor(schema_type: Any) -> dict[str, Any] | None:
     """Local Pydantic extractor for the worker SDK."""
     if _PYDANTIC_INSTALLED and isinstance(schema_type, type) and issubclass(schema_type, BaseModel):
-        return cast(dict, cast(Type[BaseModel], schema_type).model_json_schema())
+        return cast(dict, cast(type[BaseModel], schema_type).model_json_schema())
     return None
 
 
@@ -124,18 +134,17 @@ logger = getLogger(__name__)
 
 
 def _create_dynamic_skill_object(
-    base_class: Type[SkillInfo],
+    base_class: type[SkillInfo],
     init_kwargs: dict[str, Any],
 ) -> SkillInfo:
     """
     Creates a SkillInfo object (or descendant).
-    If init_kwargs contain fields not present in base_class, a new subclass is dynamically created.
+    Dynamically creates a subclass if init_kwargs contains fields not present in base_class.
     """
     known_field_names = {f.name for f in fields(base_class)}
     extra_kwargs = {k: v for k, v in init_kwargs.items() if k not in known_field_names}
     base_kwargs = {k: v for k, v in init_kwargs.items() if k in known_field_names}
 
-    # Handle Schema Extraction for base args
     if "input_schema" in base_kwargs:
         base_kwargs["input_schema"] = worker_extract_json_schema(base_kwargs["input_schema"])
     if "output_schema" in base_kwargs:
@@ -173,13 +182,13 @@ class SkillBlueprint:
     Allows defining skills in separate files without a worker instance.
     """
 
-    def __init__(self, skill_info_class: Type[SkillInfo] = SkillInfo) -> None:
+    def __init__(self, skill_info_class: type[SkillInfo] = SkillInfo) -> None:
         self._skills: list[tuple[SkillInfo, Callable]] = []
         self._skill_info_class = skill_info_class
 
     def skill(
         self,
-        info: str | SkillInfo | Type[SkillInfo] | None = None,
+        info: str | SkillInfo | type[SkillInfo] | None = None,
         **kwargs: Any,
     ) -> Callable:
         """Universal decorator to register a skill handler on the blueprint."""
@@ -234,7 +243,7 @@ class Worker:
         capacity_checker: CapacityChecker | None = None,
         clients: list[tuple[dict[str, Any], Transport]] | None = None,
         skills_dir: str | None = None,
-        skill_info_class: Type[SkillInfo] = SkillInfo,
+        skill_info_class: type[SkillInfo] = SkillInfo,
     ):
         self._config = config or WorkerConfig()
         if skills_dir:
@@ -278,8 +287,6 @@ class Worker:
         self._registered_event = Event()
         self._debounce_task: Task | None = None
         self._ssl_context = None
-
-        # HLN Optimization: Traffic reduction
         self._last_synced_skills_hash: str | None = None
 
         self._total_orchestrator_weight = 0
@@ -371,7 +378,7 @@ class Worker:
 
     def skill(
         self,
-        info: str | SkillInfo | Type[SkillInfo] | None = None,
+        info: str | SkillInfo | type[SkillInfo] | None = None,
         **kwargs: Any,
     ) -> Callable:
         """
@@ -530,7 +537,6 @@ class Worker:
 
     async def _start_polling(self) -> None:
         try:
-            # Wait for either registration OR shutdown
             done, pending = await wait(
                 [
                     create_task(self._registered_event.wait()),
@@ -620,13 +626,21 @@ class Worker:
                 deps[name] = self._observability
         return deps
 
+    def _sign_payload_if_needed(self, payload: dict[str, Any]) -> SecurityContext | None:
+        """Signs payload for zero-trust verification if token is configured."""
+        if self._config.WORKER_TOKEN and self._config.WORKER_TOKEN != "your-secret-worker-token":
+            signature_val = sign_payload(payload, self._config.WORKER_TOKEN)
+            return SecurityContext(signature=signature_val, signer_id=self._config.WORKER_ID)
+        return None
+
     async def _process_task(self, task_data_raw: dict[str, Any]) -> None:
+        """Handles the lifecycle of a single task: setup, execution, and reporting."""
         client: Transport = task_data_raw.pop("client")
         if "params_metadata" in task_data_raw and task_data_raw["params_metadata"]:
             task_data_raw["params_metadata"] = {
-                k: self._from_dict(FileMetadata, v) for k, v in task_data_raw["params_metadata"].items()
+                k: from_dict(FileMetadata, v) for k, v in task_data_raw["params_metadata"].items()
             }
-        task_payload = self._from_dict(TaskPayload, task_data_raw)
+        task_payload = from_dict(TaskPayload, task_data_raw)
         task_id, job_id, skill_name = task_payload.task_id, task_payload.job_id, task_payload.type
         params = task_payload.params
         set_context(task_id=task_id, job_id=job_id)
@@ -634,21 +648,22 @@ class Worker:
         skill_type_for_limit = handler_data.get("type") if handler_data else None
         result_obj: TaskResult | None = None
 
-        from time import perf_counter
-
         start_time = perf_counter()
 
         with self._observability.start_task_span(skill_name, task_id, job_id) as span:
 
-            async def send_event_wrapper(event_type: str, payload: dict[str, Any], priority: float = 0.0) -> None:
+            async def send_event_wrapper(
+                event_type: str,
+                payload: dict[str, Any],
+                priority: float = 0.0,
+                security: SecurityContext | None = None,
+                metadata: dict[str, Any] | None = None,
+            ) -> None:
                 if handler_data and (events_schema := handler_data["info"].events_schema):
                     if event_type in events_schema:
-                        from rxon.schema import validate_data
-
                         is_valid, error_msg = validate_data(payload, events_schema[event_type])
                         if not is_valid:
-                            full_error = f"Local contract violation for event '{event_type}': {error_msg}"
-                            logger.error(full_error)
+                            logger.error(f"Local contract violation for event '{event_type}': {error_msg}")
                             return
                     elif event_type != EVENT_TYPE_PROGRESS:
                         if self._config.STRICT_EVENT_VALIDATION:
@@ -657,8 +672,8 @@ class Worker:
                         else:
                             logger.warning(f"Emitting undeclared event type '{event_type}'. Allowed by config.")
 
-                from time import time
-                from uuid import uuid4
+                if not security:
+                    security = self._sign_payload_if_needed(payload)
 
                 event_payload = WorkerEventPayload(
                     event_id=str(uuid4()),
@@ -672,6 +687,8 @@ class Worker:
                     trace_context=task_payload.tracing_context,
                     priority=priority,
                     timestamp=time(),
+                    security=security,
+                    metadata=metadata,
                 )
                 await client.emit_event(event_payload)
 
@@ -705,29 +722,54 @@ class Worker:
                         "tracing_context": task_payload.tracing_context,
                         "priority": task_payload.priority,
                         "deadline": task_payload.deadline,
+                        "security": task_payload.security,
+                        "metadata": task_payload.metadata,
                         "send_progress": send_progress_wrapper,
                         "send_event": send_event_wrapper,
                         "add_to_hot_cache": self.add_to_hot_cache,
                         "remove_from_hot_cache": self.remove_from_hot_cache,
                         **deps,
                     }
+                    handler_func = handler_data["func"]
+                    sig = signature(handler_func)
+                    final_handler_kwargs = {}
+
+                    if "params" in sig.parameters:
+                        final_handler_kwargs["params"] = validated_params
+
+                    available_context = {**handler_kwargs, **deps}
+                    for param_name, param in sig.parameters.items():
+                        if param_name == "params":
+                            continue
+                        if param_name in available_context:
+                            final_handler_kwargs[param_name] = available_context[param_name]
+                        elif param.default is Parameter.empty and param.kind not in (
+                            Parameter.VAR_KEYWORD,
+                            Parameter.VAR_POSITIONAL,
+                        ):
+                            raise ParamValidationError(f"Missing required parameter: {param_name}")
+
                     middleware_context = {
                         "task_id": task_id,
                         "job_id": job_id,
                         "skill_name": skill_name,
                         "params": validated_params,
-                        "handler_kwargs": handler_kwargs,
+                        "handler_kwargs": final_handler_kwargs,
                         "observability": self._observability,
                         "s3_manager": self._s3_manager,
                     }
 
                     async def _execution_logic() -> Any:
                         handler = handler_data["func"]
-                        final_kwargs = middleware_context["handler_kwargs"]
+                        f_kwargs = middleware_context["handler_kwargs"]
+
+                        if any(p.kind == Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+                            f_kwargs = {**available_context, **f_kwargs}
+
                         if iscoroutinefunction(handler):
-                            return await handler(**final_kwargs)
+                            return await handler(**f_kwargs)
                         else:
-                            return await to_thread(handler, **final_kwargs)
+                            return await to_thread(handler, **f_kwargs)
 
                     handler_chain = _execution_logic
                     for middleware in reversed(self._middlewares):
@@ -741,11 +783,11 @@ class Worker:
                         handler_chain = make_wrapper(middleware, handler_chain)
                     handler_result = await handler_chain()
 
-                    # FAIL FAST: Validate output schema locally before sending
+                    if not isinstance(handler_result, dict):
+                        handler_result = {"data": handler_result}
+
                     skill_info = handler_data["info"]
                     if skill_info.output_schema:
-                        from rxon.schema import validate_data
-
                         is_valid, error_msg = validate_data(handler_result.get("data"), skill_info.output_schema)
                         if not is_valid:
                             full_error = f"Local contract violation: output does not match schema. {error_msg}"
@@ -764,6 +806,19 @@ class Worker:
                             task_error = TaskError(**valid_err_fields)
                         else:
                             task_error = TaskError(code=ERROR_CODE_TRANSIENT, message=str(err_data))
+
+                    payload_for_signing = {
+                        "job_id": job_id,
+                        "task_id": task_id,
+                        "worker_id": self._config.WORKER_ID,
+                        "status": handler_result.get("status", TASK_STATUS_SUCCESS),
+                        "data": updated_data,
+                        "error": to_dict(task_error) if task_error else None,
+                    }
+                    security = self._sign_payload_if_needed(payload_for_signing)
+                    if not security:
+                        security = from_dict(SecurityContext, handler_result.get("security"))
+
                     result_obj = TaskResult(
                         job_id=job_id,
                         task_id=task_id,
@@ -772,6 +827,8 @@ class Worker:
                         data=updated_data,
                         error=task_error,
                         data_metadata=metadata_map if metadata_map else None,
+                        security=security,
+                        metadata=handler_result.get("metadata"),
                     )
                     if span and result_obj.status == TASK_STATUS_FAILURE:
                         self._observability.set_span_status_error(
@@ -786,13 +843,20 @@ class Worker:
                     worker_id=self._config.WORKER_ID,
                     status=TASK_STATUS_FAILURE,
                     error=error,
+                    security=task_payload.security,
+                    metadata=task_payload.metadata,
                 )
                 if span:
                     self._observability.set_span_status_error(span, str(e))
             except CancelledError:
                 logger.info(f"Task {task_id} was cancelled.")
                 result_obj = TaskResult(
-                    job_id=job_id, task_id=task_id, worker_id=self._config.WORKER_ID, status=TASK_STATUS_CANCELLED
+                    job_id=job_id,
+                    task_id=task_id,
+                    worker_id=self._config.WORKER_ID,
+                    status=TASK_STATUS_CANCELLED,
+                    security=task_payload.security,
+                    metadata=task_payload.metadata,
                 )
                 if span:
                     self._observability.set_span_status_error(span, "Task cancelled")
@@ -806,6 +870,8 @@ class Worker:
                     worker_id=self._config.WORKER_ID,
                     status=TASK_STATUS_FAILURE,
                     error=error,
+                    security=task_payload.security,
+                    metadata=task_payload.metadata,
                 )
                 if span:
                     self._observability.set_span_status_error(span, str(e))
@@ -818,6 +884,8 @@ class Worker:
                     worker_id=self._config.WORKER_ID,
                     status=TASK_STATUS_FAILURE,
                     error=error,
+                    security=task_payload.security,
+                    metadata=task_payload.metadata,
                 )
                 if span:
                     self._observability.set_span_status_error(span, str(e))
@@ -842,32 +910,12 @@ class Worker:
                     self._current_load_by_type[skill_type_for_limit] -= 1
                 self._schedule_heartbeat_debounce()
 
-    @staticmethod
-    def _from_dict(cls: type, data: Any) -> Any:
-        if not data:
-            return None
-        if isinstance(data, cls):
-            return data
-        if not isinstance(data, dict):
-            return data
-
-        if hasattr(cls, "_fields"):
-            fields_list = cast(Any, cls)._fields
-            filtered_data = {k: v for k, v in data.items() if k in fields_list}
-            return cls(**filtered_data)
-        elif is_dataclass(cls):
-            known_field_names = {f.name for f in fields(cls)}
-            filtered_data = {k: v for k, v in data.items() if k in known_field_names}
-            return cls(**filtered_data)
-
-        return data
-
     def _calculate_contract_hash(self, skills: list[SkillInfo]) -> str:
-        """Calculates a hash representing the worker's current 'contract' (skills + prices + capabilities)."""
+        """Calculates a hash representing the worker's current 'contract'."""
         from rxon.utils import calculate_dict_hash
 
         combined_contract = {
-            "skills": skills,
+            "skills": [to_dict(s) for s in skills],
             "capabilities": self._config.COST_PER_SKILL,
             "extra": self._config.EXTRA_CAPABILITIES,
         }
@@ -899,7 +947,7 @@ class Worker:
         skills_hash = self._calculate_contract_hash(state["supported_skills"])
         self._last_synced_skills_hash = skills_hash
 
-        return WorkerRegistration(
+        payload = WorkerRegistration(
             worker_id=self._config.WORKER_ID,
             worker_type=self._config.WORKER_TYPE,
             supported_skills=state["supported_skills"],
@@ -918,6 +966,10 @@ class Worker:
             ),
             skills_hash=skills_hash,
         )
+        security = self._sign_payload_if_needed(to_dict(payload))
+        if security:
+            payload = payload._replace(security=security)
+        return payload
 
     async def _register_client_with_retry(self, client: Transport) -> None:
         delay = self._config.REGISTRATION_RETRY_INITIAL_DELAY
@@ -928,14 +980,13 @@ class Worker:
                 self._registered_event.set()
                 return
             except Exception:
-                # _safe_register already logs the error
                 pass
 
             logger.info(f"Retrying registration for {client} in {delay:.1f}s...")
             try:
                 await wait_for(self._shutdown_event.wait(), timeout=delay)
                 return
-            except (TimeoutError, AsyncTimeoutError):
+            except TimeoutError:
                 delay = min(delay * 2, self._config.REGISTRATION_RETRY_MAX_DELAY)
 
     async def _manage_single_orchestrator(self, client: Transport) -> None:
@@ -947,11 +998,12 @@ class Worker:
 
             while not self._shutdown_event.is_set():
                 try:
-                    await self._send_single_heartbeat(client)
+                    jitter_ms = await self._send_single_heartbeat(client)
+                    wait_time = self._config.HEARTBEAT_INTERVAL + (jitter_ms / 1000.0)
                     try:
-                        await wait_for(self._shutdown_event.wait(), timeout=self._config.HEARTBEAT_INTERVAL)
+                        await wait_for(self._shutdown_event.wait(), timeout=wait_time)
                         break
-                    except (TimeoutError, AsyncTimeoutError):
+                    except TimeoutError:
                         continue
                 except RxonError as e:
                     err_msg = str(e).lower()
@@ -964,20 +1016,19 @@ class Worker:
                         try:
                             await wait_for(self._shutdown_event.wait(), timeout=self._config.HEARTBEAT_INTERVAL)
                             break
-                        except (TimeoutError, AsyncTimeoutError):
+                        except TimeoutError:
                             continue
                 except Exception as e:
                     logger.error(f"Unexpected error in heartbeat loop for {client}: {e}")
                     try:
                         await wait_for(self._shutdown_event.wait(), timeout=self._config.HEARTBEAT_INTERVAL)
                         break
-                    except (TimeoutError, AsyncTimeoutError):
+                    except TimeoutError:
                         continue
 
     async def _register_with_all_orchestrators(self) -> None:
         """Starts background registration for all orchestrators. Blocks until at least one succeeds."""
         try:
-            # Wait for either registration OR shutdown
             done, pending = await wait(
                 [
                     create_task(self._registered_event.wait()),
@@ -990,8 +1041,7 @@ class Worker:
         except Exception:
             pass
 
-    @staticmethod
-    async def _safe_register(client: Transport, registration: WorkerRegistration) -> None:
+    async def _safe_register(self, client: Transport, registration: WorkerRegistration) -> None:
         try:
             resp = await client.register(registration)
             if isinstance(resp, dict) and (warning := resp.get("warning")):
@@ -1023,18 +1073,17 @@ class Worker:
 
     def _create_heartbeat_payload(self) -> Heartbeat:
         state = self._get_current_state()
-        hot_skills = None
+        final_hot_skills: list[SkillInfo] | None = None
         if self._skill_dependencies:
-            hot_skills = [
+            hot_skill_names = [
                 skill for skill, models in self._skill_dependencies.items() if set(models).issubset(self._hot_cache)
             ]
             final_hot_skills = []
-            for hs_name in hot_skills:
+            for hs_name in hot_skill_names:
                 if hs_name in self._skill_handlers:
                     final_hot_skills.append(self._skill_handlers[hs_name]["info"])
                 else:
                     final_hot_skills.append(SkillInfo(name=hs_name))
-            hot_skills = final_hot_skills
 
         current_skills = state["supported_skills"]
         current_hash = self._calculate_contract_hash(current_skills)
@@ -1044,36 +1093,55 @@ class Worker:
             logger.info(f"Worker contract changed (hash: {current_hash}). Sending full update.")
             skills_to_send = current_skills
 
+        usage = self._get_resources_usage()
+        payload_for_signing = {
+            "worker_id": self._config.WORKER_ID,
+            "status": state["status"],
+            "usage": to_dict(usage),
+            "current_tasks": list(self._active_tasks.keys()),
+            "supported_skills": [to_dict(s) for s in current_skills] if skills_to_send else None,
+            "hot_cache": list(self._hot_cache),
+        }
+        security = self._sign_payload_if_needed(payload_for_signing)
+
         return Heartbeat(
             worker_id=self._config.WORKER_ID,
             status=state["status"],
-            usage=self._get_resources_usage(),
+            usage=usage,
             current_tasks=list(self._active_tasks.keys()),
             supported_skills=skills_to_send,
             hot_cache=list(self._hot_cache),
             skill_dependencies=self._skill_dependencies or None,
-            hot_skills=hot_skills or None,
+            hot_skills=final_hot_skills or None,
             skills_hash=current_hash,
+            security=security,
         )
 
-    async def _send_single_heartbeat(self, client: Transport) -> None:
+    async def _send_single_heartbeat(self, client: Transport) -> int:
         heartbeat = self._create_heartbeat_payload()
         resp = await client.send_heartbeat(heartbeat)
-        if resp and not isinstance(resp, str):  # resp can be "error" or dict/model
-            # After successful heartbeat, we can mark skills as synced
+        jitter_ms = 0
+        if resp and not isinstance(resp, str):
             self._last_synced_skills_hash = heartbeat.skills_hash
         if resp:
             from rxon.constants import HB_RESP_CANCEL_TASKS, HB_RESP_REQUIRE_FULL_SYNC
 
-            if resp.get(HB_RESP_REQUIRE_FULL_SYNC):
+            if isinstance(resp, dict) and resp.get(HB_RESP_REQUIRE_FULL_SYNC):
                 logger.warning(f"Orchestrator {client} requested Full Sync. Resetting state.")
                 self._last_synced_skills_hash = None
 
-            if HB_RESP_CANCEL_TASKS in resp:
+            if isinstance(resp, dict) and HB_RESP_CANCEL_TASKS in resp:
                 for task_id in resp[HB_RESP_CANCEL_TASKS]:
                     if task_id in self._active_tasks:
                         logger.warning(f"Task {task_id} marked for cancellation via heartbeat feedback loop.")
                         self._active_tasks[task_id].cancel()
+
+            if isinstance(resp, dict):
+                try:
+                    jitter_ms = int(resp.get("next_heartbeat_jitter_ms", 0))
+                except (ValueError, TypeError):
+                    jitter_ms = 0
+        return jitter_ms
 
     async def _manage_orchestrator_communications(self) -> None:
         """Starts independent managers for each orchestrator."""
@@ -1091,7 +1159,7 @@ class Worker:
         self._validate_skill_types()
         await self.load_skills()
         if self._config.EXTRA_CAPABILITIES:
-            logger.info(f"Loaded custom capabilities from environment: {self._config.EXTRA_CAPABILITIES}")
+            logger.info(f"Loaded custom capabilities: {self._config.EXTRA_CAPABILITIES}")
         loop = get_running_loop()
         for sig in (SIGINT, SIGTERM):
             with suppress(NotImplementedError):
@@ -1117,7 +1185,6 @@ class Worker:
         await self._shutdown_event.wait()
         logger.info("Shutdown signal received. Starting graceful shutdown...")
 
-        # Stop all sub-tasks
         for task in self._comm_tasks:
             task.cancel()
 
@@ -1125,7 +1192,7 @@ class Worker:
         logger.info("Waiting for active S3 operations to complete...")
         await self._s3_manager.wait_all_done()
 
-        logger.info("Sending final 'offline' heartbeat to all orchestrators...")
+        logger.info("Sending final 'offline' heartbeat...")
         with suppress(Exception):
             heartbeat = Heartbeat(
                 worker_id=self._config.WORKER_ID,
@@ -1141,13 +1208,13 @@ class Worker:
             token_rotation_task.cancel()
         if self._active_tasks:
             timeout = self._config.SHUTDOWN_TIMEOUT
-            logger.info(f"Waiting for {len(self._active_tasks)} active tasks to complete (timeout: {timeout}s)...")
+            logger.info(f"Waiting for {len(self._active_tasks)} tasks to complete ({timeout}s)...")
             try:
                 await wait_for(
                     gather(*self._active_tasks.values(), return_exceptions=True), timeout=self._config.SHUTDOWN_TIMEOUT
                 )
-            except (TimeoutError, AsyncTimeoutError):
-                logger.warning("Shutdown timeout reached. Some tasks may be interrupted.")
+            except TimeoutError:
+                logger.warning("Shutdown timeout reached.")
             except CancelledError:
                 pass
         await gather(*[client.close() for _, client in self._clients])
@@ -1171,9 +1238,8 @@ class Worker:
                         self._config.WORKER_TOKEN = token_resp.access_token
                         min_expires_in = min(min_expires_in, token_resp.expires_in)
                 except Exception as e:
-                    logger.error(f"Error in token rotation loop: {e}")
+                    logger.error(f"Error in token rotation: {e}")
             refresh_delay = max(60, min_expires_in * 0.8)
-            logger.debug(f"Next token refresh scheduled in {refresh_delay:.1f}s")
             await sleep(refresh_delay)
 
     async def _run_health_check_server(self) -> None:
@@ -1228,10 +1294,9 @@ class Worker:
                 async for command in client.listen_for_commands():
                     if command.command == COMMAND_CANCEL_TASK:
                         task_id = command.task_id
-                        job_id = command.job_id
                         if task_id in self._active_tasks:
                             self._active_tasks[task_id].cancel()
-                            logger.info(f"Cancelled task {task_id} (Job: {job_id or 'N/A'}) by orchestrator command.")
+                            logger.info(f"Cancelled task {task_id} by command.")
             except Exception as e:
                 logger.error(f"Error in command listener: {e}")
             await sleep(5)

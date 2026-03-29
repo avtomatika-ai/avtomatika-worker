@@ -43,7 +43,7 @@ async def test_registration_infinite_retry():
     # Wait for success (initial + 3 retries = 4 calls total)
     try:
         await asyncio.wait_for(reg_task, timeout=2.0)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         pytest.fail("Registration did not succeed within timeout")
 
     assert transport.call_count == 4

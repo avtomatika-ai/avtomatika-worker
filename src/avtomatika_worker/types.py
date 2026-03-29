@@ -4,7 +4,8 @@
 #
 # Copyright (c) 2026 Dmitrii Gagarin aka madgagarin
 
-from typing import Any, Awaitable, Callable
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 from rxon.constants import (
     ERROR_CODE_CONTRACT_VIOLATION as CONTRACT_VIOLATION_ERROR,

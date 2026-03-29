@@ -6,9 +6,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Generator
 from contextlib import contextmanager
 from logging import getLogger
-from typing import Any, Generator, Optional, cast
+from typing import Any, cast
 
 logger = getLogger(__name__)
 try:
@@ -47,7 +48,7 @@ class ObservabilityManager:
         self.enabled = enabled and _HAS_OTEL
         self.tracer = None
         self.meter = None
-        self.registry: Optional[Any] = None
+        self.registry: Any | None = None
 
         if not self.enabled:
             if enabled and not _HAS_OTEL:
@@ -92,7 +93,7 @@ class ObservabilityManager:
         )
 
     @contextmanager
-    def start_task_span(self, task_type: str, task_id: str, job_id: str) -> Generator[Optional[Any], None, None]:
+    def start_task_span(self, task_type: str, task_id: str, job_id: str) -> Generator[Any | None, None, None]:
         """Starts a span for a task execution."""
         if not self.enabled or not self.tracer:
             yield None
@@ -109,7 +110,7 @@ class ObservabilityManager:
             yield span
 
     @contextmanager
-    def start_s3_span(self, op: str, uri: str) -> Generator[Optional[Any], None, None]:
+    def start_s3_span(self, op: str, uri: str) -> Generator[Any | None, None, None]:
         """Starts a span for an S3 operation."""
         if not self.enabled or not self.tracer:
             yield None
