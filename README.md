@@ -75,6 +75,7 @@ worker run --app app.main:worker
 
 ### 1. Zero-Trust Security (HLN Identity Chain)
 - **Cryptographic Signatures:** When `WORKER_TOKEN` is configured, the SDK automatically signs all registrations, heartbeats, task results, and events using HMAC SHA256. This ensures payload integrity and prevents unauthorized worker spoofing.
+- **Robust Hash Consistency:** The payload is recursively cleaned from `None` values prior to signing to guarantee identical signature hashes across different systems and programming languages. Dynamic elements (like `bubbling_chain`) are automatically excluded from the signature calculation to allow HLN network traversal without breaking cryptographic integrity.
 
 ### 2. Smart Skill Registration
 - **Zero Configuration:** Names and schemas are inferred from function names and type hints.

@@ -626,10 +626,24 @@ class Worker:
                 deps[name] = self._observability
         return deps
 
-    def _sign_payload_if_needed(self, payload: dict[str, Any]) -> SecurityContext | None:
+    def _sign_payload_if_needed(self, payload: Any, ignore_fields: list[str] | None = None) -> SecurityContext | None:
         """Signs payload for zero-trust verification if token is configured."""
         if self._config.WORKER_TOKEN and self._config.WORKER_TOKEN != "your-secret-worker-token":
-            signature_val = sign_payload(payload, self._config.WORKER_TOKEN)
+
+            def _strip_none(obj: Any) -> Any:
+                if isinstance(obj, dict):
+                    return {k: _strip_none(v) for k, v in obj.items() if v is not None}
+                elif isinstance(obj, list):
+                    return [_strip_none(v) for v in obj if v is not None]
+                return obj
+
+            data_to_sign = _strip_none(to_dict(payload))
+            data_to_sign.pop("security", None)
+            if ignore_fields:
+                for field in ignore_fields:
+                    data_to_sign.pop(field, None)
+
+            signature_val = sign_payload(data_to_sign, self._config.WORKER_TOKEN)
             return SecurityContext(signature=signature_val, signer_id=self._config.WORKER_ID)
         return None
 
@@ -672,11 +686,12 @@ class Worker:
                         else:
                             logger.warning(f"Emitting undeclared event type '{event_type}'. Allowed by config.")
 
-                if not security:
-                    security = self._sign_payload_if_needed(payload)
+                event_id = str(uuid4())
+                timestamp = time()
 
+                # We EXCLUDE bubbling_chain from the signature so it can be updated by holarchy nodes
                 event_payload = WorkerEventPayload(
-                    event_id=str(uuid4()),
+                    event_id=event_id,
                     worker_id=self._config.WORKER_ID,
                     origin_worker_id=self._config.WORKER_ID,
                     event_type=event_type,
@@ -686,10 +701,17 @@ class Worker:
                     target_task_id=task_id,
                     trace_context=task_payload.tracing_context,
                     priority=priority,
-                    timestamp=time(),
-                    security=security,
+                    timestamp=timestamp,
+                    security=None,
                     metadata=metadata,
                 )
+
+                if not security:
+                    security = self._sign_payload_if_needed(event_payload, ignore_fields=["bubbling_chain"])
+
+                if security:
+                    event_payload = event_payload._replace(security=security)
+
                 await client.emit_event(event_payload)
 
             async def send_progress_wrapper(task_id_arg, job_id_arg, progress, message=""):
@@ -706,7 +728,12 @@ class Worker:
                         worker_id=self._config.WORKER_ID,
                         status=TASK_STATUS_FAILURE,
                         error=error,
+                        security=None,
+                        metadata=task_payload.metadata,
+                        timestamp=time(),
                     )
+                    security = self._sign_payload_if_needed(result_obj)
+                    result_obj = result_obj._replace(security=security)
                     if span:
                         self._observability.set_span_status_error(span, message)
                 else:
@@ -807,18 +834,7 @@ class Worker:
                         else:
                             task_error = TaskError(code=ERROR_CODE_TRANSIENT, message=str(err_data))
 
-                    payload_for_signing = {
-                        "job_id": job_id,
-                        "task_id": task_id,
-                        "worker_id": self._config.WORKER_ID,
-                        "status": handler_result.get("status", TASK_STATUS_SUCCESS),
-                        "data": updated_data,
-                        "error": to_dict(task_error) if task_error else None,
-                    }
-                    security = self._sign_payload_if_needed(payload_for_signing)
-                    if not security:
-                        security = from_dict(SecurityContext, handler_result.get("security"))
-
+                    timestamp = time()
                     result_obj = TaskResult(
                         job_id=job_id,
                         task_id=task_id,
@@ -827,9 +843,16 @@ class Worker:
                         data=updated_data,
                         error=task_error,
                         data_metadata=metadata_map if metadata_map else None,
-                        security=security,
+                        security=None,
                         metadata=handler_result.get("metadata"),
+                        timestamp=timestamp,
                     )
+                    security = self._sign_payload_if_needed(result_obj)
+                    if not security:
+                        security = from_dict(SecurityContext, handler_result.get("security"))
+
+                    result_obj = result_obj._replace(security=security)
+
                     if span and result_obj.status == TASK_STATUS_FAILURE:
                         self._observability.set_span_status_error(
                             span, task_error.message if task_error else "Unknown failure"
@@ -843,9 +866,12 @@ class Worker:
                     worker_id=self._config.WORKER_ID,
                     status=TASK_STATUS_FAILURE,
                     error=error,
-                    security=task_payload.security,
+                    security=None,
                     metadata=task_payload.metadata,
+                    timestamp=time(),
                 )
+                security = self._sign_payload_if_needed(result_obj)
+                result_obj = result_obj._replace(security=security)
                 if span:
                     self._observability.set_span_status_error(span, str(e))
             except CancelledError:
@@ -855,9 +881,12 @@ class Worker:
                     task_id=task_id,
                     worker_id=self._config.WORKER_ID,
                     status=TASK_STATUS_CANCELLED,
-                    security=task_payload.security,
+                    security=None,
                     metadata=task_payload.metadata,
+                    timestamp=time(),
                 )
+                security = self._sign_payload_if_needed(result_obj)
+                result_obj = result_obj._replace(security=security)
                 if span:
                     self._observability.set_span_status_error(span, "Task cancelled")
                 raise
@@ -870,9 +899,12 @@ class Worker:
                     worker_id=self._config.WORKER_ID,
                     status=TASK_STATUS_FAILURE,
                     error=error,
-                    security=task_payload.security,
+                    security=None,
                     metadata=task_payload.metadata,
+                    timestamp=time(),
                 )
+                security = self._sign_payload_if_needed(result_obj)
+                result_obj = result_obj._replace(security=security)
                 if span:
                     self._observability.set_span_status_error(span, str(e))
             except Exception as e:
@@ -884,9 +916,12 @@ class Worker:
                     worker_id=self._config.WORKER_ID,
                     status=TASK_STATUS_FAILURE,
                     error=error,
-                    security=task_payload.security,
+                    security=None,
                     metadata=task_payload.metadata,
+                    timestamp=time(),
                 )
+                security = self._sign_payload_if_needed(result_obj)
+                result_obj = result_obj._replace(security=security)
                 if span:
                     self._observability.set_span_status_error(span, str(e))
             finally:
@@ -947,6 +982,7 @@ class Worker:
         skills_hash = self._calculate_contract_hash(state["supported_skills"])
         self._last_synced_skills_hash = skills_hash
 
+        timestamp = time()
         payload = WorkerRegistration(
             worker_id=self._config.WORKER_ID,
             worker_type=self._config.WORKER_TYPE,
@@ -965,8 +1001,9 @@ class Worker:
                 extra=combined_extra,
             ),
             skills_hash=skills_hash,
+            timestamp=timestamp,
         )
-        security = self._sign_payload_if_needed(to_dict(payload))
+        security = self._sign_payload_if_needed(payload)
         if security:
             payload = payload._replace(security=security)
         return payload
@@ -1094,17 +1131,9 @@ class Worker:
             skills_to_send = current_skills
 
         usage = self._get_resources_usage()
-        payload_for_signing = {
-            "worker_id": self._config.WORKER_ID,
-            "status": state["status"],
-            "usage": to_dict(usage),
-            "current_tasks": list(self._active_tasks.keys()),
-            "supported_skills": [to_dict(s) for s in current_skills] if skills_to_send else None,
-            "hot_cache": list(self._hot_cache),
-        }
-        security = self._sign_payload_if_needed(payload_for_signing)
+        timestamp = time()
 
-        return Heartbeat(
+        heartbeat = Heartbeat(
             worker_id=self._config.WORKER_ID,
             status=state["status"],
             usage=usage,
@@ -1114,8 +1143,11 @@ class Worker:
             skill_dependencies=self._skill_dependencies or None,
             hot_skills=final_hot_skills or None,
             skills_hash=current_hash,
-            security=security,
+            security=None,
+            timestamp=timestamp,
         )
+        security = self._sign_payload_if_needed(heartbeat)
+        return heartbeat._replace(security=security)
 
     async def _send_single_heartbeat(self, client: Transport) -> int:
         heartbeat = self._create_heartbeat_payload()

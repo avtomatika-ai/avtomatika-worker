@@ -75,6 +75,7 @@ worker run --app app.main:worker
 
 ### 1. Seguridad Zero-Trust (HLN Identity Chain)
 - **Firmas Criptográficas:** Cuando se configura `WORKER_TOKEN`, el SDK firma automáticamente todos los registros, latidos (heartbeats), resultados de tareas y eventos utilizando HMAC SHA256. Esto garantiza la integridad de la carga útil y previene la suplantación de workers no autorizados.
+- **Consistencia de Hash Robusta:** La carga útil se limpia recursivamente de valores `None` antes de firmar para garantizar hashes de firma idénticos en diferentes sistemas y lenguajes de programación. Los elementos dinámicos (como `bubbling_chain`) se excluyen automáticamente del cálculo de la firma para permitir el cruce de la red HLN sin romper la integridad criptográfica.
 
 ### 2. Registro Inteligente de Skills
 - **Configuración Cero:** Los nombres y esquemas se infieren automáticamente de los nombres de las funciones y las pistas de tipo.
