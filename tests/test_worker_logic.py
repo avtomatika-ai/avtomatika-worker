@@ -101,10 +101,12 @@ async def test_poll_for_tasks_receives_task(mocker):
 
     await worker._poll_for_tasks(client)
 
-    client.poll_task.assert_called_once_with(timeout=worker._config.TASK_POLL_TIMEOUT)
+    client.poll_task.assert_called_once_with(
+        timeout=worker._config.TASK_POLL_TIMEOUT,
+        available_skills=["successful_task"],
+        hot_skills=[],
+    )
     worker._process_task.assert_called_once()
-    # verify client was NOT injected into task_data passed to _process_task as raw dict?
-    # In new implementation, we convert TaskPayload to dict and inject client.
     call_args = worker._process_task.call_args[0][0]
     assert call_args["job_id"] == "job-123"
     assert call_args["client"] == client

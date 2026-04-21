@@ -1,149 +1,66 @@
-[EN](https://github.com/avtomatika-ai/avtomatika-worker/blob/main/README.md) | ES | [RU](https://github.com/avtomatika-ai/avtomatika-worker/blob/main/docs/ru/README.md)
-
 # Avtomatika Worker SDK
 
-[![License: MPL 2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](https://opensource.org/licenses/MPL-2.0)
-[![PyPI version](https://img.shields.io/pypi/v/avtomatika-worker.svg)](https://pypi.org/project/avtomatika-worker/)
-[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/release/python-3110/)
+SDK oficial para construir trabajadores compatibles con el orquestador **Avtomatika**. Automatiza tareas de bajo nivel: sondeo (polling), latidos (heartbeats), gestión de carga útil S3 y cierre ordenado (graceful shutdown).
 
-El SDK oficial para crear workers compatibles con el **[Orquestador Avtomatika](https://github.com/avtomatika-ai/avtomatika)**. Maneja el sondeo (polling), los latidos (heartbeats), la descarga de carga útil de S3 y el cierre ordenado (graceful shutdown) para que puedas concentrarte en tu lógica de negocio.
+## 🚀 Características Principales
 
-## Instalación
+- **Lenguaje:** Python 3.11+
+- **Protocolo:** Basado en **RXON** (Reverse Axon Protocol) para Redes Lógicas Jerárquicas (Holarchy).
+- **Modelo de Comunicación:**
+  - **PULL:** Los trabajadores sondean tareas desde los orquestadores (funciona detrás de NAT/Firewall).
+  - **WebSocket:** Canal de comandos en tiempo real (cancelación, comandos personalizados).
+- **Seguridad Zero Trust:**
+  - Firma HMAC SHA256 obligatoria para todos los mensajes con `WORKER_TOKEN`.
+  - Soporte para Identity Chain y Origin Worker ID para rastreo de procedencia.
+  - Protección contra ataques de repetición mediante validación de marcas de tiempo.
+- **Optimización de Tráfico:**
+  - **Habilidades en 3 Niveles:** *Supported* (catálogo), *Available* (límites dinámicos) y *Hot* (en caché).
+  - **Stable Hashing:** Envía el catálogo completo solo cuando cambia, usando `skills_hash` para latidos ligeros.
+- **S3 Streaming:** Transferencia de datos de alto rendimiento usando `obstore`. Sin errores de OOM en archivos grandes.
+- **Hardware Awareness:** Monitoreo integrado de CPU, RAM y GPUs NVIDIA (vía `psutil` y `GPUtil`).
+
+## 🛠 Instalación
 
 ```bash
-pip install avtomatika-worker
+pip install avtomatika-worker[s3,pydantic]
 ```
 
-Recomendado para todas las funciones:
+Para desarrollo:
 ```bash
-pip install "avtomatika-worker[s3,pydantic,metrics]"
+pip install -e .[test,dev]
 ```
 
-Extras:
-- `[s3]` — para descarga de S3 (requiere `obstore`).
-- `[pydantic]` — para validación de parámetros basada en Pydantic.
-- `[metrics]` — para OpenTelemetry (trazas и métricas).
-- `[dev]` — para funciones de desarrollo como CLI `--reload`.
-
-## Inicio Rápido
-
-### Opción 1: Uso de CLI (Recomendado)
-
-¡El SDK infiere automáticamente los nombres y esquemas de los skills a partir de tu código!
+## 💻 Inicio Rápido
 
 ```python
-from avtomatika_worker import Worker
-from pydantic import BaseModel
+from avtomatika_worker import Worker, TaskFiles
 
-worker = Worker(worker_type="image-processor")
+worker = Worker()
 
-class ResizeParams(BaseModel):
-    width: int
-    height: int
-    url: str
+@worker.skill("hola_mundo")
+async def mi_habilidad(params: dict, files: TaskFiles):
+    """Habilidad simple que dice hola."""
+    return {"message": f"¡Hola, {params.get('nombre', 'Mundo')}!"}
 
-# Automático: name="resize", esquema de ResizeParams
-@worker.skill()
-async def resize(params: ResizeParams):
-    print(f"Redimensionando a {params.width}px")
-    return {"status": "success", "data": {"result": "ok"}}
+@worker.on_command("reiniciar")
+async def manejar_reinicio(comando):
+    print("Reiniciando trabajador...")
+
+if __name__ == "__main__":
+    worker.run()
 ```
 
-### Opción 2: Carga Dinámica de Skills
+## ⚙️ Configuración
 
-Coloque sus manejadores de habilidades en el directorio `skills/` (ej., `skills/my_skills.py`):
+Controlada mediante variables de entorno:
+- `ORCHESTRATORS_CONFIG`: Lista JSON de configuraciones de orquestadores (URL, prioridades, pesos).
+- `ORCHESTRATOR_URL`: URL simple del orquestador si solo se usa uno (por defecto: `http://localhost:8080`).
+- `WORKER_TOKEN`: Secreto para firma HMAC (Zero Trust).
+- `S3_ENDPOINT_URL`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_DEFAULT_BUCKET`: Ajustes de almacenamiento S3 para transferencias de datos grandes.
+- `STRICT_EVENT_VALIDATION`: (Por defecto: `True`) Valida eventos contra esquemas antes de emitirlos.
+- `LOG_LEVEL`: Nivel de detalle de los logs (DEBUG, INFO, WARNING, ERROR).
+- `MAX_CONCURRENT_TASKS`: Límite global para la ejecución simultánea de tareas.
 
-```python
-from avtomatika_worker import SkillBlueprint
+## 📜 Licencia
 
-bp = SkillBlueprint()
-
-# Agregar metadatos para el Marketplace (opcional)
-@bp.skill(price=0.5, category="AI")
-async def generate_preview(params: dict):
-    return {"status": "success"}
-```
-
-Ejecute el worker y cargará automáticamente todos los skills del directorio:
-
-```bash
-# Buscará en ./skills por defecto
-worker run --app app.main:worker
-```
-
-## Características Clave
-
-### 1. Seguridad Zero-Trust (HLN Identity Chain)
-- **Firmas Criptográficas:** Cuando se configura `WORKER_TOKEN`, el SDK firma automáticamente todos los registros, latidos (heartbeats), resultados de tareas y eventos utilizando HMAC SHA256. Esto garantiza la integridad de la carga útil y previene la suplantación de workers no autorizados.
-- **Consistencia de Hash Robusta:** La carga útil se limpia recursivamente de valores `None` antes de firmar para garantizar hashes de firma idénticos en diferentes sistemas y lenguajes de programación. Los elementos dinámicos (como `bubbling_chain`) se excluyen automáticamente del cálculo de la firma para permitir el cruce de la red HLN sin romper la integridad criptográfica.
-
-### 2. Registro Inteligente de Skills
-- **Configuración Cero:** Los nombres y esquemas se infieren automáticamente de los nombres de las funciones y las pistas de tipo.
-- **Auto-Contratos:** Generación de `input_schema` y `output_schema` a partir de modelos Pydantic o Dataclasses estándar.
-- **Eventos Genéricos:** Declare señales personalizadas mediante `@worker.skill(events={"alert": Schema})` y emítalas usando el ayudante `send_event`. El progreso también es un evento del sistema.
-
-### 3. Tráfico de Red Optimizado y Rendimiento
-- **Hashing de Skills:** Los workers solo envían la lista completa de habilidades cuando realmente cambia. Los latidos periódicos utilizan un `skills_hash` ligero.
-- **Prevención de Thundering Herd:** El SDK aplica automáticamente `next_heartbeat_jitter_ms` proporcionado por el Orquestador para evitar picos de red cuando miles de workers se reinician simultáneamente.
-- **Sincronización Autorrecuperable (Self-Healing):** Si el orquestador pierde los metadatos del worker, puede solicitar una sincronización completa a través de la respuesta del latido, asegurando una recuperación perfecta.
-
-### 4. Soporte para Múltiples Orquestadores (Waterfall Priority)
-- **Estrategia Waterfall:** Por defecto, el worker sondea los orquestadores en orden de su prioridad. Siempre regresa al orquestador de mayor prioridad después de completar cualquier tarea, asegurando que las tareas VIP se manejen primero.
-- **Failover и Round Robin:** Estrategias alternativas para el equilibrio de carga и la alta disponibilidad.
-
-### 4. Observabilidad (OpenTelemetry)
-- **Trazado Distribuido:** Cada ejecución de tarea crea un Span de OpenTelemetry. Las operaciones de S3 se rastrean como spans hijos, proporcionando una visibilidad completa en Jaeger/Tempo.
-- **Métricas:** Métricas integradas compatibles con Prometheus para el conteo de tareas, duración и rendimiento de S3. Disponibles en `http://localhost:8083/metrics` (si el extra `[metrics]` está instalado).
-
-### 5. Validación Fail-Fast
-- **Cumplimiento Local:** El SDK valida los resultados de las tareas и los eventos contra sus esquemas declarados localmente. Los errores se registran de inmediato, evitando la transmisión de datos "rotos".
-
-### 6. Registro Estructurado (Logging)
-The SDK supports both human-readable and JSON logging.
-- `LOG_FORMAT=json` — para producción (ELK, Grafana Loki).
-- `LOG_FORMAT=text` — para desarrollo (por defecto).
-- All logs automatically include `worker_id`, `task_id`, and `job_id` context.
-
-### 7. Fiabilidad del Sistema de Archivos y S3
-- **TaskFiles**: Asistente asíncrono para espacios de trabajo de tareas aislados.
-- **S3 SDK**: Cargas/descargas asíncronas de alto rendimiento con reintentos automáticos и **Graceful Shutdown** (espera las cargas pendientes antes de salir).
-
-
-## Referencia de Configuración
-
-| Variable | Descripción | Por Defecto |
-|----------|-------------|-------------|
-| `WORKER_ID` | Identificador único para la instancia del worker. | UUID |
-| `ORCHESTRATOR_URL` | Dirección del orquestador. | `http://localhost:8080` |
-| `LOG_FORMAT` | Formato de registro: `text` o `json`. | `text` |
-| `LOG_LEVEL` | Nivel de registro mínimo (DEBUG, INFO, etc). | `INFO` |
-| `WORKER_PORT` | Puerto para el servidor de health-check. | `8083` |
-| `WORKER_SHUTDOWN_TIMEOUT`| Segundos máx. para esperar tareas durante el cierre. | `30.0` |
-| `WORKER_ENABLE_WEBSOCKETS`| Habilitar comandos en tiempo real (ej. cancelación). | `false` |
-| `MULTI_ORCHESTRATOR_MODE` | Estrategia de sondeo: `WATERFALL`, `ROUND_ROBIN`, `FAILOVER`. | `WATERFALL` |
-| `WORKER_ENABLE_METRICS` | Habilitar OpenTelemetry (métricas и trazado). | `false` |
-| `REGISTRATION_RETRY_INITIAL_DELAY`| Retraso inicial para reintentos de registro (seg). | `1.0` |
-| `REGISTRATION_RETRY_MAX_DELAY`| Retraso máximo para reintentos de registro (seg). | `60.0` |
-| `TASK_FILES_DIR` | Directorio local para cargas temporales de S3. | `/tmp/payloads` |
-| `WORKER_SKILLS_DIR` | Directorio para cargar skills dinámicamente. | `skills` |
-
-## Documentación
-
-- [Guía de Desarrollo](https://github.com/avtomatika-ai/avtomatika-worker/blob/main/docs/es/DEVELOPMENT.md) — Instrucciones detalladas sobre cómo crear workers personalizados, usar middlewares y manejar la descarga de S3.
-
-## Uso con Docker
-
-Utiliza el `Dockerfile` proporcionado para un despliegue sencillo:
-
-```bash
-docker build -t my-worker .
-docker run -e ORCHESTRATOR_URL=... my-worker worker run --app app:worker
-```
-
-## Desarrollo
-
-Instala las dependencias de desarrollo:
-```bash
-pip install -e .[dev]
-pytest
-```
+Mozilla Public License v. 2.0.

@@ -33,8 +33,8 @@ from time import perf_counter, time
 from typing import Any, cast, get_args, get_origin, get_type_hints
 from uuid import uuid4
 
-from aiofiles.os import listdir
-from aiofiles.ospath import abspath, exists
+from aiofiles.os import listdir  # type: ignore
+from aiofiles.ospath import abspath, exists  # type: ignore
 from aiohttp import ClientSession, TCPConnector, web
 from rxon import Transport, create_transport
 from rxon.blob import calculate_config_hash
@@ -191,7 +191,6 @@ class SkillBlueprint:
         info: str | SkillInfo | type[SkillInfo] | None = None,
         **kwargs: Any,
     ) -> Callable:
-        """Universal decorator to register a skill handler on the blueprint."""
         base_info: SkillInfo
         target_class = self._skill_info_class
 
@@ -205,6 +204,8 @@ class SkillBlueprint:
             init_kwargs.update(existing_data)
         elif isinstance(info, str):
             init_kwargs["name"] = info
+            if "type" not in init_kwargs:
+                init_kwargs["type"] = info  # Ensure type is set for dispatcher matching
 
         base_info = _create_dynamic_skill_object(target_class, init_kwargs)
 
@@ -212,6 +213,18 @@ class SkillBlueprint:
             nonlocal base_info
             if not base_info.name:
                 base_info = replace(base_info, name=func.__name__)
+
+            if base_info.description is None and func.__doc__:
+                import inspect
+
+                base_info = replace(base_info, description=inspect.cleandoc(func.__doc__))
+
+            if base_info.version is None:
+                import sys
+
+                module = sys.modules.get(func.__module__)
+                if module and hasattr(module, "__version__"):
+                    base_info = replace(base_info, version=module.__version__)
 
             if base_info.input_schema is None:
                 inferred = worker_extract_schema_from_func(func, "params")
@@ -281,6 +294,7 @@ class Worker:
         self._current_load_by_type: dict[str, int] = dict.fromkeys(self._skill_type_limits, 0)
         self._hot_cache: set[str] = set()
         self._active_tasks: dict[str, Task] = {}
+        self._command_handlers: dict[str, Callable] = {}
         self._http_session = http_session
         self._session_is_managed_externally = http_session is not None
         self._shutdown_event = Event()
@@ -398,6 +412,8 @@ class Worker:
             init_kwargs.update(existing_data)
         elif isinstance(info, str):
             init_kwargs["name"] = info
+            if "type" not in init_kwargs:
+                init_kwargs["type"] = info  # Ensure type is set for dispatcher matching
 
         base_info = _create_dynamic_skill_object(target_class, init_kwargs)
 
@@ -405,6 +421,18 @@ class Worker:
             nonlocal base_info
             if not base_info.name:
                 base_info = replace(base_info, name=func.__name__)
+
+            if base_info.description is None and func.__doc__:
+                import inspect
+
+                base_info = replace(base_info, description=inspect.cleandoc(func.__doc__))
+
+            if base_info.version is None:
+                import sys
+
+                module = sys.modules.get(func.__module__)
+                if module and hasattr(module, "__version__"):
+                    base_info = replace(base_info, version=module.__version__)
 
             if base_info.input_schema is None:
                 inferred = worker_extract_schema_from_func(func, "params")
@@ -457,30 +485,59 @@ class Worker:
         return self._hot_cache
 
     def _get_current_state(self) -> dict[str, Any]:
-        if self._current_load >= self._config.MAX_CONCURRENT_TASKS:
-            return {"status": "busy", "supported_skills": []}
+        """
+        Calculates worker state with three tiers of skills:
+        1. supported_skills: All skills this worker can perform (static catalog).
+        2. available_skills: Skills that can be started right now (respecting limits).
+        3. hot_skills: Subset of available_skills that are already in memory.
+        """
+        supported_skills: list[SkillInfo] = [h["info"] for h in self._skill_handlers.values()]
+        available_skills: list[SkillInfo] = []
+        hot_skills: list[SkillInfo] = []
 
-        supported_skills: list[SkillInfo] = []
+        if self._current_load >= self._config.MAX_CONCURRENT_TASKS:
+            return {
+                "status": "full",
+                "supported_skills": supported_skills,
+                "available_skills": [],
+                "hot_skills": [],
+            }
+
         for handler_data in self._skill_handlers.values():
-            is_available = True
+            skill_info = handler_data["info"]
             skill_type = handler_data.get("type")
 
+            is_available = True
             if skill_type and skill_type in self._skill_type_limits:
                 limit = self._skill_type_limits[skill_type]
-                current_load = self._current_load_by_type.get(skill_type, 0)
-                if current_load >= limit:
+                current = self._current_load_by_type.get(skill_type, 0)
+                if current >= limit:
                     is_available = False
 
-            if is_available:
-                skill_info = handler_data["info"]
-                if self._capacity_checker:
-                    if self._capacity_checker(skill_info.name):
-                        supported_skills.append(skill_info)
-                else:
-                    supported_skills.append(skill_info)
+            if is_available and self._capacity_checker and not self._capacity_checker(skill_info.name):
+                is_available = False
 
-        status = "idle" if supported_skills else "busy"
-        return {"status": status, "supported_skills": supported_skills}
+            if is_available:
+                available_skills.append(skill_info)
+
+                is_hot = False
+                if skill_info.name in self._skill_dependencies:
+                    deps = self._skill_dependencies[skill_info.name]
+                    if deps and set(deps).issubset(self._hot_cache):
+                        is_hot = True
+                elif skill_info.name in self._hot_cache:
+                    is_hot = True
+
+                if is_hot:
+                    hot_skills.append(skill_info)
+
+        status = "idle" if available_skills else "busy"
+        return {
+            "status": status,
+            "supported_skills": supported_skills,
+            "available_skills": available_skills,
+            "hot_skills": hot_skills,
+        }
 
     def _get_next_client(self) -> Transport | None:
         if not self._clients:
@@ -512,10 +569,21 @@ class Worker:
     async def _poll_for_tasks_with_status(self, client: Transport) -> bool:
         """Polls for tasks and returns True if a task was received."""
         current_state = self._get_current_state()
-        if current_state["status"] == "busy":
+        if current_state["status"] in ("busy", "full"):
             return False
+
         try:
-            task_data = await client.poll_task(timeout=self._config.TASK_POLL_TIMEOUT)
+            available_skill_names = [s.name for s in current_state["available_skills"]]
+            if not available_skill_names:
+                return False
+
+            hot_skill_names = [s.name for s in current_state["hot_skills"]]
+
+            task_data = await client.poll_task(
+                timeout=self._config.TASK_POLL_TIMEOUT,
+                available_skills=available_skill_names,
+                hot_skills=hot_skill_names,
+            )
             if task_data:
                 task_data_dict = to_dict(task_data)
                 task_data_dict["client"] = client
@@ -536,6 +604,8 @@ class Worker:
         await self._poll_for_tasks_with_status(client)
 
     async def _start_polling(self) -> None:
+        from rxon.constants import WORKER_STATUS_DRAINING
+
         try:
             done, pending = await wait(
                 [
@@ -550,7 +620,13 @@ class Worker:
             pass
 
         while not self._shutdown_event.is_set():
-            if self._get_current_state()["status"] == "busy":
+            # Beta 10 Draining Mode: Stop taking new tasks if status changed to draining
+            current_state = self._get_current_state()
+            if current_state["status"] == WORKER_STATUS_DRAINING:
+                logger.info("Worker is in DRAINING mode. Stop polling for new tasks.")
+                break
+
+            if current_state["status"] == "busy":
                 await sleep(self._config.IDLE_POLL_DELAY)
                 continue
 
@@ -626,25 +702,18 @@ class Worker:
                 deps[name] = self._observability
         return deps
 
-    def _sign_payload_if_needed(self, payload: Any, ignore_fields: list[str] | None = None) -> SecurityContext | None:
+    def _sign_payload_if_needed(
+        self,
+        payload: Any,
+        ignore_fields: list[str] | None = None,
+        identity_chain: list[str] | None = None,
+    ) -> SecurityContext | None:
         """Signs payload for zero-trust verification if token is configured."""
         if self._config.WORKER_TOKEN and self._config.WORKER_TOKEN != "your-secret-worker-token":
-
-            def _strip_none(obj: Any) -> Any:
-                if isinstance(obj, dict):
-                    return {k: _strip_none(v) for k, v in obj.items() if v is not None}
-                elif isinstance(obj, list):
-                    return [_strip_none(v) for v in obj if v is not None]
-                return obj
-
-            data_to_sign = _strip_none(to_dict(payload))
-            data_to_sign.pop("security", None)
-            if ignore_fields:
-                for field in ignore_fields:
-                    data_to_sign.pop(field, None)
-
-            signature_val = sign_payload(data_to_sign, self._config.WORKER_TOKEN)
-            return SecurityContext(signature=signature_val, signer_id=self._config.WORKER_ID)
+            signature_val = sign_payload(payload, self._config.WORKER_TOKEN, ignore_fields=ignore_fields)
+            return SecurityContext(
+                signature=signature_val, signer_id=self._config.WORKER_ID, identity_chain=identity_chain
+            )
         return None
 
     async def _process_task(self, task_data_raw: dict[str, Any]) -> None:
@@ -665,6 +734,26 @@ class Worker:
         start_time = perf_counter()
 
         with self._observability.start_task_span(skill_name, task_id, job_id) as span:
+            # Beta 10: Immediate validation against skill schema
+            if handler_data:
+                is_valid, error_msg = task_payload.validate_params(handler_data["info"])
+                if not is_valid:
+                    logger.error(f"Task {task_id} failed input validation: {error_msg}")
+                    error = TaskError(code=ERROR_CODE_INVALID_INPUT, message=error_msg or "Validation failed")
+                    result_obj = TaskResult(
+                        job_id=job_id,
+                        task_id=task_id,
+                        worker_id=self._config.WORKER_ID,
+                        origin_worker_id=task_data_raw.get("origin_worker_id") or self._config.WORKER_ID,
+                        status=TASK_STATUS_FAILURE,
+                        error=error,
+                        security=None,
+                        metadata=task_payload.metadata,
+                        timestamp=int(time()),
+                    )
+                    security = self._sign_payload_if_needed(result_obj)
+                    result_obj = result_obj._replace(security=security)
+                    # Skip execution and reporting result happens in finally block below
 
             async def send_event_wrapper(
                 event_type: str,
@@ -672,6 +761,7 @@ class Worker:
                 priority: float = 0.0,
                 security: SecurityContext | None = None,
                 metadata: dict[str, Any] | None = None,
+                origin_worker_id: str | None = None,
             ) -> None:
                 if handler_data and (events_schema := handler_data["info"].events_schema):
                     if event_type in events_schema:
@@ -687,15 +777,16 @@ class Worker:
                             logger.warning(f"Emitting undeclared event type '{event_type}'. Allowed by config.")
 
                 event_id = str(uuid4())
-                timestamp = time()
+                timestamp = int(time())
 
                 # We EXCLUDE bubbling_chain from the signature so it can be updated by holarchy nodes
                 event_payload = WorkerEventPayload(
                     event_id=event_id,
                     worker_id=self._config.WORKER_ID,
-                    origin_worker_id=self._config.WORKER_ID,
+                    origin_worker_id=origin_worker_id or self._config.WORKER_ID,
                     event_type=event_type,
                     payload=payload,
+                    origin_task_id=task_id,  # Beta 10: propagate origin_task_id for graph tracing
                     bubbling_chain=[],
                     target_job_id=job_id,
                     target_task_id=task_id,
@@ -718,7 +809,9 @@ class Worker:
                 await send_event_wrapper(EVENT_TYPE_PROGRESS, {"progress": progress, "message": message})
 
             try:
-                if not handler_data:
+                if result_obj:
+                    pass
+                elif not handler_data:
                     message = f"Unsupported skill: {skill_name}"
                     logger.warning(message)
                     error = TaskError(code=ERROR_CODE_PERMANENT, message=message)
@@ -730,7 +823,7 @@ class Worker:
                         error=error,
                         security=None,
                         metadata=task_payload.metadata,
-                        timestamp=time(),
+                        timestamp=int(time()),
                     )
                     security = self._sign_payload_if_needed(result_obj)
                     result_obj = result_obj._replace(security=security)
@@ -834,11 +927,12 @@ class Worker:
                         else:
                             task_error = TaskError(code=ERROR_CODE_TRANSIENT, message=str(err_data))
 
-                    timestamp = time()
+                    timestamp = int(time())
                     result_obj = TaskResult(
                         job_id=job_id,
                         task_id=task_id,
                         worker_id=self._config.WORKER_ID,
+                        origin_worker_id=task_data_raw.get("origin_worker_id") or self._config.WORKER_ID,
                         status=handler_result.get("status", TASK_STATUS_SUCCESS),
                         data=updated_data,
                         error=task_error,
@@ -864,11 +958,12 @@ class Worker:
                     job_id=job_id,
                     task_id=task_id,
                     worker_id=self._config.WORKER_ID,
+                    origin_worker_id=task_data_raw.get("origin_worker_id") or self._config.WORKER_ID,
                     status=TASK_STATUS_FAILURE,
                     error=error,
                     security=None,
                     metadata=task_payload.metadata,
-                    timestamp=time(),
+                    timestamp=int(time()),
                 )
                 security = self._sign_payload_if_needed(result_obj)
                 result_obj = result_obj._replace(security=security)
@@ -880,10 +975,11 @@ class Worker:
                     job_id=job_id,
                     task_id=task_id,
                     worker_id=self._config.WORKER_ID,
+                    origin_worker_id=task_data_raw.get("origin_worker_id") or self._config.WORKER_ID,
                     status=TASK_STATUS_CANCELLED,
                     security=None,
                     metadata=task_payload.metadata,
-                    timestamp=time(),
+                    timestamp=int(time()),
                 )
                 security = self._sign_payload_if_needed(result_obj)
                 result_obj = result_obj._replace(security=security)
@@ -897,11 +993,12 @@ class Worker:
                     job_id=job_id,
                     task_id=task_id,
                     worker_id=self._config.WORKER_ID,
+                    origin_worker_id=task_data_raw.get("origin_worker_id") or self._config.WORKER_ID,
                     status=TASK_STATUS_FAILURE,
                     error=error,
                     security=None,
                     metadata=task_payload.metadata,
-                    timestamp=time(),
+                    timestamp=int(time()),
                 )
                 security = self._sign_payload_if_needed(result_obj)
                 result_obj = result_obj._replace(security=security)
@@ -914,11 +1011,12 @@ class Worker:
                     job_id=job_id,
                     task_id=task_id,
                     worker_id=self._config.WORKER_ID,
+                    origin_worker_id=task_data_raw.get("origin_worker_id") or self._config.WORKER_ID,
                     status=TASK_STATUS_FAILURE,
                     error=error,
                     security=None,
                     metadata=task_payload.metadata,
-                    timestamp=time(),
+                    timestamp=int(time()),
                 )
                 security = self._sign_payload_if_needed(result_obj)
                 result_obj = result_obj._replace(security=security)
@@ -965,11 +1063,15 @@ class Worker:
                 for d in self._config.RESOURCES["devices"]
             ]
 
+        props = (self._config.RESOURCES.get("properties") or {}).copy()
+        if "cpu_cores" not in props:
+            props["cpu_cores"] = self._config.RESOURCES.get("cpu_cores", 1)
+        if "ram_gb" not in props:
+            props["ram_gb"] = self._config.RESOURCES.get("ram_gb", 1.0)
+
         resources = Resources(
-            max_concurrent_tasks=self._config.MAX_CONCURRENT_TASKS,
-            cpu_cores=self._config.RESOURCES["cpu_cores"],
-            ram_gb=self._config.RESOURCES.get("ram_gb", 0.0),
             devices=devices,
+            properties=props,
         )
         s3_hash = calculate_config_hash(
             self._config.S3_ENDPOINT_URL,
@@ -982,11 +1084,18 @@ class Worker:
         skills_hash = self._calculate_contract_hash(state["supported_skills"])
         self._last_synced_skills_hash = skills_hash
 
-        timestamp = time()
+        available_names = [s.name for s in state["available_skills"]]
+        hot_names_set = {s.name for s in state["hot_skills"]}
+        hot_names_set.update(self._hot_cache)
+        hot_names = list(hot_names_set)
+
+        timestamp = int(time())
         payload = WorkerRegistration(
             worker_id=self._config.WORKER_ID,
             worker_type=self._config.WORKER_TYPE,
             supported_skills=state["supported_skills"],
+            available_skills=available_names or None,
+            hot_skills=hot_names or None,
             resources=resources,
             installed_software=self._config.INSTALLED_SOFTWARE,
             installed_artifacts=[
@@ -1011,13 +1120,14 @@ class Worker:
     async def _register_client_with_retry(self, client: Transport) -> None:
         delay = self._config.REGISTRATION_RETRY_INITIAL_DELAY
         while not self._shutdown_event.is_set():
-            registration = self._create_registration_payload()
             try:
+                registration = self._create_registration_payload()
                 await self._safe_register(client, registration)
+                logger.info(f"Successfully registered with {client}")
                 self._registered_event.set()
                 return
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error(f"Registration attempt failed for {client}: {e}", exc_info=True)
 
             logger.info(f"Retrying registration for {client} in {delay:.1f}s...")
             try:
@@ -1033,13 +1143,13 @@ class Worker:
             if self._shutdown_event.is_set():
                 break
 
+            logger.info(f"Starting heartbeat loop for {client}")
             while not self._shutdown_event.is_set():
                 try:
                     jitter_ms = await self._send_single_heartbeat(client)
                     wait_time = self._config.HEARTBEAT_INTERVAL + (jitter_ms / 1000.0)
                     try:
                         await wait_for(self._shutdown_event.wait(), timeout=wait_time)
-                        break
                     except TimeoutError:
                         continue
                 except RxonError as e:
@@ -1052,14 +1162,12 @@ class Worker:
                         logger.warning(f"Heartbeat failed for {client}: {e}")
                         try:
                             await wait_for(self._shutdown_event.wait(), timeout=self._config.HEARTBEAT_INTERVAL)
-                            break
                         except TimeoutError:
                             continue
                 except Exception as e:
-                    logger.error(f"Unexpected error in heartbeat loop for {client}: {e}")
+                    logger.error(f"Unexpected error in heartbeat loop for {client}: {e}", exc_info=True)
                     try:
                         await wait_for(self._shutdown_event.wait(), timeout=self._config.HEARTBEAT_INTERVAL)
-                        break
                     except TimeoutError:
                         continue
 
@@ -1087,8 +1195,12 @@ class Worker:
             logger.error(f"Registration failed for {client}: {e}")
             raise
 
-    def _get_resources_usage(self) -> ResourcesUsage:
-        """Collects current resource usage metrics."""
+    def _get_resources_usage(self) -> ResourcesUsage | None:
+        """
+        Returns resource usage metrics.
+        Collects basic CPU/RAM metrics and GPU metrics if available.
+        Can be overridden by user via set_usage_checker().
+        """
         if self._usage_checker is not None:
             return self._usage_checker()
 
@@ -1102,7 +1214,28 @@ class Worker:
         except ImportError:
             pass
 
-        return ResourcesUsage(cpu_load_percent=cpu_load, ram_used_gb=ram_used, devices_usage=None)
+        devices_usage = []
+        try:
+            import GPUtil
+
+            gpus = GPUtil.getGPUs()
+            for gpu in gpus:
+                devices_usage.append(
+                    DeviceUsage(
+                        unit_id=str(gpu.id),
+                        load_percent=float(gpu.load) * 100,
+                        metrics={
+                            "memory_used_gb": float(gpu.memoryUsed) / 1024,
+                            "temperature_c": float(gpu.temperature),
+                        },
+                    )
+                )
+        except (ImportError, Exception):
+            pass
+
+        return ResourcesUsage(
+            cpu_load_percent=cpu_load, ram_used_gb=ram_used, devices_usage=devices_usage if devices_usage else None
+        )
 
     def set_usage_checker(self, checker: Callable[[], ResourcesUsage]) -> None:
         """Sets a custom callback for resource monitoring."""
@@ -1110,28 +1243,20 @@ class Worker:
 
     def _create_heartbeat_payload(self) -> Heartbeat:
         state = self._get_current_state()
-        final_hot_skills: list[SkillInfo] | None = None
-        if self._skill_dependencies:
-            hot_skill_names = [
-                skill for skill, models in self._skill_dependencies.items() if set(models).issubset(self._hot_cache)
-            ]
-            final_hot_skills = []
-            for hs_name in hot_skill_names:
-                if hs_name in self._skill_handlers:
-                    final_hot_skills.append(self._skill_handlers[hs_name]["info"])
-                else:
-                    final_hot_skills.append(SkillInfo(name=hs_name))
+        all_supported = state["supported_skills"]
 
-        current_skills = state["supported_skills"]
-        current_hash = self._calculate_contract_hash(current_skills)
+        current_hash = self._calculate_contract_hash(all_supported)
 
         skills_to_send = None
         if current_hash != self._last_synced_skills_hash:
-            logger.info(f"Worker contract changed (hash: {current_hash}). Sending full update.")
-            skills_to_send = current_skills
+            logger.info(f"Worker catalog changed (hash: {current_hash}). Sending full update.")
+            skills_to_send = all_supported
 
         usage = self._get_resources_usage()
-        timestamp = time()
+        timestamp = int(time())
+
+        available_names = [s.name for s in state["available_skills"]]
+        hot_names = [s.name for s in state["hot_skills"]]
 
         heartbeat = Heartbeat(
             worker_id=self._config.WORKER_ID,
@@ -1139,9 +1264,8 @@ class Worker:
             usage=usage,
             current_tasks=list(self._active_tasks.keys()),
             supported_skills=skills_to_send,
-            hot_cache=list(self._hot_cache),
-            skill_dependencies=self._skill_dependencies or None,
-            hot_skills=final_hot_skills or None,
+            available_skills=available_names or None,
+            hot_skills=hot_names or None,
             skills_hash=current_hash,
             security=None,
             timestamp=timestamp,
@@ -1204,8 +1328,10 @@ class Worker:
                     cert_path=self._config.TLS_CERT_PATH,
                     key_path=self._config.TLS_KEY_PATH,
                 )
+            from rxon.utils import json_dumps
+
             connector = TCPConnector(ssl=self._ssl_context) if self._ssl_context else None
-            self._http_session = ClientSession(connector=connector)
+            self._http_session = ClientSession(connector=connector, json_serialize=json_dumps)
             if not self._clients:
                 self._init_clients()
         await gather(*[client.connect() for _, client in self._clients])
@@ -1232,8 +1358,12 @@ class Worker:
                 usage=self._get_resources_usage(),
                 current_tasks=list(self._active_tasks.keys()),
                 supported_skills=[],
-                hot_cache=list(self._hot_cache),
+                hot_skills=list(self._hot_cache),
+                timestamp=int(time()),
             )
+            security = self._sign_payload_if_needed(heartbeat)
+            if security:
+                heartbeat = heartbeat._replace(security=security)
             await gather(*[client.send_heartbeat(heartbeat) for _, client in self._clients], return_exceptions=True)
         comm_task.cancel()
         if token_rotation_task:
@@ -1320,6 +1450,15 @@ class Worker:
         for listener in listeners:
             listener.cancel()
 
+    def on_command(self, command_name: str) -> Callable:
+        """Decorator to register a custom command handler."""
+
+        def decorator(func: Callable) -> Callable:
+            self._command_handlers[command_name] = func
+            return func
+
+        return decorator
+
     async def _listen_to_single_transport(self, client: Transport) -> None:
         while not self._shutdown_event.is_set():
             try:
@@ -1329,6 +1468,16 @@ class Worker:
                         if task_id in self._active_tasks:
                             self._active_tasks[task_id].cancel()
                             logger.info(f"Cancelled task {task_id} by command.")
+                    elif handler := self._command_handlers.get(command.command):
+                        try:
+                            if iscoroutinefunction(handler):
+                                await handler(command)
+                            else:
+                                await to_thread(handler, command)
+                        except Exception as e:
+                            logger.error(f"Error handling command '{command.command}': {e}")
+                    else:
+                        logger.warning(f"Received unknown command: {command.command}")
             except Exception as e:
                 logger.error(f"Error in command listener: {e}")
             await sleep(5)

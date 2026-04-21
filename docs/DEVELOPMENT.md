@@ -1,27 +1,25 @@
-EN | [ES](https://github.com/avtomatika-ai/avtomatika-worker/blob/main/docs/es/DEVELOPMENT.md) | [RU](https://github.com/avtomatika-ai/avtomatika-worker/blob/main/docs/ru/DEVELOPMENT.md)
-
 # Worker Development Guide
 
-This document describes how to create a custom Worker compatible with the Orchestrator using `avtomatika-worker`.
+This document describes how to create a custom Worker compatible with the Avtomatika Orchestrator using the `avtomatika-worker` SDK.
 
 **Requirements:** Python 3.11 or higher.
 
 ## Core Concept
 
 Workers created with the SDK implement a hybrid interaction model with the Orchestrator:
-- **PULL Model for Task Fetching:** The worker initiates the connection to the Orchestrator and "pulls" tasks from its personal queue. This allows Workers to operate from any network, including behind NAT or corporate firewalls, without needing a public IP address.
-- **WebSocket for Real-time Communication:** An optional bidirectional channel for receiving commands (e.g., task cancellation) and sending intermediate execution progress.
-- **HLN Optimization:** The SDK uses the **Reverse Axon (RXON)** protocol, which reduces traffic by hashing skill lists and only sending updates when changes occur.
-- **Robust Connectivity:** 
-    - **Independent Orchestrators:** Each orchestrator connection is managed by a separate task. A failure of one server doesn't block communications with others.
+- **PULL Model for Task Retrieval:** The worker initiates the connection to the Orchestrator and "pulls" tasks from its personal queue. This allows workers to operate from any network (including behind NAT or corporate firewalls) without needing a public IP address.
+- **WebSocket for Real-time Communication:** An optional bidirectional channel to receive commands (e.g., task cancellation) and send intermediate execution progress.
+- **HLN Optimization:** The SDK uses the **Reverse Axon (RXON)** protocol, which reduces traffic by hashing skill lists and sending updates only when changes occur.
+- **Connection Resilience:** 
+    - **Independent Orchestrators:** Each orchestrator connection is managed by a separate background task. One server failure doesn't block communications with others.
     - **Registration Retries:** Infinite retries with exponential backoff if an orchestrator is offline.
-    - **Non-blocking Startup:** The worker starts polling tasks as soon as it connects to at least one orchestrator.
+    - **Non-blocking Startup:** The worker starts polling for tasks as soon as it successfully registers with at least one orchestrator.
 
-## How to Create a Worker with the SDK
+## How to Build a Worker with the SDK
 
 ### Step 1: Install `avtomatika-worker`
 
-Ensure the SDK is installed in your environment. Recommended for full features (S3 and Pydantic):
+Ensure the SDK is installed in your environment. Recommended for all features (S3 and Pydantic):
 ```bash
 pip install "avtomatika-worker[s3,pydantic,metrics]"
 ```
@@ -50,7 +48,7 @@ class ReportParams(BaseModel):
 
 # 3. Define skill handlers using the @worker.skill decorator
 # The SDK automatically infers:
-# - name: "generate_report" (from function name)
+# - name: "generate_report" (from the function name)
 # - input_schema: generated from ReportParams
 @worker.skill(description="Generates complex reports")
 async def generate_report(params: ReportParams, send_progress, send_event, **kwargs) -> dict:
@@ -76,7 +74,7 @@ async def generate_report(params: ReportParams, send_progress, send_event, **kwa
         "data": {"report_url": f"s3://bucket/reports/{task_id}.pdf"}
     }
 
-# Dynamic Field Extension: add 'price' for the Marketplace
+# Dynamic field extension: add 'price' for the Marketplace
 @worker.skill(name="send_email", price=0.01)
 async def send_email(params: dict, **kwargs) -> dict:
     print(f"Sending email: {params}")
@@ -89,17 +87,17 @@ if __name__ == "__main__":
 
 ### Step 3: Run the Worker
 
-You can run the worker directly via Python or use the built-in CLI for better control:
+You can run the worker directly via Python or use the integrated CLI for better control:
 
 ```bash
-# Recommended: runs worker and enables health-check server (default port 8083)
+# Recommended: runs the worker and enables the health check server (port 8083 by default)
 worker run --app my_worker:worker
 
-# For development (auto-restarts on code changes)
+# For development (auto-reload on code changes)
 worker run --app my_worker:worker --reload
 ```
 
-### Step 4: Connection and Authentication Configuration
+### Step 4: Connection & Auth Configuration
 
 #### Option 1: Simple Connection (Single Orchestrator)
 
@@ -119,15 +117,15 @@ ORCHESTRATORS_CONFIG='[
 MULTI_ORCHESTRATOR_MODE=WATERFALL  # Or ROUND_ROBIN, FAILOVER
 ```
 
-- **WATERFALL (Default):** Polls orchestrators in order of priority. Always returns to the highest-priority one after any task.
+- **WATERFALL (Default):** Polls orchestrators strictly in priority order. Always returns to the highest priority one after any task.
 - **ROUND_ROBIN:** Distributes requests based on weights.
-- **FAILOVER:** Polls the next one only if the previous is empty.
+- **FAILOVER:** Polls the next one only if the previous was empty.
 
 ### Step 5: Real-time Communication (WebSocket)
 
-To enable this functionality, set `WORKER_ENABLE_WEBSOCKETS=true`. This allows you to:
-1.  **Send Progress and Events:** Use the injected `send_progress` and `send_event` functions.
-2.  **Task Cancellation:** The Orchestrator can send a command that will instantly raise an `asyncio.CancelledError` in your handler.
+To enable this feature, set `WORKER_ENABLE_WEBSOCKETS=true`. This allows you to:
+1.  **Send Progress & Events:** Use the injected `send_progress` and `send_event` functions.
+2.  **Task Cancellation:** The Orchestrator can send a command that will instantly trigger an `asyncio.CancelledError` in your handler.
 
 
 ### Step 6: Modular Skills (SkillBlueprint)
@@ -154,21 +152,21 @@ The Worker will automatically load all skills from the directory specified in `W
 
 ### Step 7: Working with Large Files (S3 Offloading)
 
-The SDK supports **"Payload Offloading"** via S3-compatible storage using the high-performance **`obstore`** library.
+The SDK supports **"Payload Offloading"** to S3-compatible storage using the high-performance **`obstore`** library.
 
-1.  **Auto-Download:** If `params` contains an `s3://` URI, the SDK downloads it to a local temporary folder before calling your handler.
-2.  **Auto-Upload:** If your handler returns a local path, the SDK uploads it to S3 and returns the URI to the Orchestrator.
-3.  **TaskFiles:** Use the `TaskFiles` class for easy async file operations in the task's isolated directory.
+1.  **Automatic Download (Input):** If `params` contains an `s3://` URI, the SDK downloads it to a local temporary folder before calling your handler.
+2.  **Automatic Upload (Output):** If your handler returns a local path, the SDK uploads it to S3 and returns the URI to the Orchestrator.
+3.  **TaskFiles:** Use the `TaskFiles` class for easy async file operations in the isolated task directory.
 
 ```python
 from avtomatika_worker import Worker, TaskFiles
 
 @worker.skill()
 async def process_video(params: dict, files: TaskFiles):
-    # 'video_url' in params might be an S3 URI, now replaced with local path
+    # 'video_url' in params might have been an S3 URI, now replaced with the local path
     local_path = params["video_url"]
     
-    # Create result file
+    # Create result path
     result_path = await files.path_to("output.mp4")
     # ... process ...
     
@@ -179,15 +177,15 @@ async def process_video(params: dict, files: TaskFiles):
 - `S3_ENDPOINT_URL`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_DEFAULT_BUCKET`.
 - `TASK_FILES_DIR`: Local root for temporary data (default: `/tmp/payloads`).
 
-> **Note:** The SDK automatically cleans up the entire task directory after the task completes.
+> **Note:** The SDK automatically cleans up the entire task directory once completed.
 
 ### Step 8: Observability (OpenTelemetry)
 
-The SDK provides integrated support for **distributed tracing** and **metrics** using OpenTelemetry.
+The SDK provides built-in support for **distributed tracing** and **metrics** using OpenTelemetry.
 
-1.  **Distributed Tracing:** Every task execution is wrapped in a Span (`task.{type}`). S3 operations are child spans.
-2.  **Metrics:** Prometheus-compatible metrics are available at `http://localhost:8083/metrics` (requires `metrics` extra).
-3.  **Dependency Injection:** You can request the `ObservabilityManager` in your skill handler to create custom spans.
+1.  **Distributed Tracing:** Each task execution is wrapped in a Span (`task.{type}`). S3 operations are child spans.
+2.  **Metrics:** Prometheus-compatible metrics are available at `http://localhost:8083/metrics` (requires the `metrics` extra).
+3.  **Injections:** You can request the `ObservabilityManager` in your skill handler to create custom spans.
 
 ```python
 from avtomatika_worker import Worker, ObservabilityManager
@@ -200,11 +198,11 @@ async def monitored_task(params: dict, obs: ObservabilityManager):
     return {"status": "success"}
 ```
 
-Enable it via environment variable: `WORKER_ENABLE_METRICS=true`.
+Enable via environment variable: `WORKER_ENABLE_METRICS=true`.
 
 ### Step 9: Health Checks
 
-By default, the SDK starts a small aiohttp server on `0.0.0.0:8083`. You can check the worker status at `/health`.
+By default, the SDK starts a small aiohttp server on `0.0.0.0:8083`. You can check the worker's status at `/health`.
 This is useful for Kubernetes (Liveness/Readiness probes) or monitoring systems.
 - Variable: `WORKER_PORT` (default: 8083)
 - CLI flag: `--health-check` (enabled by default)

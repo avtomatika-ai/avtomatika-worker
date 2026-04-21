@@ -11,14 +11,13 @@ from contextlib import asynccontextmanager
 from os.path import dirname, join
 from typing import TYPE_CHECKING, Any, cast
 
-from aiofiles import open as aiopen
-from aiofiles.os import listdir, makedirs
-from aiofiles.ospath import exists as aio_exists
+from aiofiles import open as aiopen  # type: ignore
+from aiofiles.os import listdir, makedirs  # type: ignore
+from aiofiles.ospath import exists as aio_exists  # type: ignore
 from orjson import OPT_INDENT_2, dumps, loads
+from rxon.models import FileMetadata
 
 if TYPE_CHECKING:
-    from rxon.models import FileMetadata
-
     from .observability import ObservabilityManager
     from .s3 import S3Manager
 
@@ -38,9 +37,6 @@ class TaskFiles:
         s3_manager: S3Manager | None = None,
         observability: ObservabilityManager | None = None,
     ):
-        """
-        Initializes TaskFiles with specific directory and identifiers.
-        """
         self._task_dir = task_dir
         self._job_id = job_id
         self._task_id = task_id
@@ -50,7 +46,6 @@ class TaskFiles:
     async def get_root(self) -> str:
         """
         Asynchronously returns the root directory for the task.
-        Creates the directory on disk if it doesn't exist.
         """
         await makedirs(self._task_dir, exist_ok=True)
         return self._task_dir
@@ -58,7 +53,6 @@ class TaskFiles:
     async def path_to(self, filename: str) -> str:
         """
         Asynchronously returns an absolute path for a file within the task directory.
-        Guarantees that the task root directory exists.
         """
         root = await self.get_root()
         return join(root, filename)
@@ -66,7 +60,6 @@ class TaskFiles:
     def get_root_sync(self) -> str:
         """
         Synchronously returns the root directory for the task.
-        Creates the directory on disk if it doesn't exist.
         """
         from os import makedirs as std_makedirs
 
@@ -76,7 +69,6 @@ class TaskFiles:
     def path_to_sync(self, filename: str) -> str:
         """
         Synchronously returns an absolute path for a file within the task directory.
-        Guarantees that the task root directory exists.
         """
         root = self.get_root_sync()
         return join(root, filename)
@@ -92,7 +84,6 @@ class TaskFiles:
             mode: File opening mode (e.g., 'r', 'w', 'a', 'rb', 'wb').
         """
         path = await self.path_to(filename)
-        # Ensure directory for the file itself exists if filename contains subdirectories
         file_dir = dirname(path)
         if file_dir != self._task_dir:
             await makedirs(file_dir, exist_ok=True)
@@ -141,44 +132,71 @@ class TaskFiles:
         """Uploads a specific file to S3 and returns its metadata."""
         if not self._s3_manager:
             raise RuntimeError("S3Manager not configured for this TaskFiles instance.")
+
         path = await self.path_to(filename)
+        from os.path import basename
+
+        from aiofiles.ospath import getsize
+
+        bucket = self._s3_manager._config.S3_DEFAULT_BUCKET
+        target_uri = f"s3://{bucket}/{join(self._job_id, basename(path)).lstrip('/')}"
+
         if self._observability:
-            with self._observability.start_s3_span("upload_file", f"file://{filename}"):
-                return await self._s3_manager._upload_to_s3(path, s3_prefix=self._job_id)
-        return await self._s3_manager._upload_to_s3(path, s3_prefix=self._job_id)
+            with self._observability.start_s3_span("upload", target_uri):
+                etag = await self._s3_manager._provider.upload(path, target_uri)
+                size = await getsize(path)
+                return FileMetadata(uri=target_uri, size=size, etag=etag)
+
+        etag = await self._s3_manager._provider.upload(path, target_uri)
+        size = await getsize(path)
+        return FileMetadata(uri=target_uri, size=size, etag=etag)
 
     async def upload_dir(self, dirname: str = "") -> FileMetadata:
-        """Uploads the entire task directory or a subdirectory to S3."""
+        """Uploads a directory to S3."""
         if not self._s3_manager:
             raise RuntimeError("S3Manager not configured for this TaskFiles instance.")
+
         path = join(self._task_dir, dirname) if dirname else self._task_dir
-        if self._observability:
-            with self._observability.start_s3_span("upload_dir", f"dir://{dirname or 'root'}"):
-                return await self._s3_manager._upload_to_s3(path, s3_prefix=self._job_id)
-        return await self._s3_manager._upload_to_s3(path, s3_prefix=self._job_id)
+
+        # We use a fixed key 'root' to avoid path-based KeyError
+        _, metadata = await self._s3_manager.process_result({"root": path}, s3_prefix=self._job_id)
+        return metadata["root"]
 
     async def download_file(self, uri: str, filename: str, verify_meta: FileMetadata | None = None) -> str:
-        """Downloads a file from S3 to the task directory with optional integrity check."""
+        """Downloads a file from S3 to the task directory."""
         if not self._s3_manager:
             raise RuntimeError("S3Manager not configured for this TaskFiles instance.")
+
+        local_path = await self.path_to(filename)
+
         if self._observability:
-            with self._observability.start_s3_span("download_file", uri):
-                return await self._s3_manager._process_s3_uri(uri, self._task_id, verify_meta=verify_meta)
-        return await self._s3_manager._process_s3_uri(uri, self._task_id, verify_meta=verify_meta)
+            with self._observability.start_s3_span("download", uri):
+                await self._s3_manager._provider.download(uri, local_path)
+        else:
+            await self._s3_manager._provider.download(uri, local_path)
+
+        if verify_meta:
+            from aiofiles.ospath import getsize
+
+            actual_size = await getsize(local_path)
+            if verify_meta.size is not None and actual_size != verify_meta.size:
+                raise ValueError(f"Size mismatch for {uri}")
+
+        return local_path
 
     async def list(self) -> list[str]:
         """
         Asynchronously lists all file and directory names within the task root.
         """
         root = await self.get_root()
-        return await listdir(root)
+        return cast(list[str], await listdir(root))
 
     async def exists(self, filename: str) -> bool:
         """
         Asynchronously checks if a specific file or directory exists in the task root.
         """
         path = join(self._task_dir, filename)
-        return await aio_exists(path)
+        return cast(bool, await aio_exists(path))
 
     def __repr__(self):
         return f"<TaskFiles root='{self._task_dir}'>"

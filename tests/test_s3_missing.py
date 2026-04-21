@@ -34,11 +34,10 @@ async def test_s3_missing_dependency():
 
         manager = s3_module.S3Manager(config)
 
-        # 1. Check explicit check
+        # 1. Check explicit check on provider
         with pytest.raises(RuntimeError) as excinfo:
-            manager._check_availability()
+            manager._provider._check_availability()
         assert "install 'avtomatika-worker[s3]'" in str(excinfo.value)
-
         # 2. Check process_params (async)
         with pytest.raises(RuntimeError):
             await manager.process_params({"file": "s3://bucket/file"}, "task-1")

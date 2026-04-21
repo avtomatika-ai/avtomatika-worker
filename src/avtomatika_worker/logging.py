@@ -29,7 +29,6 @@ class ContextFilter(Filter):
         return True
 
 
-# Global context filter
 _context_filter = ContextFilter()
 
 
@@ -54,7 +53,6 @@ def setup_logging(worker_id: str | None = None) -> None:
 
     root_logger = getLogger()
 
-    # Clear existing handlers if any
     for h in root_logger.handlers[:]:
         root_logger.removeHandler(h)
 

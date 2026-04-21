@@ -49,7 +49,7 @@ def test_get_current_state_initial():
 
 
 def test_get_current_state_global_limit_reached():
-    """Tests that the worker becomes busy when the global concurrency limit is reached."""
+    """Tests that the worker becomes full when the global concurrency limit is reached."""
     # Create a mock config to ensure MAX_CONCURRENT_TASKS is controlled
     mock_config = WorkerConfig()
     mock_config.MAX_CONCURRENT_TASKS = 1
@@ -61,8 +61,10 @@ def test_get_current_state_global_limit_reached():
     async def some_task(params: dict): ...
 
     state = worker._get_current_state()
-    assert state["status"] == "busy"
-    assert state["supported_skills"] == []
+    assert state["status"] == "full"
+    # Supported skills are always returned
+    assert len(state["supported_skills"]) == 1
+    assert state["available_skills"] == []
 
 
 def test_get_current_state_type_limit_reached():
@@ -79,8 +81,12 @@ def test_get_current_state_type_limit_reached():
 
     state = worker._get_current_state()
     assert state["status"] == "idle"
+    # Both are supported
     skill_names = {s.name for s in state["supported_skills"]}
-    assert skill_names == {"process_audio"}
+    assert skill_names == {"process_audio", "process_video"}
+    # Only audio is available
+    available_names = {s.name for s in state["available_skills"]}
+    assert available_names == {"process_audio"}
 
 
 def test_get_current_state_all_type_limits_reached():
@@ -99,4 +105,5 @@ def test_get_current_state_all_type_limits_reached():
 
     state = worker._get_current_state()
     assert state["status"] == "busy"
-    assert state["supported_skills"] == []
+    assert len(state["supported_skills"]) == 2
+    assert state["available_skills"] == []

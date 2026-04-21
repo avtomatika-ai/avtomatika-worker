@@ -11,11 +11,20 @@ from importlib.metadata import PackageNotFoundError, version
 from .logging import setup_logging
 from .observability import ObservabilityManager
 from .task_files import TaskFiles
-from .worker import DeviceUsage, ResourcesUsage, SkillBlueprint, Worker, is_valid_identifier, validate_identifier
+from .worker import (
+    DeviceUsage,
+    ResourcesUsage,
+    SkillBlueprint,
+    SkillInfo,
+    Worker,
+    is_valid_identifier,
+    validate_identifier,
+)
 
 __all__ = [
     "Worker",
     "SkillBlueprint",
+    "SkillInfo",
     "TaskFiles",
     "setup_logging",
     "ObservabilityManager",

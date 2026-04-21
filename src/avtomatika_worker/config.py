@@ -87,8 +87,6 @@ class WorkerConfig:
         self.STRICT_EVENT_VALIDATION: bool = getenv("STRICT_EVENT_VALIDATION", "true").lower() == "true"
         self.WORKER_ENABLE_METRICS: bool = getenv("WORKER_ENABLE_METRICS", "false").lower() == "true"
 
-        # --- Custom Extra Capabilities ---
-        # Automatically pick up environment variables starting with WORKER_EXTRA_
         self.EXTRA_CAPABILITIES: dict[str, Any] = self._load_extra_from_env()
 
     def _load_extra_from_env(self) -> dict[str, Any]:
@@ -97,9 +95,7 @@ class WorkerConfig:
         prefix = "WORKER_EXTRA_"
         for key, value in environ.items():
             if key.startswith(prefix):
-                # Convert WORKER_EXTRA_REGION to region
                 name = key[len(prefix) :].lower()
-                # Try to parse as JSON if it looks like it, otherwise keep as string
                 if value.startswith(("{", "[")):
                     try:
                         extra[name] = loads(value)
@@ -158,7 +154,6 @@ class WorkerConfig:
                     },
                 }
             )
-        # Support for generic devices via JSON env var
         if generic_devices_json := getenv("WORKER_DEVICES"):
             try:
                 generic_devices = loads(generic_devices_json)

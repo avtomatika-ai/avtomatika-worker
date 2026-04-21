@@ -58,7 +58,6 @@ class ObservabilityManager:
                 )
             return
 
-        # Setup Resource Attributes
         resource = Resource.create(
             {
                 ResourceAttributes.SERVICE_NAME: service_name,
@@ -68,20 +67,17 @@ class ObservabilityManager:
             }
         )
 
-        # Initialize OTel Tracer and Meter
         from opentelemetry.sdk.trace import TracerProvider
 
         self._tracer_provider = TracerProvider(resource=resource)
         trace.set_tracer_provider(self._tracer_provider)
         self.tracer = trace.get_tracer(service_name)
 
-        # Setup Prometheus reader for metrics
         self._prom_reader = PrometheusMetricReader()
         self._meter_provider = MeterProvider(resource=resource, metric_readers=[self._prom_reader])
         metrics.set_meter_provider(self._meter_provider)
         self.meter = metrics.get_meter(service_name)
 
-        # Metrics Definition
         self.tasks_total = self.meter.create_counter(
             "worker.tasks.total", unit="1", description="Total number of tasks processed"
         )

@@ -89,7 +89,7 @@ async def test_worker_polls_executes_and_sends_result(monkeypatch):
     assert len(transport.registered) > 0
     registration = transport.registered[0]
     assert registration.capabilities.cost_per_skill == {"successful_task": 0.5}
-    assert registration.resources.ram_gb == 16.0
+    assert registration.resources.properties["ram_gb"] == 16.0
 
     assert len(transport.results) == 1
     result: TaskResult = transport.results[0]
@@ -171,13 +171,14 @@ async def test_hot_cache_update_and_heartbeat():
 
     assert len(transport.heartbeats) == 1
     heartbeat = transport.heartbeats[0]
-    assert sorted(heartbeat.hot_cache) == ["model-2"]
+    # Internal hot_cache is NOT sent anymore
+    assert not hasattr(heartbeat, "hot_cache")
 
 
 @pytest.mark.asyncio
-async def test_heartbeat_sends_skill_dependencies_and_hot_skills():
+async def test_heartbeat_sends_hot_skills_by_names():
     """
-    Tests that the heartbeat correctly sends skill_dependencies and hot_skills.
+    Tests that the heartbeat correctly sends hot_skills as names.
     """
     skill_deps = {
         "image_generation": ["sd_v1.5", "vae"],
@@ -188,6 +189,10 @@ async def test_heartbeat_sends_skill_dependencies_and_hot_skills():
         skill_dependencies=skill_deps, clients=[({"url": "http://test-orchestrator", "weight": 1}, transport)]
     )
 
+    @worker.skill("image_generation")
+    async def h1(params: dict):
+        pass
+
     # Case 1: One skill fully loaded
     worker.add_to_hot_cache("sd_v1.5")
     worker.add_to_hot_cache("vae")
@@ -196,9 +201,9 @@ async def test_heartbeat_sends_skill_dependencies_and_hot_skills():
         await worker._send_single_heartbeat(client)
 
     heartbeat = transport.heartbeats[0]
-    assert heartbeat.skill_dependencies == skill_deps
-    hot_skill_names = [s.name for s in heartbeat.hot_skills]
-    assert sorted(hot_skill_names) == ["image_generation"]
+    assert heartbeat.hot_skills == ["image_generation"]
+    # Internal detail is NOT in the heartbeat
+    assert not hasattr(heartbeat, "skill_dependencies")
 
     transport.heartbeats.clear()
 
@@ -225,14 +230,14 @@ async def test_get_hot_cache():
             await worker._debounce_task
 
 
-def test_get_current_state_busy():
-    """Tests that _get_current_state returns 'busy' when the worker is at max capacity."""
+def test_get_current_state_full():
+    """Tests that _get_current_state returns 'full' when the worker is at max capacity."""
     worker = Worker()
     worker._current_load = 10
     worker._config.MAX_CONCURRENT_TASKS = 10
     state = worker._get_current_state()
-    assert state["status"] == "busy"
-    assert state["supported_skills"] == []
+    assert state["status"] == "full"
+    assert state["available_skills"] == []
 
 
 def test_get_current_state_idle():
@@ -249,12 +254,14 @@ def test_get_current_state_idle():
 
     state = worker._get_current_state()
     assert state["status"] == "idle"
-    skill_names = [s.name for s in state["supported_skills"]]
-    assert sorted(skill_names) == ["task-1", "task-2"]
+    # supported_skills is the full catalog
+    assert sorted([s.name for s in state["supported_skills"]]) == ["task-1", "task-2"]
+    # available_skills is what can be done now
+    assert sorted([s.name for s in state["available_skills"]]) == ["task-1", "task-2"]
 
 
 def test_get_current_state_with_skill_type_limits():
-    """Tests that _get_current_state correctly filters tasks based on type limits."""
+    """Tests that _get_current_state correctly filters available tasks based on type limits."""
     worker = Worker(skill_type_limits={"gpu": 1})
 
     @worker.skill("gpu_task_1", type="gpu")
@@ -272,14 +279,15 @@ def test_get_current_state_with_skill_type_limits():
     # No GPU tasks running, so all tasks are available
     state = worker._get_current_state()
     assert state["status"] == "idle"
-    skill_names = [s.name for s in state["supported_skills"]]
-    assert sorted(skill_names) == ["cpu_task", "gpu_task_1", "gpu_task_2"]
+    assert sorted([s.name for s in state["available_skills"]]) == ["cpu_task", "gpu_task_1", "gpu_task_2"]
 
     # One GPU task is running, so no more GPU tasks can be started
     worker._current_load_by_type["gpu"] = 1
     state = worker._get_current_state()
-    assert state["status"] == "idle"
-    assert [s.name for s in state["supported_skills"]] == ["cpu_task"]
+    # supported_skills still has all tasks (it's a static catalog)
+    assert sorted([s.name for s in state["supported_skills"]]) == ["cpu_task", "gpu_task_1", "gpu_task_2"]
+    # available_skills only has the CPU task
+    assert sorted([s.name for s in state["available_skills"]]) == ["cpu_task"]
 
 
 @pytest.mark.asyncio
