@@ -59,6 +59,9 @@ Controlada mediante variables de entorno:
 - `S3_ENDPOINT_URL`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_DEFAULT_BUCKET`: Ajustes de almacenamiento S3 para transferencias de datos grandes.
 - `STRICT_EVENT_VALIDATION`: (Por defecto: `True`) Valida eventos contra esquemas antes de emitirlos.
 - `LOG_LEVEL`: Nivel de detalle de los logs (DEBUG, INFO, WARNING, ERROR).
+- `POLL_BACKOFF_INITIAL`: Retraso inicial después de un error 429 o fallo de red (por defecto: `1.0`). Respeta el encabezado `Retry-After`.
+- `POLL_BACKOFF_MAX`: Retraso máximo de backoff (por defecto: `60.0`).
+- `POLL_BACKOFF_FACTOR`: Multiplicador para el backoff exponencial (por defecto: `2.0`).
 - `MAX_CONCURRENT_TASKS`: Límite global para la ejecución simultánea de tareas.
 
 ## 📜 Licencia

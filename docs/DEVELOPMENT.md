@@ -117,6 +117,17 @@ ORCHESTRATORS_CONFIG='[
 MULTI_ORCHESTRATOR_MODE=WATERFALL  # Or ROUND_ROBIN, FAILOVER
 ```
 
+#### Polling & Backoff Configuration (Stable Beta 15+)
+
+To prevent "Retry Storms" during high load (429 errors) or network failures, the SDK uses an exponential backoff strategy. **Note:** The SDK honors the `Retry-After` header from the orchestrator, which takes precedence over local backoff calculations.
+
+```dotenv
+TASK_POLL_TIMEOUT=30        # Max seconds to wait for a task response
+POLL_BACKOFF_INITIAL=1.0    # Initial delay (sec) after error
+POLL_BACKOFF_MAX=60.0       # Maximum delay limit
+POLL_BACKOFF_FACTOR=2.0     # Multiplier for each retry
+```
+
 - **WATERFALL (Default):** Polls orchestrators strictly in priority order. Always returns to the highest priority one after any task.
 - **ROUND_ROBIN:** Distributes requests based on weights.
 - **FAILOVER:** Polls the next one only if the previous was empty.

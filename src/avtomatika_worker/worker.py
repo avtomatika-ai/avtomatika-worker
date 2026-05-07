@@ -30,11 +30,11 @@ from logging import getLogger
 from os.path import join
 from signal import SIGINT, SIGTERM
 from time import perf_counter, time
-from typing import Any, cast, get_args, get_origin, get_type_hints
+from typing import TYPE_CHECKING, Any, cast, get_args, get_origin, get_type_hints
 from uuid import uuid4
 
-from aiofiles.os import listdir  # type: ignore
-from aiofiles.ospath import abspath, exists  # type: ignore
+from aiofiles.os import listdir
+from aiofiles.ospath import abspath, exists
 from aiohttp import ClientSession, TCPConnector, web
 from rxon import Transport, create_transport
 from rxon.blob import calculate_config_hash
@@ -50,7 +50,7 @@ from rxon.constants import (
     TASK_STATUS_FAILURE,
     TASK_STATUS_SUCCESS,
 )
-from rxon.exceptions import RxonError
+from rxon.exceptions import RxonError, RxonNetworkError, RxonRateLimitError
 from rxon.models import (
     DeviceUsage,
     FileMetadata,
@@ -80,18 +80,23 @@ from .s3 import S3Manager
 from .task_files import TaskFiles
 from .types import CapacityChecker, Middleware, ParamValidationError
 
-try:
+if TYPE_CHECKING:
     from pydantic import BaseModel, ValidationError
 
     _PYDANTIC_INSTALLED = True
-except ImportError:
-    _PYDANTIC_INSTALLED = False
+else:
+    try:
+        from pydantic import BaseModel, ValidationError
 
-    class BaseModel:  # type: ignore
-        pass
+        _PYDANTIC_INSTALLED = True
+    except ImportError:
+        _PYDANTIC_INSTALLED = False
 
-    class ValidationError(Exception):  # type: ignore
-        pass
+        class BaseModel:
+            pass
+
+        class ValidationError(Exception):
+            pass
 
 
 __all__ = [
@@ -310,6 +315,8 @@ class Worker:
                 self._total_orchestrator_weight += o.get("weight", 1)
         self._clients = clients or []
         self._comm_tasks: list[Task] = []
+        self._poll_backoff: dict[Transport, float] = {}
+        self._next_poll_time: dict[Transport, float] = {}
         self._usage_checker: Callable[[], ResourcesUsage] | None = None
         if not self._clients and self._http_session:
             self._init_clients()
@@ -568,6 +575,9 @@ class Worker:
 
     async def _poll_for_tasks_with_status(self, client: Transport) -> bool:
         """Polls for tasks and returns True if a task was received."""
+        if time() < self._next_poll_time.get(client, 0):
+            return False
+
         current_state = self._get_current_state()
         if current_state["status"] in ("busy", "full"):
             return False
@@ -584,6 +594,10 @@ class Worker:
                 available_skills=available_skill_names,
                 hot_skills=hot_skill_names,
             )
+
+            self._poll_backoff.pop(client, None)
+            self._next_poll_time.pop(client, None)
+
             if task_data:
                 task_data_dict = to_dict(task_data)
                 task_data_dict["client"] = client
@@ -596,6 +610,30 @@ class Worker:
                 task = create_task(self._process_task(task_data_dict))
                 self._active_tasks[task_data.task_id] = task
                 return True
+        except (RxonRateLimitError, RxonNetworkError) as e:
+            current_backoff = self._poll_backoff.get(client, 0.0)
+            retry_after = getattr(e, "details", {}).get("retry_after") if isinstance(e, RxonRateLimitError) else None
+
+            if retry_after is not None:
+                new_backoff = float(retry_after)
+                self._poll_backoff[client] = new_backoff
+            else:
+                new_backoff = min(
+                    max(
+                        current_backoff * self._config.POLL_BACKOFF_FACTOR,
+                        self._config.POLL_BACKOFF_INITIAL,
+                    ),
+                    self._config.POLL_BACKOFF_MAX,
+                )
+                self._poll_backoff[client] = new_backoff
+
+            self._next_poll_time[client] = time() + new_backoff
+
+            if isinstance(e, RxonRateLimitError):
+                source = "Retry-After" if retry_after is not None else "backoff"
+                logger.warning(f"Rate limited by {client} ({source}). Backing off for {new_backoff:.1f}s.")
+            else:
+                logger.warning(f"Network error polling {client}: {e}. Backing off for {new_backoff:.1f}s.")
         except RxonError as e:
             logger.error(f"Error polling tasks from {client}: {e}")
         return False

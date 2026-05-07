@@ -66,6 +66,9 @@ Controlled via environment variables:
 - `S3_ENDPOINT_URL`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_DEFAULT_BUCKET`: Storage settings for large payloads.
 - `STRICT_EVENT_VALIDATION`: (Default: `True`) Validates events against schemas before emitting.
 - `LOG_LEVEL`: Logging verbosity (DEBUG, INFO, WARNING, ERROR).
+- `POLL_BACKOFF_INITIAL`: Initial delay (seconds) after a 429 error or network failure (default: `1.0`). Honors `Retry-After` header.
+- `POLL_BACKOFF_MAX`: Maximum backoff delay (seconds) (default: `60.0`).
+- `POLL_BACKOFF_FACTOR`: Multiplier for exponential backoff (default: `2.0`).
 - `MAX_CONCURRENT_TASKS`: Global limit for concurrent task execution.
 
 ## 📜 License

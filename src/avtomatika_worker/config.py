@@ -79,6 +79,9 @@ class WorkerConfig:
         self.TASK_POLL_ERROR_DELAY: float = float(
             getenv("TASK_POLL_ERROR_DELAY", "5.0"),
         )
+        self.POLL_BACKOFF_INITIAL: float = float(getenv("POLL_BACKOFF_INITIAL", "1.0"))
+        self.POLL_BACKOFF_MAX: float = float(getenv("POLL_BACKOFF_MAX", "60.0"))
+        self.POLL_BACKOFF_FACTOR: float = float(getenv("POLL_BACKOFF_FACTOR", "2.0"))
         self.IDLE_POLL_DELAY: float = float(getenv("IDLE_POLL_DELAY", "0.01"))
         self.SHUTDOWN_TIMEOUT: float = float(getenv("WORKER_SHUTDOWN_TIMEOUT", "30.0"))
         self.ENABLE_WEBSOCKETS: bool = getenv("WORKER_ENABLE_WEBSOCKETS", "false").lower() == "true"

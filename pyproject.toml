@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "avtomatika-worker"
-version = "1.0b14"
+version = "1.0b15"
 description = "Worker SDK for the Avtomatika orchestrator."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -21,7 +21,7 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "rxon>=1.0b10",
+    "rxon>=1.0b11",
     "aiohttp~=3.13.5",
     "python-json-logger~=4.1.0",
     "aiofiles~=25.1.0",

@@ -12,9 +12,9 @@ from os.path import basename, dirname, join, relpath
 from shutil import rmtree
 from typing import Any, cast
 
-from aiofiles import open as aio_open  # type: ignore
-from aiofiles.os import makedirs  # type: ignore
-from aiofiles.ospath import exists, getsize  # type: ignore
+from aiofiles import open as aio_open
+from aiofiles.os import makedirs
+from aiofiles.ospath import exists, getsize
 from rxon.blob import BlobProvider, parse_uri
 from rxon.models import FileMetadata
 

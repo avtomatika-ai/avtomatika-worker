@@ -119,6 +119,17 @@ ORCHESTRATORS_CONFIG='[
 MULTI_ORCHESTRATOR_MODE=WATERFALL  # O ROUND_ROBIN, FAILOVER
 ```
 
+#### Configuración de Sondeo y Backoff (Stable Beta 15+)
+
+Para evitar "tormentas de reintentos" durante una carga alta (errores 429) o fallos de red, el SDK utiliza una estrategia de backoff exponencial. **Nota:** El SDK respeta el encabezado `Retry-After` del orquestador, que tiene prioridad sobre los cálculos locales de backoff.
+
+```dotenv
+TASK_POLL_TIMEOUT=30        # Segundos máx. para esperar una respuesta de tarea
+POLL_BACKOFF_INITIAL=1.0    # Retraso inicial (seg) después de un error
+POLL_BACKOFF_MAX=60.0       # Límite máximo de retraso
+POLL_BACKOFF_FACTOR=2.0     # Multiplicador para cada reintento
+```
+
 - **WATERFALL (Por defecto):** Sondea los orquestadores en orden de prioridad. Siempre regresa al de mayor prioridad después de cualquier tarea.
 - **ROUND_ROBIN:** Distribuye las solicitudes según los pesos.
 - **FAILOVER:** Sondea al siguiente solo si el anterior está vacío.
