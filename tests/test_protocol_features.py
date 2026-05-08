@@ -45,6 +45,7 @@ async def test_heartbeat_jitter_variants():
     config = WorkerConfig()
     transport = JitterMockTransport()
     worker = Worker(config=config, clients=[({}, transport)])
+    worker._heartbeat_cooldown = 0
 
     # 1. String int
     transport.heartbeat_response = {"next_heartbeat_jitter_ms": "500"}
@@ -85,6 +86,7 @@ async def test_dynamic_skill_sync():
     config = WorkerConfig()
     transport = MockTransport()
     worker = Worker(config=config, clients=[({}, transport)])
+    worker._heartbeat_cooldown = 0
     await worker._send_single_heartbeat(transport)
     assert transport.heartbeats[-1].supported_skills is not None
     await worker._send_single_heartbeat(transport)
@@ -101,9 +103,17 @@ async def test_dynamic_skill_sync():
 @pytest.mark.asyncio
 async def test_heartbeat_debounce():
     config = WorkerConfig()
-    config.HEARTBEAT_DEBOUNCE_DELAY = 0.05
     transport = MockTransport()
     worker = Worker(config=config, clients=[({}, transport)])
+    # We want to test that multiple triggers result in 1 heartbeat.
+    # Set cooldown to a small but positive value so throttling happens.
+    worker._heartbeat_cooldown = 0.05
+
+    # Pre-set last heartbeat time to "now" so the first trigger is also throttled
+    from time import time
+
+    worker._last_heartbeat_times[transport] = time()
+
     for _ in range(3):
         worker._schedule_heartbeat_debounce()
     await asyncio.sleep(0.1)

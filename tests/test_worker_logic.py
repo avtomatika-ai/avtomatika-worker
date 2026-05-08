@@ -5,7 +5,6 @@
 # Copyright (c) 2026 Dmitrii Gagarin aka madgagarin
 
 import asyncio
-from unittest.mock import MagicMock
 
 import pytest
 from rxon import Transport
@@ -39,44 +38,17 @@ async def test_validate_config_warns_on_unused_skill_type_limits(mocker):
 
 
 @pytest.mark.asyncio
-async def test_debounced_heartbeat_sender(mocker):
+async def test_schedule_heartbeat_debounce(mocker):
     """
-    Tests that _debounced_heartbeat_sender waits for the correct delay
-    and then sends heartbeats.
+    Tests that _schedule_heartbeat_debounce schedules heartbeats for all clients.
     """
     transport = mocker.AsyncMock(spec=Transport)
     worker = Worker(clients=[({"url": "http://test", "weight": 1}, transport)])
-    worker._config.HEARTBEAT_DEBOUNCE_DELAY = 0.01
-    mock_send_single = mocker.patch.object(worker, "_send_single_heartbeat", new_callable=mocker.AsyncMock)
-    mock_sleep = mocker.patch("avtomatika_worker.worker.sleep", new_callable=mocker.AsyncMock)
-
-    await worker._debounced_heartbeat_sender()
-
-    mock_sleep.assert_called_once_with(0.01)
-    mock_send_single.assert_called_once_with(transport)
-
-
-@pytest.mark.asyncio
-async def test_schedule_heartbeat_debounce(mocker):
-    """
-    Tests that _schedule_heartbeat_debounce cancels a pending task and schedules a new one.
-    """
-    worker = Worker()
     mock_create_task = mocker.patch("avtomatika_worker.worker.create_task")
 
-    # First call, no pending task
     worker._schedule_heartbeat_debounce()
-    mock_create_task.assert_called_once()
-    mock_create_task.call_args[0][0].close()  # Avoid RuntimeWarning
-
-    # Second call, with a pending task
-    pending_task = MagicMock()
-    pending_task.done.return_value = False
-    worker._debounce_task = pending_task
-    worker._schedule_heartbeat_debounce()
-
-    pending_task.cancel.assert_called_once()
-    assert mock_create_task.call_count == 2
+    # It should call create_task for the transport
+    assert mock_create_task.called
     mock_create_task.call_args[0][0].close()  # Avoid RuntimeWarning
 
 

@@ -73,6 +73,9 @@ async def test_skills_hashing_persistence_lifecycle():
 
     client = AsyncMock()
 
+    # Disable cooldown for sequential calls
+    worker._heartbeat_cooldown = 0
+
     # 1. Scenario: Orchestrator returns ERROR
     client.send_heartbeat.return_value = None  # Simulating failure or empty response
 

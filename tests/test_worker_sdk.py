@@ -188,6 +188,7 @@ async def test_heartbeat_sends_hot_skills_by_names():
     worker = Worker(
         skill_dependencies=skill_deps, clients=[({"url": "http://test-orchestrator", "weight": 1}, transport)]
     )
+    worker._heartbeat_cooldown = 0
 
     @worker.skill("image_generation")
     async def h1(params: dict):
@@ -223,11 +224,6 @@ async def test_get_hot_cache():
     worker = Worker()
     worker.add_to_hot_cache("model-1")
     assert worker.get_hot_cache() == {"model-1"}
-    # Clean up the debounced task
-    if worker._debounce_task:
-        worker._debounce_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await worker._debounce_task
 
 
 def test_get_current_state_full():

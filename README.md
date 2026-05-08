@@ -21,9 +21,11 @@ Official SDK for building workers compatible with the **Avtomatika** orchestrato
 
 ## 🛡 Resilience & Connectivity
 
-- **Independent Managers:** Connection to each orchestrator is managed by a separate background task. One server failure doesn't affect others.
-- **Infinite Retries:** Exponential backoff for registration if the orchestrator is unavailable.
-- **Non-blocking Startup:** The worker starts polling as soon as it registers successfully with at least one orchestrator.
+- **Independent Managers:** Connection to each orchestrator is managed by a separate background task. One server failure or rate limit doesn't affect others.
+- **Smart Backoff:** Unified exponential backoff for registration, polling, and heartbeats.
+- **Rate Limit Protection:** Full support for `Retry-After` (seconds or HTTP-date). Implements a mandatory 30s safety floor for 429 errors without `Retry-After` to prevent Retry Storms.
+- **Heartbeat Debouncing:** Throttles heartbeats to once every 2 seconds. Events are not lost but consolidated and sent after the cooldown period.
+- **Infinite Retries:** Workers never stop trying to register with an exponential delay.
 - **Graceful Shutdown:** Handles `SIGTERM` and `SIGINT` properly, waiting for active tasks to finish.
 
 ## 🛠 Installation

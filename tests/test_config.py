@@ -29,10 +29,10 @@ def test_worker_config_defaults():
         assert config.HEARTBEAT_INTERVAL == 15
         assert config.RESULT_MAX_RETRIES == 5
         assert config.RESULT_RETRY_INITIAL_DELAY == 1.0
-        assert config.HEARTBEAT_DEBOUNCE_DELAY == 0.1
+        assert config.HEARTBEAT_COOLDOWN == 2.0
         assert config.TASK_POLL_TIMEOUT == 30
         assert config.TASK_POLL_ERROR_DELAY == 5.0
-        assert config.IDLE_POLL_DELAY == 0.01
+        assert config.IDLE_POLL_DELAY == 0.5
         assert not config.ENABLE_WEBSOCKETS
         assert config.MULTI_ORCHESTRATOR_MODE == "WATERFALL"
 
@@ -57,7 +57,8 @@ def test_worker_config_custom_values():
             "HEARTBEAT_INTERVAL": "30",
             "RESULT_MAX_RETRIES": "10",
             "RESULT_RETRY_INITIAL_DELAY": "2.0",
-            "WORKER_HEARTBEAT_DEBOUNCE_DELAY": "0.2",
+            "WORKER_HEARTBEAT_COOLDOWN": "5.0",
+            "RATE_LIMIT_BACKOFF_FLOOR": "45.0",
             "TASK_POLL_TIMEOUT": "60",
             "TASK_POLL_ERROR_DELAY": "10.0",
             "IDLE_POLL_DELAY": "0.02",
@@ -86,7 +87,7 @@ def test_worker_config_custom_values():
         assert config.HEARTBEAT_INTERVAL == 30
         assert config.RESULT_MAX_RETRIES == 10
         assert config.RESULT_RETRY_INITIAL_DELAY == 2.0
-        assert config.HEARTBEAT_DEBOUNCE_DELAY == 0.2
+        assert config.HEARTBEAT_COOLDOWN == 5.0
         assert config.TASK_POLL_TIMEOUT == 60
         assert config.TASK_POLL_ERROR_DELAY == 10.0
         assert config.IDLE_POLL_DELAY == 0.02

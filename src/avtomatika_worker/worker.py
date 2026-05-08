@@ -24,6 +24,8 @@ from asyncio import (
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import fields, is_dataclass, make_dataclass, replace
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from importlib.util import module_from_spec, spec_from_file_location
 from inspect import Parameter, iscoroutinefunction, signature
 from logging import getLogger
@@ -304,7 +306,6 @@ class Worker:
         self._session_is_managed_externally = http_session is not None
         self._shutdown_event = Event()
         self._registered_event = Event()
-        self._debounce_task: Task | None = None
         self._ssl_context = None
         self._last_synced_skills_hash: str | None = None
 
@@ -315,8 +316,12 @@ class Worker:
                 self._total_orchestrator_weight += o.get("weight", 1)
         self._clients = clients or []
         self._comm_tasks: list[Task] = []
-        self._poll_backoff: dict[Transport, float] = {}
+        self._poll_backoffs: dict[Transport, float] = {}
+        self._hb_backoffs: dict[Transport, float] = {}
+        self._last_heartbeat_times: dict[Transport, float] = {}
         self._next_poll_time: dict[Transport, float] = {}
+        self._debouncing_flags: dict[Transport, bool] = {}
+        self._heartbeat_cooldown = self._config.HEARTBEAT_COOLDOWN
         self._usage_checker: Callable[[], ResourcesUsage] | None = None
         if not self._clients and self._http_session:
             self._init_clients()
@@ -563,15 +568,11 @@ class Worker:
                     break
         return selected_client
 
-    async def _debounced_heartbeat_sender(self) -> None:
-        await sleep(self._config.HEARTBEAT_DEBOUNCE_DELAY)
-        for _, client in self._clients:
-            await self._send_single_heartbeat(client)
-
     def _schedule_heartbeat_debounce(self) -> None:
-        if self._debounce_task and not self._debounce_task.done():
-            self._debounce_task.cancel()
-        self._debounce_task = create_task(self._debounced_heartbeat_sender())
+        """Schedules a heartbeat for all clients, respecting their individual cooldowns."""
+        for item in self._clients:
+            client = item[1] if isinstance(item, tuple) and len(item) == 2 else item
+            create_task(self._send_single_heartbeat(client))
 
     async def _poll_for_tasks_with_status(self, client: Transport) -> bool:
         """Polls for tasks and returns True if a task was received."""
@@ -595,7 +596,7 @@ class Worker:
                 hot_skills=hot_skill_names,
             )
 
-            self._poll_backoff.pop(client, None)
+            self._poll_backoffs.pop(client, None)
             self._next_poll_time.pop(client, None)
 
             if task_data:
@@ -611,27 +612,26 @@ class Worker:
                 self._active_tasks[task_data.task_id] = task
                 return True
         except (RxonRateLimitError, RxonNetworkError) as e:
-            current_backoff = self._poll_backoff.get(client, 0.0)
-            retry_after = getattr(e, "details", {}).get("retry_after") if isinstance(e, RxonRateLimitError) else None
+            is_rate_limit = isinstance(e, RxonRateLimitError)
+            current_backoff = self._poll_backoffs.get(client, 0.0)
+            retry_after_raw = getattr(e, "details", {}).get("retry_after") if is_rate_limit else None
+            retry_after = self._parse_retry_after(retry_after_raw)
 
-            if retry_after is not None:
-                new_backoff = float(retry_after)
-                self._poll_backoff[client] = new_backoff
+            if retry_after > 0:
+                new_backoff = retry_after
             else:
-                new_backoff = min(
-                    max(
-                        current_backoff * self._config.POLL_BACKOFF_FACTOR,
-                        self._config.POLL_BACKOFF_INITIAL,
-                    ),
-                    self._config.POLL_BACKOFF_MAX,
+                new_backoff = self._calculate_backoff(
+                    current_backoff,
+                    initial=self._config.POLL_BACKOFF_INITIAL,
+                    max_delay=self._config.POLL_BACKOFF_MAX,
+                    is_rate_limit=is_rate_limit,
                 )
-                self._poll_backoff[client] = new_backoff
 
+            self._poll_backoffs[client] = new_backoff
             self._next_poll_time[client] = time() + new_backoff
 
-            if isinstance(e, RxonRateLimitError):
-                source = "Retry-After" if retry_after is not None else "backoff"
-                logger.warning(f"Rate limited by {client} ({source}). Backing off for {new_backoff:.1f}s.")
+            if is_rate_limit:
+                logger.warning(f"Rate limited by {client}. Backing off for {new_backoff:.1f}s.")
             else:
                 logger.warning(f"Network error polling {client}: {e}. Backing off for {new_backoff:.1f}s.")
         except RxonError as e:
@@ -1165,17 +1165,38 @@ class Worker:
                 self._registered_event.set()
                 return
             except Exception as e:
-                logger.error(f"Registration attempt failed for {client}: {e}", exc_info=True)
+                is_rl = isinstance(e, RxonRateLimitError)
+                retry_after_raw = getattr(e, "details", {}).get("retry_after") if is_rl else None
+                retry_after = self._parse_retry_after(retry_after_raw)
+
+                logger.error(f"Registration attempt failed for {client}: {e}")
+
+                if retry_after > 0:
+                    delay = retry_after
+                else:
+                    delay = self._calculate_backoff(
+                        delay,
+                        initial=self._config.REGISTRATION_RETRY_INITIAL_DELAY,
+                        max_delay=self._config.REGISTRATION_RETRY_MAX_DELAY,
+                        is_rate_limit=is_rl,
+                    )
 
             logger.info(f"Retrying registration for {client} in {delay:.1f}s...")
             try:
                 await wait_for(self._shutdown_event.wait(), timeout=delay)
-                return
+                break
             except TimeoutError:
-                delay = min(delay * 2, self._config.REGISTRATION_RETRY_MAX_DELAY)
+                continue
+
+    async def _delayed_heartbeat(self, client: Transport, delay: float) -> None:
+        """Helper to send a heartbeat after a delay, used for debouncing."""
+        try:
+            await sleep(delay)
+            await self._send_single_heartbeat(client)
+        finally:
+            self._debouncing_flags[client] = False
 
     async def _manage_single_orchestrator(self, client: Transport) -> None:
-        """Maintains registration and heartbeats for a single orchestrator."""
         while not self._shutdown_event.is_set():
             await self._register_client_with_retry(client)
             if self._shutdown_event.is_set():
@@ -1183,11 +1204,32 @@ class Worker:
 
             logger.info(f"Starting heartbeat loop for {client}")
             while not self._shutdown_event.is_set():
+                hb_backoff = self._hb_backoffs.get(client, 0.0)
                 try:
                     jitter_ms = await self._send_single_heartbeat(client)
+                    self._hb_backoffs[client] = 0.0
                     wait_time = self._config.HEARTBEAT_INTERVAL + (jitter_ms / 1000.0)
                     try:
                         await wait_for(self._shutdown_event.wait(), timeout=wait_time)
+                        break
+                    except TimeoutError:
+                        continue
+                except RxonRateLimitError as e:
+                    retry_after = self._parse_retry_after(e.details.get("retry_after") if e.details else None)
+                    if retry_after > 0:
+                        new_backoff = retry_after
+                    else:
+                        new_backoff = self._calculate_backoff(
+                            hb_backoff,
+                            initial=self._config.HEARTBEAT_INTERVAL,
+                            max_delay=self._config.POLL_BACKOFF_MAX,
+                            is_rate_limit=True,
+                        )
+                    self._hb_backoffs[client] = new_backoff
+                    logger.warning(f"Rate limited by {client}. Backing off for {new_backoff:.1f}s")
+                    try:
+                        await wait_for(self._shutdown_event.wait(), timeout=new_backoff)
+                        break
                     except TimeoutError:
                         continue
                 except RxonError as e:
@@ -1197,15 +1239,23 @@ class Worker:
                         self._last_synced_skills_hash = None
                         break
                     else:
-                        logger.warning(f"Heartbeat failed for {client}: {e}")
+                        new_backoff = self._calculate_backoff(
+                            hb_backoff,
+                            initial=self._config.HEARTBEAT_INTERVAL,
+                            max_delay=self._config.POLL_BACKOFF_MAX,
+                        )
+                        self._hb_backoffs[client] = new_backoff
+                        logger.warning(f"Heartbeat failed for {client}: {e}. Backing off for {new_backoff:.1f}s")
                         try:
-                            await wait_for(self._shutdown_event.wait(), timeout=self._config.HEARTBEAT_INTERVAL)
+                            await wait_for(self._shutdown_event.wait(), timeout=new_backoff)
+                            break
                         except TimeoutError:
                             continue
                 except Exception as e:
                     logger.error(f"Unexpected error in heartbeat loop for {client}: {e}", exc_info=True)
                     try:
                         await wait_for(self._shutdown_event.wait(), timeout=self._config.HEARTBEAT_INTERVAL)
+                        break
                     except TimeoutError:
                         continue
 
@@ -1301,7 +1351,7 @@ class Worker:
             status=state["status"],
             usage=usage,
             current_tasks=list(self._active_tasks.keys()),
-            supported_skills=skills_to_send,
+            supported_skills=skills_to_send if current_hash != self._last_synced_skills_hash else None,
             available_skills=available_names or None,
             hot_skills=hot_names or None,
             skills_hash=current_hash,
@@ -1311,12 +1361,56 @@ class Worker:
         security = self._sign_payload_if_needed(heartbeat)
         return heartbeat._replace(security=security)
 
+    def _parse_retry_after(self, retry_after: Any) -> float:
+        """Parses Retry-After header which can be seconds or an HTTP-date."""
+        if not retry_after:
+            return 0.0
+        try:
+            return float(retry_after)
+        except (ValueError, TypeError):
+            try:
+                dt = parsedate_to_datetime(str(retry_after))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=UTC)
+                return max(0.0, (dt - datetime.now(UTC)).total_seconds())
+            except Exception:
+                return 0.0
+
+    def _calculate_backoff(
+        self,
+        current: float,
+        initial: float,
+        max_delay: float,
+        factor: float = 2.0,
+        is_rate_limit: bool = False,
+    ) -> float:
+        """Unified exponential backoff logic."""
+        new_val = min(max(current * factor, initial), max_delay)
+        if is_rate_limit:
+            return max(new_val, self._config.RATE_LIMIT_BACKOFF_FLOOR)
+        return new_val
+
     async def _send_single_heartbeat(self, client: Transport) -> int:
+        now = time()
+        last_time = self._last_heartbeat_times.get(client, 0.0)
+        time_since_last = now - last_time
+
+        if time_since_last < self._heartbeat_cooldown:
+            remaining = self._heartbeat_cooldown - time_since_last
+            if not self._debouncing_flags.get(client, False):
+                self._debouncing_flags[client] = True
+                create_task(self._delayed_heartbeat(client, remaining))
+            return 0
+
         heartbeat = self._create_heartbeat_payload()
         resp = await client.send_heartbeat(heartbeat)
+        self._last_heartbeat_times[client] = time()
         jitter_ms = 0
-        if resp and not isinstance(resp, str):
+
+        # Any response (even empty string/dict) from server confirms successful reach
+        if resp is not None:
             self._last_synced_skills_hash = heartbeat.skills_hash
+
         if resp:
             from rxon.constants import HB_RESP_CANCEL_TASKS, HB_RESP_REQUIRE_FULL_SYNC
 
@@ -1332,7 +1426,8 @@ class Worker:
 
             if isinstance(resp, dict):
                 try:
-                    jitter_ms = int(resp.get("next_heartbeat_jitter_ms", 0))
+                    val = resp.get("next_heartbeat_jitter_ms", 0)
+                    jitter_ms = int(float(val)) if val is not None else 0
                 except (ValueError, TypeError):
                     jitter_ms = 0
         return jitter_ms

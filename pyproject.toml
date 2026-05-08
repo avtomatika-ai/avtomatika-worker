@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "avtomatika-worker"
-version = "1.0b15"
+version = "1.0b16"
 description = "Worker SDK for the Avtomatika orchestrator."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -21,11 +21,11 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "rxon>=1.0b11",
+    "rxon==1.0b11",
     "aiohttp~=3.13.5",
     "python-json-logger~=4.1.0",
     "aiofiles~=25.1.0",
-    "orjson>=3.10.0",
+    "orjson~=3.11.9",
 ]
 
 [project.scripts]
@@ -33,7 +33,7 @@ worker = "avtomatika_worker.__main__:main"
 
 [project.optional-dependencies]
 s3 = ["obstore~=0.9.2"]
-pydantic = ["pydantic~=2.12"]
+pydantic = ["pydantic~=2.13.4"]
 metrics = [
     "opentelemetry-api~=1.30.0",
     "opentelemetry-sdk~=1.30.0",

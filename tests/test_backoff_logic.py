@@ -26,44 +26,37 @@ def worker():
 
 @pytest.mark.asyncio
 async def test_exponential_backoff_progression(worker, mocker):
-    """Verify that delay increases exponentially on repeated 429 errors."""
     client = mocker.AsyncMock()
     client.poll_task.side_effect = RxonRateLimitError("Too many requests")
 
     await worker._poll_for_tasks_with_status(client)
-    assert worker._poll_backoff[client] == 1.0
+    assert worker._poll_backoffs[client] == 30.0
 
     worker._next_poll_time[client] = 0
     await worker._poll_for_tasks_with_status(client)
-    assert worker._poll_backoff[client] == 2.0
-
-    worker._next_poll_time[client] = 0
-    await worker._poll_for_tasks_with_status(client)
-    assert worker._poll_backoff[client] == 4.0
+    assert worker._poll_backoffs[client] == 60.0
 
 
 @pytest.mark.asyncio
 async def test_backoff_max_limit(worker, mocker):
-    """Verify that backoff does not exceed the maximum limit."""
-    worker._config.POLL_BACKOFF_MAX = 10.0
+    worker._config.POLL_BACKOFF_MAX = 45.0
     client = mocker.AsyncMock()
     client.poll_task.side_effect = RxonRateLimitError("429")
 
-    worker._poll_backoff[client] = 8.0
+    worker._poll_backoffs[client] = 40.0
     worker._next_poll_time[client] = 0
 
     await worker._poll_for_tasks_with_status(client)
-    assert worker._poll_backoff[client] == 10.0
+    assert worker._poll_backoffs[client] == 45.0
 
 
 @pytest.mark.asyncio
 async def test_backoff_reset_on_success(worker, mocker):
-    """Verify that backoff is reset on the first successful response."""
     client = mocker.AsyncMock()
 
     client.poll_task.side_effect = RxonRateLimitError("429")
     await worker._poll_for_tasks_with_status(client)
-    assert client in worker._poll_backoff
+    assert client in worker._poll_backoffs
 
     client.poll_task.side_effect = None
     client.poll_task.return_value = None
@@ -71,13 +64,12 @@ async def test_backoff_reset_on_success(worker, mocker):
 
     await worker._poll_for_tasks_with_status(client)
 
-    assert client not in worker._poll_backoff
+    assert client not in worker._poll_backoffs
     assert client not in worker._next_poll_time
 
 
 @pytest.mark.asyncio
 async def test_waterfall_skips_blocked_orchestrator(worker, mocker):
-    """Verify that WATERFALL mode skips blocked orchestrators."""
     worker._config.MULTI_ORCHESTRATOR_MODE = "WATERFALL"
 
     c1 = mocker.AsyncMock(name="VIP")
@@ -97,19 +89,17 @@ async def test_waterfall_skips_blocked_orchestrator(worker, mocker):
 
 @pytest.mark.asyncio
 async def test_network_error_triggers_backoff(worker, mocker):
-    """Verify that network errors trigger backoff."""
     client = mocker.AsyncMock()
     client.poll_task.side_effect = RxonNetworkError("Connection refused")
 
     await worker._poll_for_tasks_with_status(client)
-    assert worker._poll_backoff[client] == worker._config.POLL_BACKOFF_INITIAL
+    assert worker._poll_backoffs[client] == worker._config.POLL_BACKOFF_INITIAL
 
 
 @pytest.mark.asyncio
 async def test_backoff_with_actual_task(worker, mocker):
-    """Verify that receiving a task resets backoff."""
     client = mocker.AsyncMock()
-    worker._poll_backoff[client] = 10.0
+    worker._poll_backoffs[client] = 10.0
     worker._next_poll_time[client] = 0
 
     client.poll_task.return_value = TaskPayload(job_id="j1", task_id="t1", type="test_skill", params={})
@@ -117,13 +107,12 @@ async def test_backoff_with_actual_task(worker, mocker):
     with patch.object(worker, "_process_task", return_value=AsyncMock()):
         await worker._poll_for_tasks_with_status(client)
 
-    assert client not in worker._poll_backoff
+    assert client not in worker._poll_backoffs
     assert client not in worker._next_poll_time
 
 
 @pytest.mark.asyncio
 async def test_heartbeat_is_not_blocked_by_polling_backoff(worker, mocker):
-    """Verify that polling backoff does not block heartbeats."""
     client = mocker.AsyncMock()
     client.poll_task.side_effect = RxonRateLimitError("429")
     await worker._poll_for_tasks_with_status(client)
@@ -136,7 +125,6 @@ async def test_heartbeat_is_not_blocked_by_polling_backoff(worker, mocker):
 
 
 def test_rate_limit_error_contains_correct_code():
-    """Verify that the exception contains the correct error code."""
     from rxon.constants import ERROR_CODE_LIMIT_EXCEEDED
 
     exc = RxonRateLimitError("Rate limited")
@@ -145,13 +133,12 @@ def test_rate_limit_error_contains_correct_code():
 
 @pytest.mark.asyncio
 async def test_backoff_respects_retry_after_header(worker, mocker):
-    """Verify that worker respects Retry-After header."""
     client = mocker.AsyncMock()
     client.poll_task.side_effect = RxonRateLimitError("429", details={"retry_after": 300.0})
 
     await worker._poll_for_tasks_with_status(client)
 
-    assert worker._poll_backoff[client] == 300.0
+    assert worker._poll_backoffs[client] == 300.0
     from time import time
 
     assert abs(worker._next_poll_time[client] - (time() + 300.0)) < 1.0

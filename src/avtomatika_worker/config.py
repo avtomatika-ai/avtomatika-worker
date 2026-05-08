@@ -74,7 +74,8 @@ class WorkerConfig:
         )
         self.REGISTRATION_RETRY_INITIAL_DELAY: float = float(getenv("REGISTRATION_RETRY_INITIAL_DELAY", "1.0"))
         self.REGISTRATION_RETRY_MAX_DELAY: float = float(getenv("REGISTRATION_RETRY_MAX_DELAY", "60.0"))
-        self.HEARTBEAT_DEBOUNCE_DELAY: float = float(getenv("WORKER_HEARTBEAT_DEBOUNCE_DELAY", 0.1))
+        self.HEARTBEAT_COOLDOWN: float = float(getenv("WORKER_HEARTBEAT_COOLDOWN", "2.0"))
+        self.RATE_LIMIT_BACKOFF_FLOOR: float = float(getenv("RATE_LIMIT_BACKOFF_FLOOR", "30.0"))
         self.TASK_POLL_TIMEOUT: float = float(getenv("TASK_POLL_TIMEOUT", "30"))
         self.TASK_POLL_ERROR_DELAY: float = float(
             getenv("TASK_POLL_ERROR_DELAY", "5.0"),
@@ -82,7 +83,7 @@ class WorkerConfig:
         self.POLL_BACKOFF_INITIAL: float = float(getenv("POLL_BACKOFF_INITIAL", "1.0"))
         self.POLL_BACKOFF_MAX: float = float(getenv("POLL_BACKOFF_MAX", "60.0"))
         self.POLL_BACKOFF_FACTOR: float = float(getenv("POLL_BACKOFF_FACTOR", "2.0"))
-        self.IDLE_POLL_DELAY: float = float(getenv("IDLE_POLL_DELAY", "0.01"))
+        self.IDLE_POLL_DELAY: float = float(getenv("IDLE_POLL_DELAY", "0.5"))
         self.SHUTDOWN_TIMEOUT: float = float(getenv("WORKER_SHUTDOWN_TIMEOUT", "30.0"))
         self.ENABLE_WEBSOCKETS: bool = getenv("WORKER_ENABLE_WEBSOCKETS", "false").lower() == "true"
         self.MULTI_ORCHESTRATOR_MODE: str = getenv("MULTI_ORCHESTRATOR_MODE", "WATERFALL")

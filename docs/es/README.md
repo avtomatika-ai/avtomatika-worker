@@ -19,6 +19,15 @@ SDK oficial para construir trabajadores compatibles con el orquestador **Avtomat
 - **S3 Streaming:** Transferencia de datos de alto rendimiento usando `obstore`. Sin errores de OOM en archivos grandes.
 - **Hardware Awareness:** Monitoreo integrado de CPU, RAM y GPUs NVIDIA (vía `psutil` y `GPUtil`).
 
+## 🛡 Resiliencia y Conectividad
+
+- **Gestores Independientes:** La conexión a cada orquestador es gestionada por una tarea de fondo separada. El fallo de un servidor o un límite de velocidad (Rate Limit) no afecta a los demás.
+- **Backoff Inteligente:** Sistema unificado de retraso exponencial para registro, sondeo de tareas y latidos (heartbeats).
+- **Protección contra Rate Limit:** Soporte completo para el encabezado `Retry-After` (segundos o fecha HTTP). Implementa un "piso de seguridad" obligatorio de 30s para errores 429 sin `Retry-After` para prevenir tormentas de reintentos (Retry Storms).
+- **Heartbeat Debouncing:** Limita la frecuencia de los latidos a uno cada 2 segundos. Los eventos no se pierden, sino que se consolidan y envían después del periodo de enfriamiento.
+- **Reintentos Infinitos:** Los trabajadores nunca dejan de intentar registrarse con un retraso exponencial.
+- **Cierre Ordenado (Graceful Shutdown):** Maneja `SIGTERM` y `SIGINT` correctamente, esperando a que las tareas activas terminen.
+
 ## 🛠 Instalación
 
 ```bash
