@@ -16,6 +16,7 @@ from asyncio import (
     gather,
     get_running_loop,
     run,
+    shield,
     sleep,
     to_thread,
     wait,
@@ -26,11 +27,14 @@ from contextlib import suppress
 from dataclasses import fields, is_dataclass, make_dataclass, replace
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as get_version
 from importlib.util import module_from_spec, spec_from_file_location
-from inspect import Parameter, iscoroutinefunction, signature
+from inspect import Parameter, cleandoc, iscoroutinefunction, signature
 from logging import getLogger
 from os.path import join
 from signal import SIGINT, SIGTERM
+from sys import modules
 from time import perf_counter, time
 from typing import TYPE_CHECKING, Any, cast, get_args, get_origin, get_type_hints
 from uuid import uuid4
@@ -48,9 +52,12 @@ from rxon.constants import (
     ERROR_CODE_PERMANENT,
     ERROR_CODE_TRANSIENT,
     EVENT_TYPE_PROGRESS,
+    HB_RESP_CANCEL_TASKS,
+    HB_RESP_REQUIRE_FULL_SYNC,
     TASK_STATUS_CANCELLED,
     TASK_STATUS_FAILURE,
     TASK_STATUS_SUCCESS,
+    WORKER_STATUS_DRAINING,
 )
 from rxon.exceptions import RxonError, RxonNetworkError, RxonRateLimitError
 from rxon.models import (
@@ -72,12 +79,12 @@ from rxon.models import (
 )
 from rxon.schema import extract_json_schema, extract_output_schema_from_func, extract_schema_from_func, validate_data
 from rxon.security import create_client_ssl_context, sign_payload
-from rxon.utils import from_dict, to_dict
+from rxon.utils import calculate_dict_hash, from_dict, json_dumps, to_dict
 from rxon.validators import is_valid_identifier, validate_identifier
 
 from .config import WorkerConfig
 from .logging import clear_context, set_context, setup_logging
-from .observability import ObservabilityManager
+from .observability import ObservabilityManager, propagate
 from .s3 import S3Manager
 from .task_files import TaskFiles
 from .types import CapacityChecker, Middleware, ParamValidationError
@@ -212,7 +219,7 @@ class SkillBlueprint:
         elif isinstance(info, str):
             init_kwargs["name"] = info
             if "type" not in init_kwargs:
-                init_kwargs["type"] = info  # Ensure type is set for dispatcher matching
+                init_kwargs["type"] = info
 
         base_info = _create_dynamic_skill_object(target_class, init_kwargs)
 
@@ -222,14 +229,10 @@ class SkillBlueprint:
                 base_info = replace(base_info, name=func.__name__)
 
             if base_info.description is None and func.__doc__:
-                import inspect
-
-                base_info = replace(base_info, description=inspect.cleandoc(func.__doc__))
+                base_info = replace(base_info, description=cleandoc(func.__doc__))
 
             if base_info.version is None:
-                import sys
-
-                module = sys.modules.get(func.__module__)
+                module = modules.get(func.__module__)
                 if module and hasattr(module, "__version__"):
                     base_info = replace(base_info, version=module.__version__)
 
@@ -269,9 +272,6 @@ class Worker:
         if skills_dir:
             self._config.WORKER_SKILLS_DIR = skills_dir
 
-        from importlib.metadata import PackageNotFoundError
-        from importlib.metadata import version as get_version
-
         try:
             pkg_version = get_version("avtomatika-worker")
         except PackageNotFoundError:
@@ -299,7 +299,7 @@ class Worker:
 
         self._current_load = 0
         self._current_load_by_type: dict[str, int] = dict.fromkeys(self._skill_type_limits, 0)
-        self._hot_cache: set[str] = set()
+        self._hot_skills_state: set[str] = set()
         self._active_tasks: dict[str, Task] = {}
         self._command_handlers: dict[str, Callable] = {}
         self._http_session = http_session
@@ -425,7 +425,7 @@ class Worker:
         elif isinstance(info, str):
             init_kwargs["name"] = info
             if "type" not in init_kwargs:
-                init_kwargs["type"] = info  # Ensure type is set for dispatcher matching
+                init_kwargs["type"] = info
 
         base_info = _create_dynamic_skill_object(target_class, init_kwargs)
 
@@ -435,14 +435,10 @@ class Worker:
                 base_info = replace(base_info, name=func.__name__)
 
             if base_info.description is None and func.__doc__:
-                import inspect
-
-                base_info = replace(base_info, description=inspect.cleandoc(func.__doc__))
+                base_info = replace(base_info, description=cleandoc(func.__doc__))
 
             if base_info.version is None:
-                import sys
-
-                module = sys.modules.get(func.__module__)
+                module = modules.get(func.__module__)
                 if module and hasattr(module, "__version__"):
                     base_info = replace(base_info, version=module.__version__)
 
@@ -485,16 +481,19 @@ class Worker:
             "type": skill_type,
         }
 
-    def add_to_hot_cache(self, model_name: str) -> None:
-        self._hot_cache.add(model_name)
+    def add_to_hot_skills(self, item: str) -> None:
+        """Marks a skill or resource identifier as 'hot' (loaded/ready)."""
+        self._hot_skills_state.add(item)
         self._schedule_heartbeat_debounce()
 
-    def remove_from_hot_cache(self, model_name: str) -> None:
-        self._hot_cache.discard(model_name)
+    def remove_from_hot_skills(self, item: str) -> None:
+        """Removes a skill or resource from the hot list."""
+        self._hot_skills_state.discard(item)
         self._schedule_heartbeat_debounce()
 
-    def get_hot_cache(self) -> set[str]:
-        return self._hot_cache
+    def get_hot_skills_state(self) -> set[str]:
+        """Returns the set of currently hot items."""
+        return self._hot_skills_state
 
     def _get_current_state(self) -> dict[str, Any]:
         """
@@ -535,9 +534,9 @@ class Worker:
                 is_hot = False
                 if skill_info.name in self._skill_dependencies:
                     deps = self._skill_dependencies[skill_info.name]
-                    if deps and set(deps).issubset(self._hot_cache):
+                    if deps and set(deps).issubset(self._hot_skills_state):
                         is_hot = True
-                elif skill_info.name in self._hot_cache:
+                elif skill_info.name in self._hot_skills_state:
                     is_hot = True
 
                 if is_hot:
@@ -642,8 +641,6 @@ class Worker:
         await self._poll_for_tasks_with_status(client)
 
     async def _start_polling(self) -> None:
-        from rxon.constants import WORKER_STATUS_DRAINING
-
         try:
             done, pending = await wait(
                 [
@@ -658,7 +655,6 @@ class Worker:
             pass
 
         while not self._shutdown_event.is_set():
-            # Beta 10 Draining Mode: Stop taking new tasks if status changed to draining
             current_state = self._get_current_state()
             if current_state["status"] == WORKER_STATUS_DRAINING:
                 logger.info("Worker is in DRAINING mode. Stop polling for new tasks.")
@@ -771,8 +767,9 @@ class Worker:
 
         start_time = perf_counter()
 
-        with self._observability.start_task_span(skill_name, task_id, job_id) as span:
-            # Beta 10: Immediate validation against skill schema
+        with self._observability.start_task_span(
+            skill_name, task_id, job_id, parent_context=task_payload.tracing_context
+        ) as span:
             if handler_data:
                 is_valid, error_msg = task_payload.validate_params(handler_data["info"])
                 if not is_valid:
@@ -791,7 +788,6 @@ class Worker:
                     )
                     security = self._sign_payload_if_needed(result_obj)
                     result_obj = result_obj._replace(security=security)
-                    # Skip execution and reporting result happens in finally block below
 
             async def send_event_wrapper(
                 event_type: str,
@@ -817,18 +813,34 @@ class Worker:
                 event_id = str(uuid4())
                 timestamp = int(time())
 
-                # We EXCLUDE bubbling_chain from the signature so it can be updated by holarchy nodes
+                # Tracing context propagation
+                tracing_context = (task_payload.tracing_context or {}).copy()
+
+                if span and hasattr(span, "get_span_context") and span.get_span_context().is_valid:
+                    ctx = span.get_span_context()
+                    tracing_context["traceparent"] = (
+                        f"00-{format(ctx.trace_id, '032x')}-{format(ctx.span_id, '016x')}-"
+                        f"{format(ctx.trace_flags, '02x')}"
+                    )
+                elif propagate is not None:
+                    propagate.inject(tracing_context)
+
+                if not tracing_context.get("traceparent") and task_payload.tracing_context:
+                    tracing_context.update(task_payload.tracing_context)
+
+                logger.debug(f"Emitting event {event_type} for job {job_id}. Trace context: {tracing_context}")
+
                 event_payload = WorkerEventPayload(
                     event_id=event_id,
                     worker_id=self._config.WORKER_ID,
                     origin_worker_id=origin_worker_id or self._config.WORKER_ID,
                     event_type=event_type,
                     payload=payload,
-                    origin_task_id=task_id,  # Beta 10: propagate origin_task_id for graph tracing
+                    origin_task_id=task_id,
                     bubbling_chain=[],
                     target_job_id=job_id,
                     target_task_id=task_id,
-                    trace_context=task_payload.tracing_context,
+                    trace_context=tracing_context,
                     priority=priority,
                     timestamp=timestamp,
                     security=None,
@@ -884,8 +896,8 @@ class Worker:
                         "metadata": task_payload.metadata,
                         "send_progress": send_progress_wrapper,
                         "send_event": send_event_wrapper,
-                        "add_to_hot_cache": self.add_to_hot_cache,
-                        "remove_from_hot_cache": self.remove_from_hot_cache,
+                        "add_to_hot_skills": self.add_to_hot_skills,
+                        "remove_from_hot_skills": self.remove_from_hot_skills,
                         **deps,
                     }
                     handler_func = handler_data["func"]
@@ -1083,8 +1095,6 @@ class Worker:
 
     def _calculate_contract_hash(self, skills: list[SkillInfo]) -> str:
         """Calculates a hash representing the worker's current 'contract'."""
-        from rxon.utils import calculate_dict_hash
-
         combined_contract = {
             "skills": [to_dict(s) for s in skills],
             "capabilities": self._config.COST_PER_SKILL,
@@ -1123,9 +1133,7 @@ class Worker:
         self._last_synced_skills_hash = skills_hash
 
         available_names = [s.name for s in state["available_skills"]]
-        hot_names_set = {s.name for s in state["hot_skills"]}
-        hot_names_set.update(self._hot_cache)
-        hot_names = list(hot_names_set)
+        hot_names = [s.name for s in state["hot_skills"]]
 
         timestamp = int(time())
         payload = WorkerRegistration(
@@ -1407,13 +1415,10 @@ class Worker:
         self._last_heartbeat_times[client] = time()
         jitter_ms = 0
 
-        # Any response (even empty string/dict) from server confirms successful reach
         if resp is not None:
             self._last_synced_skills_hash = heartbeat.skills_hash
 
         if resp:
-            from rxon.constants import HB_RESP_CANCEL_TASKS, HB_RESP_REQUIRE_FULL_SYNC
-
             if isinstance(resp, dict) and resp.get(HB_RESP_REQUIRE_FULL_SYNC):
                 logger.warning(f"Orchestrator {client} requested Full Sync. Resetting state.")
                 self._last_synced_skills_hash = None
@@ -1461,7 +1466,6 @@ class Worker:
                     cert_path=self._config.TLS_CERT_PATH,
                     key_path=self._config.TLS_KEY_PATH,
                 )
-            from rxon.utils import json_dumps
 
             connector = TCPConnector(ssl=self._ssl_context) if self._ssl_context else None
             self._http_session = ClientSession(connector=connector, json_serialize=json_dumps)
@@ -1473,7 +1477,20 @@ class Worker:
         if self._ssl_context:
             token_rotation_task = create_task(self._manage_token_rotation())
         polling_task = create_task(self._start_polling())
-        await self._shutdown_event.wait()
+
+        try:
+            await self._shutdown_event.wait()
+        finally:
+            # We shield the cleanup to ensure it completes even if main() is cancelled
+            await shield(self._perform_shutdown_cleanup(comm_task, polling_task, token_rotation_task))
+
+    async def _perform_shutdown_cleanup(
+        self,
+        comm_task: Task,
+        polling_task: Task,
+        token_rotation_task: Task | None,
+    ) -> None:
+        """Internal helper to execute all shutdown steps. Shielded from cancellation."""
         logger.info("Shutdown signal received. Starting graceful shutdown...")
 
         for task in self._comm_tasks:
@@ -1485,34 +1502,45 @@ class Worker:
 
         logger.info("Sending final 'offline' heartbeat...")
         with suppress(Exception):
+            state = self._get_current_state()
+            hot_skill_names = [s.name for s in state["hot_skills"]]
+
             heartbeat = Heartbeat(
                 worker_id=self._config.WORKER_ID,
                 status="offline",
                 usage=self._get_resources_usage(),
                 current_tasks=list(self._active_tasks.keys()),
                 supported_skills=[],
-                hot_skills=list(self._hot_cache),
+                available_skills=None,
+                hot_skills=hot_skill_names or None,
+                skills_hash=self._last_synced_skills_hash or "",
+                security=None,
+                metadata=None,
                 timestamp=int(time()),
             )
             security = self._sign_payload_if_needed(heartbeat)
             if security:
                 heartbeat = heartbeat._replace(security=security)
             await gather(*[client.send_heartbeat(heartbeat) for _, client in self._clients], return_exceptions=True)
+
         comm_task.cancel()
         if token_rotation_task:
             token_rotation_task.cancel()
+
         if self._active_tasks:
             timeout = self._config.SHUTDOWN_TIMEOUT
             logger.info(f"Waiting for {len(self._active_tasks)} tasks to complete ({timeout}s)...")
             try:
                 await wait_for(
-                    gather(*self._active_tasks.values(), return_exceptions=True), timeout=self._config.SHUTDOWN_TIMEOUT
+                    gather(*self._active_tasks.values(), return_exceptions=True),
+                    timeout=self._config.SHUTDOWN_TIMEOUT,
                 )
-            except TimeoutError:
-                logger.warning("Shutdown timeout reached.")
-            except CancelledError:
-                pass
-        await gather(*[client.close() for _, client in self._clients])
+            except (TimeoutError, CancelledError):
+                logger.warning("Shutdown timeout reached or cleanup cancelled.")
+
+        await gather(*[client.close() for _, client in self._clients], return_exceptions=True)
+        await self._observability.shutdown()
+
         if self._http_session and not self._http_session.closed and not self._session_is_managed_externally:
             await self._http_session.close()
 
@@ -1543,15 +1571,7 @@ class Worker:
         async def health_handler(_):
             return web.Response(text="OK")
 
-        async def metrics_handler(_):
-            if not self._observability.enabled:
-                return web.Response(status=404, text="Metrics are disabled")
-            return web.Response(
-                body=self._observability.generate_latest(), content_type=self._observability.content_type
-            )
-
         app.router.add_get("/health", health_handler)
-        app.router.add_get("/metrics", metrics_handler)
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.TCPSite(runner, "0.0.0.0", self._config.WORKER_PORT)

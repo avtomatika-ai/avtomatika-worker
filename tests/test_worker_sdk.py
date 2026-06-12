@@ -156,14 +156,14 @@ async def test_send_progress():
 
 
 @pytest.mark.asyncio
-async def test_hot_cache_update_and_heartbeat():
-    """Tests that the hot_cache is correctly updated and sent in the heartbeat."""
+async def test_hot_skills_update_and_heartbeat():
+    """Tests that the hot_skills state is correctly updated and sent in the heartbeat."""
     transport = MockTransport()
     worker = Worker(clients=[({"url": "http://test-orchestrator", "weight": 1}, transport)])
 
-    worker.add_to_hot_cache("model-1")
-    worker.add_to_hot_cache("model-2")
-    worker.remove_from_hot_cache("model-1")
+    worker.add_to_hot_skills("model-1")
+    worker.add_to_hot_skills("model-2")
+    worker.remove_from_hot_skills("model-1")
 
     # Simulate Heartbeat
     for _, client in worker._clients:
@@ -195,8 +195,8 @@ async def test_heartbeat_sends_hot_skills_by_names():
         pass
 
     # Case 1: One skill fully loaded
-    worker.add_to_hot_cache("sd_v1.5")
-    worker.add_to_hot_cache("vae")
+    worker.add_to_hot_skills("sd_v1.5")
+    worker.add_to_hot_skills("vae")
     # Simulate Heartbeat
     for _, client in worker._clients:
         await worker._send_single_heartbeat(client)
@@ -209,7 +209,7 @@ async def test_heartbeat_sends_hot_skills_by_names():
     transport.heartbeats.clear()
 
     # Case 2: A model is removed, making the skill "cold"
-    worker.remove_from_hot_cache("sd_v1.5")
+    worker.remove_from_hot_skills("sd_v1.5")
     # Simulate Heartbeat
     for _, client in worker._clients:
         await worker._send_single_heartbeat(client)
@@ -219,11 +219,53 @@ async def test_heartbeat_sends_hot_skills_by_names():
 
 
 @pytest.mark.asyncio
-async def test_get_hot_cache():
-    """Tests that get_hot_cache returns the current hot cache."""
+async def test_get_hot_skills_state():
+    """Tests that get_hot_skills_state returns the current hot skills state."""
     worker = Worker()
-    worker.add_to_hot_cache("model-1")
-    assert worker.get_hot_cache() == {"model-1"}
+    worker.add_to_hot_skills("model-1")
+    assert worker.get_hot_skills_state() == {"model-1"}
+
+
+@pytest.mark.asyncio
+async def test_skill_dependencies_complex():
+    """Tests complex skill dependencies with shared resources."""
+    skill_deps = {
+        "text_to_image": ["base_model", "refiner"],
+        "image_upscale": ["refiner"],
+    }
+    worker = Worker(skill_dependencies=skill_deps)
+
+    @worker.skill("text_to_image")
+    async def s1(params):
+        pass
+
+    @worker.skill("image_upscale")
+    async def s2(params):
+        pass
+
+    # No resources -> both cold
+    state = worker._get_current_state()
+    assert not any(s.name in ["text_to_image", "image_upscale"] for s in state["hot_skills"])
+
+    # Load 'refiner' -> upscale becomes hot, t2i stays cold
+    worker.add_to_hot_skills("refiner")
+    state = worker._get_current_state()
+    hot_names = {s.name for s in state["hot_skills"]}
+    assert "image_upscale" in hot_names
+    assert "text_to_image" not in hot_names
+
+    # Load 'base_model' -> both become hot
+    worker.add_to_hot_skills("base_model")
+    state = worker._get_current_state()
+    hot_names = {s.name for s in state["hot_skills"]}
+    assert "image_upscale" in hot_names
+    assert "text_to_image" in hot_names
+
+    # Remove 'refiner' -> both become cold (cascading)
+    worker.remove_from_hot_skills("refiner")
+    state = worker._get_current_state()
+    hot_names = {s.name for s in state["hot_skills"]}
+    assert not any(n in hot_names for n in ["text_to_image", "image_upscale"])
 
 
 def test_get_current_state_full():

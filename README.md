@@ -18,6 +18,10 @@ Official SDK for building workers compatible with the **Avtomatika** orchestrato
   - **Stable Hashing:** Sends full skill catalog only when changed, using `skills_hash` for light heartbeats.
 - **S3 Streaming:** High-performance data transfer using `obstore`. No OOM on large files.
 - **Hardware Awareness:** Built-in monitoring for CPU, RAM, and NVIDIA GPUs (via `psutil` and `GPUtil`).
+- **Observability:**
+  - Built-in support for **OpenTelemetry** (traces and metrics).
+  - Automatic **Trace Context Propagation**: Workers extract `trace_id` from tasks and inject it into events (including progress), ensuring end-to-end visibility in Jaeger/Honeycomb.
+  - Automatic metrics export via OTLP (Push model) when `OTEL_EXPORTER_OTLP_ENDPOINT` is configured.
 
 ## 🛡 Resilience & Connectivity
 

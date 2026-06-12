@@ -25,7 +25,6 @@ def test_observability_manager_no_op():
 
         manager.record_task_finished("test", "success", 1.0)
         manager.record_s3_op("upload", "success")
-        assert manager.generate_latest() == b""
 
 
 @pytest.mark.asyncio
@@ -42,6 +41,7 @@ async def test_observability_integration_logic():
         # Manually inject mocks
         manager.enabled = True
         manager.tracer = MagicMock()
+        manager.meter = MagicMock()
         manager.tasks_total = MagicMock()
         manager.tasks_duration = MagicMock()
         manager.s3_ops_total = MagicMock()
@@ -56,3 +56,66 @@ async def test_observability_integration_logic():
         manager.record_task_finished("test-task", "success", 0.5)
         manager.tasks_total.add.assert_called()
         manager.tasks_duration.record.assert_called()
+
+
+@pytest.mark.asyncio
+async def test_observability_shutdown(mocker):
+    """Tests that shutdown flushes and closes providers."""
+    with patch("avtomatika_worker.observability._HAS_OTEL", True):
+        from avtomatika_worker.observability import ObservabilityManager
+
+        manager = ObservabilityManager(enabled=True)
+        manager._tracer_provider = mocker.Mock()
+        manager._meter_provider = mocker.Mock()
+
+        await manager.shutdown()
+
+        manager._tracer_provider.shutdown.assert_called_once()
+        manager._meter_provider.shutdown.assert_called_once()
+
+
+def test_observability_manager_otlp_vs_console_config(mocker):
+    """Tests that the manager chooses OTLP or Console based on env vars."""
+    with patch("avtomatika_worker.observability._HAS_OTEL", True):
+        from avtomatika_worker.observability import ObservabilityManager
+
+        # Mock core OTel modules and classes
+        mocker.patch("avtomatika_worker.observability.metrics", create=True)
+        mocker.patch("avtomatika_worker.observability.trace", create=True)
+        mocker.patch("avtomatika_worker.observability.Resource", create=True)
+        mocker.patch("avtomatika_worker.observability.ResourceAttributes", create=True)
+        mocker.patch("avtomatika_worker.observability.OTLPMetricExporter", create=True)
+        mocker.patch("avtomatika_worker.observability.ConsoleMetricExporter", create=True)
+        mocker.patch("avtomatika_worker.observability.PeriodicExportingMetricReader", create=True)
+        mocker.patch("avtomatika_worker.observability.MeterProvider", create=True)
+
+        # Case 1: OTLP Endpoint set
+        with patch.dict("os.environ", {"OTEL_EXPORTER_OTLP_ENDPOINT": "http://collector:4317"}):
+            manager = ObservabilityManager(enabled=True)
+            assert manager.enabled is True
+            # Verify OTLPMetricExporter was used
+            from avtomatika_worker.observability import OTLPMetricExporter
+
+            assert OTLPMetricExporter.called
+
+        # Case 2: No OTLP Endpoint
+        with patch.dict("os.environ", {}, clear=True):
+            manager = ObservabilityManager(enabled=True)
+            # Verify ConsoleMetricExporter was used
+            from avtomatika_worker.observability import ConsoleMetricExporter
+
+            assert ConsoleMetricExporter.called
+
+
+def test_observability_disabled_mode_safety():
+    """Tests that record methods don't crash when disabled."""
+    with patch("avtomatika_worker.observability._HAS_OTEL", True):
+        from avtomatika_worker.observability import ObservabilityManager
+
+        manager = ObservabilityManager(enabled=False)
+        assert manager.enabled is False
+        assert manager.meter is None
+
+        # Should not crash
+        manager.record_task_finished("task", "ok", 1.0)
+        manager.record_s3_op("op", "ok")

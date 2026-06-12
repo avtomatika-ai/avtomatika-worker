@@ -83,3 +83,46 @@ async def test_shutdown_timeout(mocker):
 
     # Check that task was cancelled when wait_for timed out
     assert task_interrupted is True
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cleanup_on_cancellation(mocker):
+    """
+    Verifies that the finally block in worker.main() runs even if the task is cancelled.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    transport = MockTransport(worker_id="test-worker")
+    transport.send_heartbeat = AsyncMock(return_value={})
+    transport.close = AsyncMock()
+
+    worker = Worker(clients=[({"url": "http://test", "weight": 1}, transport)])
+    worker._observability = MagicMock()
+    worker._observability.shutdown = AsyncMock()
+
+    # Create worker.main() task
+    worker_task = asyncio.create_task(worker.main())
+
+    # Give it a moment to initialize
+    await asyncio.sleep(0.1)
+
+    # Cancel the task directly (simulating KeyboardInterrupt or TaskGroup cancellation)
+    worker_task.cancel()
+
+    import contextlib
+
+    with contextlib.suppress(asyncio.CancelledError):
+        await worker_task
+
+    # VERIFY CLEANUP
+    # 1. Final offline heartbeat should be sent
+    # Note: MockTransport.send_heartbeat was called during registration and maybe heartbeats,
+    # so we check if any call had status="offline"
+    offline_calls = [call for call in transport.send_heartbeat.call_args_list if call.args[0].status == "offline"]
+    assert len(offline_calls) >= 1
+
+    # 2. Transports should be closed
+    transport.close.assert_called()
+
+    # 3. Observability should be shut down
+    worker._observability.shutdown.assert_called_once()

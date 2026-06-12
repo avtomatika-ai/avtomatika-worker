@@ -43,7 +43,7 @@ async def test_skill_docstring_and_version_extraction():
 async def test_three_tier_skill_lists_in_heartbeat():
     """Checks that correct skill list types are sent in heartbeat."""
     worker = Worker()
-    worker.add_to_hot_cache("hot_task")
+    worker.add_to_hot_skills("hot_task")
 
     @worker.skill("hot_task")
     async def hot_task(params: dict):

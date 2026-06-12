@@ -76,6 +76,8 @@ async def generate_report(params: ReportParams, send_progress, send_event, **kwa
         "data": {"report_url": f"s3://bucket/reports/{task_id}.pdf"}
     }
 
+> **Важно о безопасности (Zero Trust):** Хотя SDK автоматически генерирует схемы на основе ваших моделей, **Оркестратор имеет высший приоритет**. Если в блюпринте задана жесткая `output_schema`, оркестратор отфильтрует любые поля вашего результата, которые не соответствуют «закону блюпринта». Это защищает систему от инъекций состояния.
+
 # Пример с динамическими полями: добавление 'price' для маркетплейса
 @worker.skill(name="send_email", price=0.01)
 async def send_email(params: dict, **kwargs) -> dict:
@@ -194,26 +196,57 @@ async def process_video(params: dict, files: TaskFiles):
 
 ### Шаг 8: Наблюдаемость (OpenTelemetry)
 
-SDK имеет встроенную поддержку **распределенной трассировки** и **метрик** через OpenTelemetry.
+SDK имеет встроенную поддержку **распределенной трассировки** и **метрик** через OpenTelemetry. Это превращает воркер из «черного ящика» в прозрачный узел системы.
 
-1.  **Distributed Tracing:** Каждое выполнение задачи обернуто в Span (`task.{type}`). Операции с S3 являются дочерними спанами.
-2.  **Метрики:** Метрики в формате Prometheus доступны по адресу `http://localhost:8083/metrics` (требуется экстра `metrics`).
-3.  **Injections:** Вы можете запросить `ObservabilityManager` в свой обработчик для создания кастомных спанов.
+1.  **Сквозная трассировка:** Воркер автоматически извлекает `trace_id` из входящих задач и делает выполнение навыка дочерним спаном (`task.{type}`). Все события и результаты привязываются к этой же трассе.
+2.  **Автоматические под-спаны:** Операции с S3 (загрузка/выгрузка) автоматически выделяются в отдельные дочерние спаны.
+3.  **Метрики:** Метрики автоматически экспортируются в OTLP-коллектор (требуется экстра `metrics` и переменная `OTEL_EXPORTER_OTLP_ENDPOINT`).
+4.  **Кастомные спаны (Внутренняя работа):** Вы можете запросить `ObservabilityManager` в свой обработчик для детализации внутренней логики.
 
 ```python
 from avtomatika_worker import Worker, ObservabilityManager
 
 @worker.skill()
 async def monitored_task(params: dict, obs: ObservabilityManager):
-    with obs.tracer.start_as_current_span("my-custom-step"):
-        # ... логика ...
-        pass
-    return {"status": "success"}
+    """
+    Использование внедренного менеджера для глубокого мониторинга.
+    """
+    # 1. Создаем кастомный под-спан для тяжелого этапа
+    with obs.tracer.start_as_current_span("heavy_model_inference") as span:
+        span.set_attribute("model.name", "whisper-v3")
+        # ... работа модели ...
+        result = "processed data"
+
+    # 2. Метрики и логи внутри спана привязываются к Trace ID задачи
+    return {"status": "success", "data": result}
 ```
 
 Включите через переменную окружения: `WORKER_ENABLE_METRICS=true`.
 
-### Шаг 9: Проверки здоровья (Health Checks)
+
+### Шаг 9: Динамическое управление навыками (Hot Skills)
+
+В сценариях с высокой производительностью (например, инференс ИИ-моделей) может быть полезно, чтобы Оркестратор знал, какие навыки являются «горячими» (уже загружены в память GPU или кэш). Это позволяет мгновенно запускать задачи без задержек на загрузку.
+
+SDK предоставляет функции `add_to_hot_skills` и `remove_from_hot_skills`, которые внедряются в ваши обработчики навыков.
+
+```python
+@worker.skill()
+async def heavy_ai_task(params: dict, add_to_hot_skills, **kwargs):
+    # 1. Загрузите вашу модель, если нужно
+    model = await load_model("my_large_model")
+    
+    # 2. Пометьте этот ресурс или имя навыка как «горячий»
+    # Это будет отправлено в следующем хартбите оркестратору
+    add_to_hot_skills("my_large_model")
+    
+    # 3. Обработка
+    return {"status": "success"}
+```
+
+Вы также можете использовать эти методы напрямую на экземпляре воркера: `worker.add_to_hot_skills("model_name")`.
+
+### Шаг 10: Проверки здоровья (Health Checks)
 
 По умолчанию SDK запускает небольшой сервер aiohttp на `0.0.0.0:8083`. Вы можете проверить статус воркера по адресу `/health`.
 Это полезно для Kubernetes (Liveness/Readiness probes) или систем мониторинга.

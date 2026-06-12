@@ -9,26 +9,46 @@ from __future__ import annotations
 from collections.abc import Generator
 from contextlib import contextmanager
 from logging import getLogger
-from typing import Any, cast
+from os import getenv
+from typing import Any
 
 logger = getLogger(__name__)
 try:
-    from opentelemetry import metrics, trace
-    from opentelemetry.exporter.prometheus import PrometheusMetricReader
+    from opentelemetry import metrics, propagate, trace
     from opentelemetry.metrics import Counter, Histogram, Meter
+    from opentelemetry.propagate import set_global_textmap
     from opentelemetry.sdk.metrics import MeterProvider
     from opentelemetry.sdk.resources import Resource
     from opentelemetry.semconv.resource import ResourceAttributes
     from opentelemetry.trace import Status, StatusCode
-    from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+    from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+
+    # Set global propagator to W3C TraceContext
+    set_global_textmap(TraceContextTextMapPropagator())
+
+    try:
+        from opentelemetry.sdk.metrics.export import ConsoleMetricExporter, PeriodicExportingMetricReader
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
+
+        try:
+            from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
+            from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+        except ImportError:
+            OTLPSpanExporter = OTLPMetricExporter = None
+    except ImportError:
+        TracerProvider = BatchSpanProcessor = ConsoleSpanExporter = None
+        OTLPSpanExporter = OTLPMetricExporter = None
+        ConsoleMetricExporter = PeriodicExportingMetricReader = None
 
     _HAS_OTEL = True
 except ImportError:
-    metrics = trace = None
+    metrics = trace = propagate = None
     Meter = Counter = Histogram = Status = StatusCode = Resource = Any
-    generate_latest = None
-    CONTENT_TYPE_LATEST = "text/plain"
     ResourceAttributes = Any
+    TracerProvider = BatchSpanProcessor = ConsoleSpanExporter = None
+    OTLPSpanExporter = OTLPMetricExporter = None
+    ConsoleMetricExporter = PeriodicExportingMetricReader = None
     _HAS_OTEL = False
 
 
@@ -48,7 +68,6 @@ class ObservabilityManager:
         self.enabled = enabled and _HAS_OTEL
         self.tracer = None
         self.meter = None
-        self.registry: Any | None = None
 
         if not self.enabled:
             if enabled and not _HAS_OTEL:
@@ -67,36 +86,61 @@ class ObservabilityManager:
             }
         )
 
-        from opentelemetry.sdk.trace import TracerProvider
+        otlp_endpoint = getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
 
-        self._tracer_provider = TracerProvider(resource=resource)
-        trace.set_tracer_provider(self._tracer_provider)
-        self.tracer = trace.get_tracer(service_name)
+        if TracerProvider:
+            self._tracer_provider = TracerProvider(resource=resource)
 
-        self._prom_reader = PrometheusMetricReader()
-        self._meter_provider = MeterProvider(resource=resource, metric_readers=[self._prom_reader])
-        metrics.set_meter_provider(self._meter_provider)
-        self.meter = metrics.get_meter(service_name)
+            if otlp_endpoint and OTLPSpanExporter:
+                logger.info(f"OTLP Trace exporter enabled for worker, sending to {otlp_endpoint}")
+                trace_processor = BatchSpanProcessor(OTLPSpanExporter(endpoint=otlp_endpoint, insecure=True))
+            else:
+                logger.info("Using ConsoleSpanExporter for worker tracing.")
+                trace_processor = BatchSpanProcessor(ConsoleSpanExporter())
 
-        self.tasks_total = self.meter.create_counter(
-            "worker.tasks.total", unit="1", description="Total number of tasks processed"
-        )
-        self.tasks_duration = self.meter.create_histogram(
-            "worker.tasks.duration", unit="s", description="Task execution duration"
-        )
-        self.s3_ops_total = self.meter.create_counter(
-            "worker.s3.operations.total", unit="1", description="Total number of S3 operations"
-        )
+            self._tracer_provider.add_span_processor(trace_processor)
+            trace.set_tracer_provider(self._tracer_provider)
+            self.tracer = trace.get_tracer(service_name)
+
+        if PeriodicExportingMetricReader:
+            if otlp_endpoint and OTLPMetricExporter:
+                logger.info(f"OTLP Metric exporter enabled for worker, sending to {otlp_endpoint}")
+                metric_exporter = OTLPMetricExporter(endpoint=otlp_endpoint, insecure=True)
+            else:
+                logger.info("Using ConsoleMetricExporter for worker metrics.")
+                metric_exporter = ConsoleMetricExporter()
+
+            self._metric_reader = PeriodicExportingMetricReader(metric_exporter, export_interval_millis=60000)
+            self._meter_provider = MeterProvider(resource=resource, metric_readers=[self._metric_reader])
+            metrics.set_meter_provider(self._meter_provider)
+            self.meter = metrics.get_meter(service_name)
+
+            self.tasks_total = self.meter.create_counter(
+                "worker.tasks.total", unit="1", description="Total number of tasks processed"
+            )
+            self.tasks_duration = self.meter.create_histogram(
+                "worker.tasks.duration", unit="s", description="Task execution duration"
+            )
+            self.s3_ops_total = self.meter.create_counter(
+                "worker.s3.operations.total", unit="1", description="Total number of S3 operations"
+            )
 
     @contextmanager
-    def start_task_span(self, task_type: str, task_id: str, job_id: str) -> Generator[Any | None, None, None]:
-        """Starts a span for a task execution."""
+    def start_task_span(
+        self, task_type: str, task_id: str, job_id: str, parent_context: dict[str, Any] | None = None
+    ) -> Generator[Any | None, None, None]:
+        """Starts a span for a task execution, optionally linked to a parent context."""
         if not self.enabled or not self.tracer:
             yield None
             return
 
+        ctx = None
+        if parent_context and propagate:
+            ctx = propagate.extract(parent_context)
+
         with self.tracer.start_as_current_span(
             f"task.{task_type}",
+            context=ctx,
             attributes={
                 "task.id": task_id,
                 "job.id": job_id,
@@ -123,14 +167,14 @@ class ObservabilityManager:
 
     def record_task_finished(self, task_type: str, status: str, duration: float) -> None:
         """Updates metrics when a task is finished."""
-        if not self.enabled:
+        if not self.enabled or not self.meter:
             return
         self.tasks_total.add(1, {"task.type": task_type, "status": status})
         self.tasks_duration.record(duration, {"task.type": task_type})
 
     def record_s3_op(self, op: str, status: str) -> None:
         """Updates S3 metrics."""
-        if not self.enabled:
+        if not self.enabled or not self.meter:
             return
         self.s3_ops_total.add(1, {"s3.operation": op, "status": status})
 
@@ -140,16 +184,24 @@ class ObservabilityManager:
             return
         span.set_status(Status(StatusCode.ERROR, message))
 
-    def generate_latest(self) -> bytes:
-        """Generates the latest metrics in Prometheus format."""
-        if not self.enabled or not generate_latest:
-            return b""
-        return cast(bytes, generate_latest(self.registry))
+    async def shutdown(self) -> None:
+        """Gracefully shuts down the observability providers and flushes data."""
+        if not self.enabled:
+            return
 
-    @property
-    def content_type(self) -> str:
-        """Returns the correct Content-Type for the metrics endpoint."""
-        return cast(str, CONTENT_TYPE_LATEST)
+        logger.info("Shutting down Observability providers...")
+
+        if hasattr(self, "_tracer_provider"):
+            try:
+                self._tracer_provider.shutdown()
+            except Exception as e:
+                logger.error(f"Error shutting down tracer provider: {e}")
+
+        if hasattr(self, "_meter_provider"):
+            try:
+                self._meter_provider.shutdown()
+            except Exception as e:
+                logger.error(f"Error shutting down meter provider: {e}")
 
     @property
     def has_otel(self) -> bool:

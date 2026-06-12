@@ -289,9 +289,8 @@ async def test_run_health_check_server(mocker):
     await worker._run_health_check_server()
 
     mock_app_class.assert_called_once_with()  # Application()
-    assert mock_app_instance.router.add_get.call_count == 2
+    assert mock_app_instance.router.add_get.call_count == 1
     mock_app_instance.router.add_get.assert_any_call("/health", mocker.ANY)
-    mock_app_instance.router.add_get.assert_any_call("/metrics", mocker.ANY)
 
     mock_runner_class.assert_called_once_with(mock_app_instance)  # AppRunner(app)
     mock_runner_instance.setup.assert_called_once()

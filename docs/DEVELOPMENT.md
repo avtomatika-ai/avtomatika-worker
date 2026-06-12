@@ -74,6 +74,8 @@ async def generate_report(params: ReportParams, send_progress, send_event, **kwa
         "data": {"report_url": f"s3://bucket/reports/{task_id}.pdf"}
     }
 
+> **Security Note (Zero Trust):** While the SDK automatically generates schemas based on your models, the **Orchestrator has the ultimate authority**. If a strict `output_schema` is defined in the blueprint, the orchestrator will filter out any fields in your result that do not comply with the "law of the blueprint." This protects the system from state injection attacks.
+
 # Dynamic field extension: add 'price' for the Marketplace
 @worker.skill(name="send_email", price=0.01)
 async def send_email(params: dict, **kwargs) -> dict:
@@ -192,26 +194,56 @@ async def process_video(params: dict, files: TaskFiles):
 
 ### Step 8: Observability (OpenTelemetry)
 
-The SDK provides built-in support for **distributed tracing** and **metrics** using OpenTelemetry.
+The SDK provides built-in support for **distributed tracing** and **metrics** via OpenTelemetry. This transforms the worker from a "black box" into a transparent node in the system.
 
-1.  **Distributed Tracing:** Each task execution is wrapped in a Span (`task.{type}`). S3 operations are child spans.
-2.  **Metrics:** Prometheus-compatible metrics are available at `http://localhost:8083/metrics` (requires the `metrics` extra).
-3.  **Injections:** You can request the `ObservabilityManager` in your skill handler to create custom spans.
+1.  **End-to-End Tracing:** The worker automatically extracts the `trace_id` from incoming tasks and makes the skill execution a child span (`task.{type}`). All events and results are tied to the same trace.
+2.  **Automatic Sub-spans:** S3 operations (upload/download) are automatically isolated into separate child spans.
+3.  **Metrics:** Metrics are automatically exported to the OTLP collector (requires the `metrics` extra and `OTEL_EXPORTER_OTLP_ENDPOINT` variable).
+4.  **Custom Spans (Internal Work):** You can request the `ObservabilityManager` in your handler to add detail to your internal logic.
 
 ```python
 from avtomatika_worker import Worker, ObservabilityManager
 
 @worker.skill()
 async def monitored_task(params: dict, obs: ObservabilityManager):
-    with obs.tracer.start_as_current_span("my-custom-step"):
-        # ... logic ...
-        pass
-    return {"status": "success"}
+    """
+    Using the injected manager for deep monitoring.
+    """
+    # 1. Create a custom sub-span for a heavy stage
+    with obs.tracer.start_as_current_span("heavy_model_inference") as span:
+        span.set_attribute("model.name", "whisper-v3")
+        # ... model work ...
+        result = "processed data"
+        
+    # 2. Metrics and logs inside the span are tied to the Task Trace ID
+    return {"status": "success", "data": result}
 ```
 
 Enable via environment variable: `WORKER_ENABLE_METRICS=true`.
 
-### Step 9: Health Checks
+### Step 9: Dynamic Skill Management (Hot Skills)
+
+In high-performance scenarios (e.g., AI model inference), you might want the Orchestrator to know which skills are "hot" (already loaded into GPU memory or cache). This allows for instant task execution without loading delays.
+
+The SDK provides `add_to_hot_skills` and `remove_from_hot_skills` functions that are injected into your skill handlers.
+
+```python
+@worker.skill()
+async def heavy_ai_task(params: dict, add_to_hot_skills, **kwargs):
+    # 1. Load your model if needed
+    model = await load_model("my_large_model")
+    
+    # 2. Mark this resource or skill name as 'hot'
+    # This will be sent in the next heartbeat to the Orchestrator
+    add_to_hot_skills("my_large_model")
+    
+    # 3. Process
+    return {"status": "success"}
+```
+
+You can also use these methods on the `worker` instance directly: `worker.add_to_hot_skills("model_name")`.
+
+### Step 10: Health Checks
 
 By default, the SDK starts a small aiohttp server on `0.0.0.0:8083`. You can check the worker's status at `/health`.
 This is useful for Kubernetes (Liveness/Readiness probes) or monitoring systems.

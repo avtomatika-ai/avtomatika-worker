@@ -76,6 +76,8 @@ async def generate_report(params: ReportParams, send_progress, send_event, **kwa
         "data": {"report_url": f"s3://bucket/reports/{task_id}.pdf"}
     }
 
+> **Nota de Seguridad (Zero Trust):** Aunque el SDK genera automáticamente esquemas basados en sus modelos, el **Orquestador tiene la autoridad final**. Si se define un `output_schema` estricto en el blueprint, el orquestador filtrará cualquier campo en su resultado que no cumpla con la "ley del blueprint". Esto protege al sistema contra ataques de inyección de estado.
+
 # Extensión de campo dinámico: agregar 'price' para el Marketplace
 @worker.skill(name="send_email", price=0.01)
 async def send_email(params: dict, **kwargs) -> dict:
@@ -194,26 +196,57 @@ async def process_video(params: dict, files: TaskFiles):
 
 ### Paso 8: Observabilidad (OpenTelemetry)
 
-El SDK proporciona soporte integrado para **trazado distribuido** y **métricas** utilizando OpenTelemetry.
+El SDK proporciona soporte integrado para **trazado distribuido** y **métricas** utilizando OpenTelemetry. Esto transforma al worker de una "caja negra" a un nodo transparente en el sistema.
 
-1.  **Trazado Distribuido:** Cada ejecución de tarea está envuelta en un Span (`task.{type}`). Las operaciones de S3 son spans hijos.
-2.  **Métricas:** Las métricas compatibles con Prometheus están disponibles en `http://localhost:8083/metrics` (requiere el extra `metrics`).
-3.  **Inyección de Dependencias:** Puede solicitar el `ObservabilityManager` en su manejador de habilidades para crear spans personalizados.
+1.  **Rastreo de Extremo a Extremo:** El worker extrae automáticamente el `trace_id` de las tareas entrantes y convierte la ejecución de la habilidad en un span hijo (`task.{type}`). Todos los eventos y resultados se vinculan al mismo rastreo.
+2.  **Sub-spans Automáticos:** Las operaciones de S3 (carga/descarga) se aíslan automáticamente en spans hijos separados.
+3.  **Métricas:** Las métricas se exportan automáticamente al colector OTLP (requiere el extra `metrics` y la variable `OTEL_EXPORTER_OTLP_ENDPOINT`).
+4.  **Spans Personalizados (Trabajo Interno):** Puede solicitar el `ObservabilityManager` en su manejador para añadir detalle a su lógica interna.
 
 ```python
 from avtomatika_worker import Worker, ObservabilityManager
 
 @worker.skill()
 async def monitored_task(params: dict, obs: ObservabilityManager):
-    with obs.tracer.start_as_current_span("mi-paso-personalizado"):
-        # ... lógica ...
-        pass
-    return {"status": "success"}
+    """
+    Uso del gestor inyectado para un monitoreo profundo.
+    """
+    # 1. Crear un span personalizado para una etapa pesada
+    with obs.tracer.start_as_current_span("heavy_model_inference") as span:
+        span.set_attribute("model.name", "whisper-v3")
+        # ... trabajo del modelo ...
+        result = "datos procesados"
+
+    # 2. Las métricas y logs dentro del span se vinculan al Trace ID de la tarea
+    return {"status": "success", "data": result}
 ```
 
 Habilítelo a través de la variable de entorno: `WORKER_ENABLE_METRICS=true`.
 
-### Paso 9: Comprobaciones de Salud (Health Checks)
+
+### Paso 9: Gestión Dinámica de Habilidades (Hot Skills)
+
+En escenarios de alto rendimiento (por ejemplo, inferencia de modelos de IA), puede ser útil que el Orquestador sepa qué habilidades están "hot" (ya cargadas en la memoria de la GPU o en el caché). Esto permite una ejecución instantánea de tareas sin retrasos de carga.
+
+El SDK proporciona las funciones `add_to_hot_skills` y `remove_from_hot_skills` que se inyectan en sus manejadores de habilidades.
+
+```python
+@worker.skill()
+async def heavy_ai_task(params: dict, add_to_hot_skills, **kwargs):
+    # 1. Cargue su modelo si es necesario
+    model = await load_model("my_large_model")
+    
+    # 2. Marque este recurso o nombre de habilidad como 'hot'
+    # Esto se enviará en el próximo heartbeat al Orquestador
+    add_to_hot_skills("my_large_model")
+    
+    # 3. Procesar
+    return {"status": "success"}
+```
+
+También puede usar estos métodos directamente en la instancia del worker: `worker.add_to_hot_skills("model_name")`.
+
+### Paso 10: Comprobaciones de Salud (Health Checks)
 
 Por defecto, el SDK inicia un pequeño servidor aiohttp en `0.0.0.0:8083`. Puede comprobar el estado del worker en `/health`.
 Esto es útil para Kubernetes (probas de Liveness/Readiness) o sistemas de monitoreo.

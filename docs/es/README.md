@@ -17,9 +17,13 @@ SDK oficial para construir trabajadores compatibles con el orquestador **Avtomat
   - **Habilidades en 3 Niveles:** *Supported* (catálogo), *Available* (límites dinámicos) y *Hot* (en caché).
   - **Stable Hashing:** Envía el catálogo completo solo cuando cambia, usando `skills_hash` para latidos ligeros.
 - **S3 Streaming:** Transferencia de datos de alto rendimiento usando `obstore`. Sin errores de OOM en archivos grandes.
-- **Hardware Awareness:** Monitoreo integrado de CPU, RAM y GPUs NVIDIA (vía `psutil` y `GPUtil`).
+- **Hardware Awareness:** Monitoreo integrado de CPU, RAM y GPUs NVIDIA (vía `psutil` и `GPUtil`).
+- **Observabilidad:**
+  - Soporte nativo para **OpenTelemetry** (trazas y métricas).
+  - Propagación automática del **Contexto de Rastreo**: Los trabajadores extraen el `trace_id` de las tareas e inyectan el contexto actualizado en los eventos (incluido el progreso), asegurando visibilidad de extremo a extremo en Jaeger/Honeycomb.
+  - Exportación automática de métricas vía OTLP (modelo Push) cuando se configura `OTEL_EXPORTER_OTLP_ENDPOINT`.
 
-## 🛡 Resiliencia y Conectividad
+## 🛡 Resiliencia и Conectividad
 
 - **Gestores Independientes:** La conexión a cada orquestador es gestionada por una tarea de fondo separada. El fallo de un servidor o un límite de velocidad (Rate Limit) no afecta a los demás.
 - **Backoff Inteligente:** Sistema unificado de retraso exponencial para registro, sondeo de tareas y latidos (heartbeats).
