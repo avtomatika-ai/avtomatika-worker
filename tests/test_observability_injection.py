@@ -7,6 +7,7 @@
 from unittest.mock import AsyncMock
 
 import pytest
+import rxon
 from rxon.models import TaskPayload
 
 from avtomatika_worker.observability import ObservabilityManager
@@ -30,7 +31,7 @@ async def test_observability_dependency_injection():
     client = AsyncMock()
     payload = TaskPayload(job_id="j1", task_id="t1", type="test-skill", params={}, tracing_context={})
 
-    task_data = payload._asdict()
+    task_data = rxon.to_dict(payload)
     task_data["client"] = client
 
     # Process task
@@ -62,7 +63,7 @@ async def test_observability_middleware_context():
 
     client = AsyncMock()
     payload = TaskPayload(job_id="j1", task_id="t1", type="test-skill", params={}, tracing_context={})
-    task_data = payload._asdict()
+    task_data = rxon.to_dict(payload)
     task_data["client"] = client
 
     await worker._process_task(task_data)

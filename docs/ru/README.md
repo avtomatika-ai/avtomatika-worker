@@ -13,10 +13,14 @@
   - Обязательная подпись HMAC SHA256 для всех сообщений при наличии `WORKER_TOKEN`.
   - Поддержка Identity Chain и Origin Worker ID для отслеживания происхождения данных.
   - Защита от повторных атак (Replay Protection) через временные метки.
-- **Оптимизация трафика:**
-  - **Трёхуровневые навыки:** *Supported* (каталог), *Available* (лимиты), *Hot* (кэшированные).
+- **Оптимизация трафика и производительности:**
+  - **Telemetry Throttling (Heartbeat Deadband):** Телеметрия ресурсов (CPU/RAM/GPU) отправляется только при изменении значений более чем на $\pm5\%$ или раз в 60 сек, существенно экономя трафик.
+  - **ETag-кэширование блобов:** Тяжелые файлы (например, веса ИИ-моделей) скачиваются из S3 один раз, кэшируются локально и связываются с рабочей папкой задачи через символические ссылки.
+  - **Фоновый uploader результатов:** Результаты отправляются через неблокирующую очередь `asyncio.Queue` с поддержкой ретриев при ошибках и Rate Limit, мгновенно освобождая воркер.
+  - **Трёхуровневые навыки:** _Supported_ (каталог), _Available_ (лимиты), _Hot_ (кэшированные).
   - **Stable Hashing:** Передача полного каталога навыков только при изменениях.
 - **S3 Streaming:** Высокопроизводительная потоковая передача данных через `obstore`. Никаких OOM на больших файлах.
+- **Интеграция с ИИ-агентами:** Поддержка цепочек вызовов (Tool Use / Chain of Thought) через внедрение зависимостей `OrchestratorClient`.
 - **Мониторинг железа:** Встроенный сбор метрик CPU, RAM и NVIDIA GPU (через `psutil` и `GPUtil`).
 - **Наблюдаемость (Observability):**
   - Встроенная поддержка **OpenTelemetry** (трассировка и метрики).
@@ -39,6 +43,7 @@ pip install avtomatika-worker[s3,pydantic]
 ```
 
 Для разработки:
+
 ```bash
 pip install -e .[test,dev]
 ```
@@ -46,7 +51,7 @@ pip install -e .[test,dev]
 ## 💻 Быстрый старт
 
 ```python
-from avtomatika_worker import Worker, TaskFiles
+from avtomatika_worker import Worker, TaskFiles, OrchestratorClient
 
 worker = Worker()
 
@@ -54,6 +59,12 @@ worker = Worker()
 async def my_skill(params: dict, files: TaskFiles):
     """Простой навык, который говорит привет."""
     return {"message": f"Привет, {params.get('name', 'Мир')}!"}
+
+@worker.skill("ai_agent_reasoning")
+async def agent_skill(params: dict, orchestrator_client: OrchestratorClient):
+    """Навык ИИ-агента, делегирующий подзадачу (Tool Use) через OrchestratorClient."""
+    search_result = await orchestrator_client.call_skill("web_search", {"query": params["search_query"]})
+    return {"result": f"На основе веб-поиска: {search_result['data']}"}
 
 @worker.on_command("reboot")
 async def handle_reboot(command):
@@ -66,10 +77,14 @@ if __name__ == "__main__":
 ## ⚙️ Конфигурация
 
 Управляется через переменные окружения:
+
 - `ORCHESTRATORS_CONFIG`: JSON-список конфигураций оркестраторов (URL, приоритеты, веса).
 - `ORCHESTRATOR_URL`: Простой URL оркестратора, если используется только один (по умолчанию: `http://localhost:8080`).
 - `WORKER_TOKEN`: Секретный ключ для HMAC-подписи (Zero Trust).
 - `S3_ENDPOINT_URL`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_DEFAULT_BUCKET`: Настройки S3 для передачи больших объёмов данных.
+- `WORKER_BLOB_CACHE_DIR`: Директория для кэширования S3 блобов (по умолчанию: `/tmp/avtomatika_cache`).
+- `WORKER_TELEMETRY_DEADBAND`: Порог (процент) изменения телеметрии для отправки (по умолчанию: `5.0`).
+- `WORKER_TELEMETRY_FORCE_INTERVAL`: Максимальный интервал ожидания перед отправкой неизменившейся телеметрии (по умолчанию: `60.0`).
 - `STRICT_EVENT_VALIDATION`: (По умолчанию: `True`) Проверка событий на соответствие схемам перед отправкой.
 - `LOG_LEVEL`: Уровень детализации логов (DEBUG, INFO, WARNING, ERROR).
 - `POLL_BACKOFF_INITIAL`: Начальная задержка после ошибки 429 или сетевого сбоя (по умолчанию: `1.0`). Учитывает заголовок `Retry-After`.

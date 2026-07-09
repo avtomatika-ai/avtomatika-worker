@@ -29,6 +29,13 @@ class DataclassWithValidation:
             raise ValueError("Must be at least 18")
 
 
+@dataclass
+class DataclassWithDefault:
+    name: str
+    active: bool = True
+    tag: str | None = None
+
+
 class PydanticModel(BaseModel):
     name: str
     value: float = Field(gt=0)
@@ -168,4 +175,34 @@ async def test_process_task_with_pydantic_validation_failure(mocker):
     client.send_result.assert_called_once()
     payload = client.send_result.call_args.args[0]
     assert payload.status == "failure"
-    assert "validation" in payload.error.message.lower()
+    assert "expected" in payload.error.message.lower() or "validation" in payload.error.message.lower()
+
+
+@pytest.mark.asyncio
+async def test_process_task_with_dataclass_defaults(mocker):
+    """Tests schema extraction for dataclasses with default and optional values."""
+    client = mocker.AsyncMock(spec=Transport)
+    worker = Worker()
+    received_params = None
+
+    @worker.skill("dataclass_default_task")
+    async def my_handler(params: DataclassWithDefault, **kwargs):
+        nonlocal received_params
+        received_params = params
+        return {"status": "success"}
+
+    # Pass only the required field
+    task_data = {
+        "job_id": "j1",
+        "task_id": "t1",
+        "type": "dataclass_default_task",
+        "params": {"name": "only_required"},
+        "tracing_context": {},
+        "client": client,
+    }
+    await worker._process_task(task_data)
+
+    assert isinstance(received_params, DataclassWithDefault)
+    assert received_params.name == "only_required"
+    assert received_params.active is True
+    assert received_params.tag is None

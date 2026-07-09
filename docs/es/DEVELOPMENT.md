@@ -9,24 +9,27 @@ Este documento describe cómo crear un Worker personalizado compatible con el Or
 ## Concepto Central
 
 Los Workers creados con el SDK implementan un modelo de interacción híbrido con el Orquestador:
+
 - **Modelo PULL para la Obtención de Tareas:** El worker inicia la conexión con el Orquestador y "tira" de las tareas de su cola personal. Esto permite que los Workers operen desde cualquier red (incluyendo detrás de NAT o firewalls corporativos) sin necesidad de una dirección IP pública.
 - **WebSocket para Comunicación en Tiempo Real:** Un canal bidireccional opcional para recibir comandos (ej., cancelación de tareas) y enviar el progreso de ejecución intermedio.
 - **Optimización HLN:** El SDK utiliza el protocolo **Reverse Axon (RXON)**, que reduce el tráfico mediante el hashing de listas de habilidades y el envío de actualizaciones solo cuando ocurren cambios.
-- **Robustez de Conexión:** 
-    - **Orquestadores Independientes:** Cada conexión con un orquestador es gestionada por una tarea separada. El fallo de un servidor no bloquea las comunicaciones con otros.
-    - **Reintentos de Registro:** Reintentos infinitos con retroceso exponencial si un orquestador está fuera de línea.
-    - **Inicio No Bloqueante:** El worker comienza a solicitar tareas tan pronto como se registra con éxito en al menos un orquestador.
+- **Robustez de Conexión:**
+  - **Orquestadores Independientes:** Cada conexión con un orquestador es gestionada por una tarea separada. El fallo de un servidor no bloquea las comunicaciones con otros.
+  - **Reintentos de Registro:** Reintentos infinitos con retroceso exponencial si un orquestador está fuera de línea.
+  - **Inicio No Bloqueante:** El worker comienza a solicitar tareas tan pronto como se registra con éxito en al menos un orquestador.
 
 ## Cómo Crear un Worker con el SDK
 
 ### Paso 1: Instalar `avtomatika-worker`
 
 Asegúrese de que el SDK esté instalado en su entorno. Recomendado para todas las funciones (S3 y Pydantic):
+
 ```bash
 pip install "avtomatika-worker[s3,pydantic,metrics]"
 ```
 
 Si está trabajando en el repositorio principal, puede instalarlo en modo editable:
+
 ```bash
 pip install -e .[dev]
 ```
@@ -55,7 +58,7 @@ class ReportParams(BaseModel):
 @worker.skill(description="Genera informes complejos")
 async def generate_report(params: ReportParams, send_progress, send_event, **kwargs) -> dict:
     """
-    - `params` (ReportParams): Parámetros validados y tipados. 
+    - `params` (ReportParams): Parámetros validados y tipados.
       IMPORTANTE: El argumento DEBE llamarse 'params' para que funcione la inferencia automática de esquemas.
     - `send_progress`: Función asíncrona para enviar actualizaciones de progreso.
     - `send_event`: Función asíncrona para emitir eventos personalizados.
@@ -67,7 +70,7 @@ async def generate_report(params: ReportParams, send_progress, send_event, **kwa
 
     # Enviar progreso (evento estándar)
     await send_progress(progress=0.5, message="Procesando datos...")
-    
+
     # Enviar evento personalizado
     await send_event("milestone", {"name": "data_parsed"})
 
@@ -139,15 +142,16 @@ POLL_BACKOFF_FACTOR=2.0     # Multiplicador para cada reintento
 ### Paso 5: Comunicación en Tiempo Real (WebSocket)
 
 Para habilitar esta funcionalidad, configure `WORKER_ENABLE_WEBSOCKETS=true`. Esto le permite:
+
 1.  **Enviar Progreso y Eventos:** Use las funciones inyectadas `send_progress` y `send_event`.
 2.  **Cancelación de Tareas:** El Orquestador puede enviar un comando que lanzará instantáneamente un `asyncio.CancelledError` en su manejador.
-
 
 ### Paso 6: Habilidades Modulares (SkillBlueprint)
 
 Organice las tareas en módulos en el directorio `skills/`.
 
 `skills/image_skills.py`:
+
 ```python
 from avtomatika_worker import SkillBlueprint
 from pydantic import BaseModel
@@ -180,15 +184,16 @@ from avtomatika_worker import Worker, TaskFiles
 async def process_video(params: dict, files: TaskFiles):
     # 'video_url' en params podría ser un URI de S3, ahora reemplazado con la ruta local
     local_path = params["video_url"]
-    
+
     # Crear archivo de resultado
     result_path = await files.path_to("output.mp4")
     # ... procesar ...
-    
+
     return {"status": "success", "data": {"result": result_path}}
 ```
 
 #### Configuración de S3
+
 - `S3_ENDPOINT_URL`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_DEFAULT_BUCKET`.
 - `TASK_FILES_DIR`: Raíz local para datos temporales (por defecto: `/tmp/payloads`).
 
@@ -223,7 +228,6 @@ async def monitored_task(params: dict, obs: ObservabilityManager):
 
 Habilítelo a través de la variable de entorno: `WORKER_ENABLE_METRICS=true`.
 
-
 ### Paso 9: Gestión Dinámica de Habilidades (Hot Skills)
 
 En escenarios de alto rendimiento (por ejemplo, inferencia de modelos de IA), puede ser útil que el Orquestador sepa qué habilidades están "hot" (ya cargadas en la memoria de la GPU o en el caché). Esto permite una ejecución instantánea de tareas sin retrasos de carga.
@@ -235,11 +239,11 @@ El SDK proporciona las funciones `add_to_hot_skills` y `remove_from_hot_skills` 
 async def heavy_ai_task(params: dict, add_to_hot_skills, **kwargs):
     # 1. Cargue su modelo si es necesario
     model = await load_model("my_large_model")
-    
+
     # 2. Marque este recurso o nombre de habilidad como 'hot'
     # Esto se enviará en el próximo heartbeat al Orquestador
     add_to_hot_skills("my_large_model")
-    
+
     # 3. Procesar
     return {"status": "success"}
 ```
@@ -249,6 +253,27 @@ También puede usar estos métodos directamente en la instancia del worker: `wor
 ### Paso 10: Comprobaciones de Salud (Health Checks)
 
 Por defecto, el SDK inicia un pequeño servidor aiohttp en `0.0.0.0:8083`. Puede comprobar el estado del worker en `/health`.
-Esto es útil para Kubernetes (probas de Liveness/Readiness) o sistemas de monitoreo.
+Esto es útil para Kubernetes (pruebas de Liveness/Readiness) o sistemas de monitoreo.
+
 - Variable: `WORKER_PORT` (por defecto: 8083)
 - Bandera CLI: `--health-check` (habilitada por defecto)
+
+### Paso 11: Uso de Herramientas por Agentes de IA (Delegación de Subtareas)
+
+Para los agentes de IA que realizan razonamientos complejos, puede solicitar la ejecución de otras habilidades (herramientas) al orquestador y esperar sus resultados directamente en el código del manejador.
+
+Solicite la inyección de la dependencia `OrchestratorClient` en la firma de su manejador:
+
+```python
+from avtomatika_worker import Worker, OrchestratorClient
+
+@worker.skill()
+async def agent_reasoning(params: dict, orchestrator_client: OrchestratorClient):
+    # Delegar una subtarea (llamada a herramienta) al orquestador
+    subtask_result = await orchestrator_client.call_skill(
+        skill_name="web_search",
+        params={"query": "últimas noticias sobre IA"}
+    )
+    # Continuar el razonamiento utilizando el resultado de la herramienta
+    return {"final_answer": f"Resultado de la búsqueda: {subtask_result['data']}"}
+```

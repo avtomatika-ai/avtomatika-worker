@@ -13,11 +13,15 @@ SDK oficial para construir trabajadores compatibles con el orquestador **Avtomat
   - Firma HMAC SHA256 obligatoria para todos los mensajes con `WORKER_TOKEN`.
   - Soporte para Identity Chain y Origin Worker ID para rastreo de procedencia.
   - Protección contra ataques de repetición mediante validación de marcas de tiempo.
-- **Optimización de Tráfico:**
-  - **Habilidades en 3 Niveles:** *Supported* (catálogo), *Available* (límites dinámicos) y *Hot* (en caché).
+- **Optimización de Tráfico y Rendimiento:**
+  - **Telemetry Throttling (Heartbeat Deadband):** La telemetría de recursos (CPU/RAM/GPU) solo se envía cuando el valor cambia en $>5\%$ o tras un intervalo forzado de 60s, reduciendo drásticamente el uso de ancho de banda.
+  - **ETag-Based Blob Caching:** Los archivos grandes (por ejemplo, pesos de modelos de IA) se descargan de S3 una sola vez, se guardan en caché local y se enlazan al espacio de trabajo de la tarea mediante enlaces simbólicos.
+  - **Subida de Resultados Asíncrona:** Los resultados se envían mediante una cola no bloqueante `asyncio.Queue` con soporte para reintentos y Rate Limit, liberando inmediatamente al trabajador.
+  - **Habilidades en 3 Niveles:** _Supported_ (catálogo), _Available_ (límites dinámicos) y _Hot_ (en caché).
   - **Stable Hashing:** Envía el catálogo completo solo cuando cambia, usando `skills_hash` para latidos ligeros.
 - **S3 Streaming:** Transferencia de datos de alto rendimiento usando `obstore`. Sin errores de OOM en archivos grandes.
-- **Hardware Awareness:** Monitoreo integrado de CPU, RAM y GPUs NVIDIA (vía `psutil` и `GPUtil`).
+- **Soporte para Agentes de IA:** Soporte para Chain of Thought y Tool Use mediante la inyección de dependencias `OrchestratorClient` para delegar subtareas.
+- **Hardware Awareness:** Monitoreo integrado de CPU, RAM y GPUs NVIDIA (vía `psutil` y `GPUtil`).
 - **Observabilidad:**
   - Soporte nativo para **OpenTelemetry** (trazas y métricas).
   - Propagación automática del **Contexto de Rastreo**: Los trabajadores extraen el `trace_id` de las tareas e inyectan el contexto actualizado en los eventos (incluido el progreso), asegurando visibilidad de extremo a extremo en Jaeger/Honeycomb.
@@ -39,6 +43,7 @@ pip install avtomatika-worker[s3,pydantic]
 ```
 
 Para desarrollo:
+
 ```bash
 pip install -e .[test,dev]
 ```
@@ -46,7 +51,7 @@ pip install -e .[test,dev]
 ## 💻 Inicio Rápido
 
 ```python
-from avtomatika_worker import Worker, TaskFiles
+from avtomatika_worker import Worker, TaskFiles, OrchestratorClient
 
 worker = Worker()
 
@@ -54,6 +59,12 @@ worker = Worker()
 async def mi_habilidad(params: dict, files: TaskFiles):
     """Habilidad simple que dice hola."""
     return {"message": f"¡Hola, {params.get('nombre', 'Mundo')}!"}
+
+@worker.skill("ai_agent_reasoning")
+async def agent_skill(params: dict, orchestrator_client: OrchestratorClient):
+    """Habilidad de agente de IA que delega una subtarea (Tool Use) a través de OrchestratorClient."""
+    search_result = await orchestrator_client.call_skill("web_search", {"query": params["search_query"]})
+    return {"result": f"Basado en búsqueda web: {search_result['data']}"}
 
 @worker.on_command("reiniciar")
 async def manejar_reinicio(comando):
@@ -66,10 +77,14 @@ if __name__ == "__main__":
 ## ⚙️ Configuración
 
 Controlada mediante variables de entorno:
+
 - `ORCHESTRATORS_CONFIG`: Lista JSON de configuraciones de orquestadores (URL, prioridades, pesos).
 - `ORCHESTRATOR_URL`: URL simple del orquestador si solo se usa uno (por defecto: `http://localhost:8080`).
 - `WORKER_TOKEN`: Secreto para firma HMAC (Zero Trust).
 - `S3_ENDPOINT_URL`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_DEFAULT_BUCKET`: Ajustes de almacenamiento S3 para transferencias de datos grandes.
+- `WORKER_BLOB_CACHE_DIR`: Directorio para caché de blobs S3 (por defecto: `/tmp/avtomatika_cache`).
+- `WORKER_TELEMETRY_DEADBAND`: Umbral (porcentaje) para envío de telemetría (por defecto: `5.0`).
+- `WORKER_TELEMETRY_FORCE_INTERVAL`: Intervalo de tiempo máximo (segundos) para enviar telemetría aunque no haya cambios (por defecto: `60.0`).
 - `STRICT_EVENT_VALIDATION`: (Por defecto: `True`) Valida eventos contra esquemas antes de emitirlos.
 - `LOG_LEVEL`: Nivel de detalle de los logs (DEBUG, INFO, WARNING, ERROR).
 - `POLL_BACKOFF_INITIAL`: Retraso inicial después de un error 429 o fallo de red (por defecto: `1.0`). Respeta el encabezado `Retry-After`.

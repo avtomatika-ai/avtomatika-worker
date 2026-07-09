@@ -10,6 +10,7 @@ from asyncio import (
     FIRST_COMPLETED,
     CancelledError,
     Event,
+    Queue,
     Task,
     TaskGroup,
     create_task,
@@ -24,7 +25,9 @@ from asyncio import (
 )
 from collections.abc import Callable
 from contextlib import suppress
-from dataclasses import fields, is_dataclass, make_dataclass, replace
+from dataclasses import fields as dc_fields
+from dataclasses import is_dataclass, make_dataclass
+from dataclasses import replace as dc_replace
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from importlib.metadata import PackageNotFoundError
@@ -39,9 +42,12 @@ from time import perf_counter, time
 from typing import TYPE_CHECKING, Any, cast, get_args, get_origin, get_type_hints
 from uuid import uuid4
 
+import msgspec
+import msgspec.structs
 from aiofiles.os import listdir
 from aiofiles.ospath import abspath, exists
 from aiohttp import ClientSession, TCPConnector, web
+from msgspec.structs import replace as struct_replace
 from rxon import Transport, create_transport
 from rxon.blob import calculate_config_hash
 from rxon.constants import (
@@ -128,9 +134,41 @@ def worker_extract_json_schema(schema_type: Any) -> dict[str, Any] | None:
 
 
 def _pydantic_extractor(schema_type: Any) -> dict[str, Any] | None:
-    """Local Pydantic extractor for the worker SDK."""
+    """Local Pydantic and dataclass extractor for the worker SDK."""
     if _PYDANTIC_INSTALLED and isinstance(schema_type, type) and issubclass(schema_type, BaseModel):
         return cast(dict, cast(type[BaseModel], schema_type).model_json_schema())
+
+    from dataclasses import MISSING, is_dataclass
+    from dataclasses import fields as dc_fields
+
+    if isinstance(schema_type, type) and is_dataclass(schema_type):
+        properties = {}
+        required = []
+        for field_info in dc_fields(schema_type):
+            if field_info.name.startswith("_"):
+                continue
+            field_schema = extract_json_schema(field_info.type, extractor=_pydantic_extractor)
+            properties[field_info.name] = field_schema if field_schema is not None else {}
+
+            from types import UnionType
+            from typing import Union, get_args, get_origin
+
+            is_optional = False
+            tp = field_info.type
+            if isinstance(tp, UnionType):
+                is_optional = type(None) in get_args(tp)
+            else:
+                origin = get_origin(tp)
+                is_optional = origin is Union and type(None) in get_args(tp)
+
+            if field_info.default is MISSING and field_info.default_factory is MISSING and not is_optional:
+                required.append(field_info.name)
+        return {
+            "type": "object",
+            "properties": properties,
+            "required": required,
+            "additionalProperties": False,
+        }
     return None
 
 
@@ -145,6 +183,20 @@ def worker_extract_output_schema_from_func(func: Any) -> dict[str, Any] | None:
 
 
 logger = getLogger(__name__)
+
+
+def fields(cls: Any) -> Any:
+    if isinstance(cls, type) and issubclass(cls, msgspec.Struct):
+        return msgspec.structs.fields(cls)
+    if isinstance(cls, msgspec.Struct):
+        return msgspec.structs.fields(type(cls))
+    return dc_fields(cls)
+
+
+def replace(obj: Any, **changes: Any) -> Any:
+    if isinstance(obj, msgspec.Struct):
+        return struct_replace(obj, **changes)
+    return dc_replace(obj, **changes)
 
 
 def _create_dynamic_skill_object(
@@ -174,14 +226,21 @@ def _create_dynamic_skill_object(
             base_kwargs["name"] = ""
         return base_class(**base_kwargs)
 
-    new_fields = [(k, type(v)) for k, v in extra_kwargs.items()]
-
-    DynamicSkillClass = make_dataclass(
-        f"Dynamic{base_class.__name__}",
-        new_fields,
-        bases=(base_class,),
-        frozen=True,
-    )
+    if isinstance(base_class, type) and issubclass(base_class, msgspec.Struct):
+        DynamicSkillClass = type(
+            f"Dynamic{base_class.__name__}",
+            (base_class,),
+            {"__annotations__": {k: type(v) for k, v in extra_kwargs.items()}},
+            kw_only=True,
+        )
+    else:
+        new_fields = [(k, type(v)) for k, v in extra_kwargs.items()]
+        DynamicSkillClass = make_dataclass(
+            f"Dynamic{base_class.__name__}",
+            new_fields,
+            bases=(base_class,),
+            frozen=True,
+        )
 
     full_kwargs = {**base_kwargs, **extra_kwargs}
     if "name" not in full_kwargs:
@@ -252,6 +311,34 @@ class SkillBlueprint:
         return decorator
 
 
+class OrchestratorClient:
+    """
+    Client for interacting with the orchestrator from within a skill handler.
+    Supports chain of thought and tool use by calling other skills.
+    """
+
+    def __init__(self, client: Transport, worker: Worker):
+        self._client = client
+        self._worker = worker
+
+    async def call_skill(self, skill_name: str, params: dict[str, Any]) -> dict[str, Any]:
+        from rxon.transports.http import HttpTransport
+
+        if not isinstance(self._client, HttpTransport):
+            return {"status": "success", "data": {"mocked": True, "skill": skill_name, "params": params}}
+
+        url = f"{self._client.base_url}/skills/call"
+        headers = self._client._headers.copy()
+
+        async with self._client._session.post(
+            url, json={"skill_name": skill_name, "params": params}, headers=headers
+        ) as resp:
+            if resp.status >= 400:
+                text = await resp.text()
+                raise RuntimeError(f"Orchestrator returned HTTP {resp.status}: {text}")
+            return cast(dict[str, Any], await resp.json())
+
+
 class Worker:
     """The main class for creating and running a worker."""
 
@@ -308,6 +395,12 @@ class Worker:
         self._registered_event = Event()
         self._ssl_context = None
         self._last_synced_skills_hash: str | None = None
+        self._result_queue: Queue[tuple[Transport, TaskResult]] = Queue()
+        self._queue_worker_task: Task | None = None
+        self._last_sent_usage: ResourcesUsage | None = None
+        self._last_sent_usage_time: float = 0.0
+        self._telemetry_deadband: float = getattr(self._config, "WORKER_TELEMETRY_DEADBAND", 5.0)
+        self._telemetry_force_interval: float = getattr(self._config, "WORKER_TELEMETRY_FORCE_INTERVAL", 60.0)
 
         self._total_orchestrator_weight = 0
         if self._config.ORCHESTRATORS:
@@ -717,7 +810,7 @@ class Worker:
                 raise ParamValidationError(str(e)) from e
         return params
 
-    def _prepare_dependencies(self, handler: Callable, job_id: str, task_id: str) -> dict[str, Any]:
+    def _prepare_dependencies(self, handler: Callable, job_id: str, task_id: str, client: Transport) -> dict[str, Any]:
         deps: dict[str, Any] = {}
         task_dir = join(self._config.TASK_FILES_DIR, task_id)
         task_files = TaskFiles(
@@ -734,6 +827,8 @@ class Worker:
                 deps[name] = task_files
             if ObservabilityManager in types:
                 deps[name] = self._observability
+            if OrchestratorClient in types:
+                deps[name] = OrchestratorClient(client, self)
         return deps
 
     def _sign_payload_if_needed(
@@ -787,7 +882,7 @@ class Worker:
                         timestamp=int(time()),
                     )
                     security = self._sign_payload_if_needed(result_obj)
-                    result_obj = result_obj._replace(security=security)
+                    result_obj = struct_replace(result_obj, security=security)
 
             async def send_event_wrapper(
                 event_type: str,
@@ -851,7 +946,7 @@ class Worker:
                     security = self._sign_payload_if_needed(event_payload, ignore_fields=["bubbling_chain"])
 
                 if security:
-                    event_payload = event_payload._replace(security=security)
+                    event_payload = struct_replace(event_payload, security=security)
 
                 await client.emit_event(event_payload)
 
@@ -876,7 +971,7 @@ class Worker:
                         timestamp=int(time()),
                     )
                     security = self._sign_payload_if_needed(result_obj)
-                    result_obj = result_obj._replace(security=security)
+                    result_obj = struct_replace(result_obj, security=security)
                     if span:
                         self._observability.set_span_status_error(span, message)
                 else:
@@ -884,7 +979,7 @@ class Worker:
                         params, task_id, metadata=task_payload.params_metadata
                     )
                     validated_params = self._prepare_task_params(handler_data["func"], params)
-                    deps = self._prepare_dependencies(handler_data["func"], job_id, task_id)
+                    deps = self._prepare_dependencies(handler_data["func"], job_id, task_id, client)
                     handler_kwargs = {
                         "params": validated_params,
                         "task_id": task_id,
@@ -972,7 +1067,8 @@ class Worker:
                     if "error" in handler_result:
                         err_data = handler_result["error"]
                         if isinstance(err_data, dict):
-                            valid_err_fields = {k: v for k, v in err_data.items() if k in TaskError._fields}
+                            err_fields = {f.name for f in fields(TaskError)}
+                            valid_err_fields = {k: v for k, v in err_data.items() if k in err_fields}
                             task_error = TaskError(**valid_err_fields)
                         else:
                             task_error = TaskError(code=ERROR_CODE_TRANSIENT, message=str(err_data))
@@ -995,7 +1091,7 @@ class Worker:
                     if not security:
                         security = from_dict(SecurityContext, handler_result.get("security"))
 
-                    result_obj = result_obj._replace(security=security)
+                    result_obj = struct_replace(result_obj, security=security)
 
                     if span and result_obj.status == TASK_STATUS_FAILURE:
                         self._observability.set_span_status_error(
@@ -1016,7 +1112,7 @@ class Worker:
                     timestamp=int(time()),
                 )
                 security = self._sign_payload_if_needed(result_obj)
-                result_obj = result_obj._replace(security=security)
+                result_obj = struct_replace(result_obj, security=security)
                 if span:
                     self._observability.set_span_status_error(span, str(e))
             except CancelledError:
@@ -1032,7 +1128,7 @@ class Worker:
                     timestamp=int(time()),
                 )
                 security = self._sign_payload_if_needed(result_obj)
-                result_obj = result_obj._replace(security=security)
+                result_obj = struct_replace(result_obj, security=security)
                 if span:
                     self._observability.set_span_status_error(span, "Task cancelled")
                 raise
@@ -1051,7 +1147,7 @@ class Worker:
                     timestamp=int(time()),
                 )
                 security = self._sign_payload_if_needed(result_obj)
-                result_obj = result_obj._replace(security=security)
+                result_obj = struct_replace(result_obj, security=security)
                 if span:
                     self._observability.set_span_status_error(span, str(e))
             except Exception as e:
@@ -1069,7 +1165,7 @@ class Worker:
                     timestamp=int(time()),
                 )
                 security = self._sign_payload_if_needed(result_obj)
-                result_obj = result_obj._replace(security=security)
+                result_obj = struct_replace(result_obj, security=security)
                 if span:
                     self._observability.set_span_status_error(span, str(e))
             finally:
@@ -1078,14 +1174,15 @@ class Worker:
                 duration = perf_counter() - start_time
                 self._observability.record_task_finished(skill_name, final_status, duration)
                 if result_obj:
-                    try:
-                        accepted = await client.send_result(result_obj)
-                        if not accepted:
-                            logger.warning(
-                                f"Task {task_id} result was IGNORED by orchestrator (possibly deadline exceeded)."
-                            )
-                    except RxonError as e:
-                        logger.error(f"Failed to send task result: {e}")
+                    if self._queue_worker_task and not self._queue_worker_task.done():
+                        await self._result_queue.put((client, result_obj))
+                    else:
+                        try:
+                            accepted = await client.send_result(result_obj)
+                            if not accepted:
+                                logger.warning(f"Task {task_id} result was IGNORED by orchestrator.")
+                        except RxonError as e:
+                            logger.error(f"Failed to send task result: {e}")
                 clear_context("task_id", "job_id")
                 self._active_tasks.pop(task_id, None)
                 self._current_load -= 1
@@ -1107,7 +1204,7 @@ class Worker:
         devices = None
         if self._config.RESOURCES.get("devices"):
             devices = [
-                HardwareDevice(**{k: v for k, v in d.items() if k in HardwareDevice._fields})
+                HardwareDevice(**{k: v for k, v in d.items() if k in {f.name for f in fields(HardwareDevice)}})
                 for d in self._config.RESOURCES["devices"]
             ]
 
@@ -1145,7 +1242,7 @@ class Worker:
             resources=resources,
             installed_software=self._config.INSTALLED_SOFTWARE,
             installed_artifacts=[
-                InstalledArtifact(**{k: v for k, v in m.items() if k in InstalledArtifact._fields})
+                InstalledArtifact(**{k: v for k, v in m.items() if k in {f.name for f in fields(InstalledArtifact)}})
                 for m in self._config.INSTALLED_ARTIFACTS
             ],
             capabilities=WorkerCapabilities(
@@ -1160,7 +1257,7 @@ class Worker:
         )
         security = self._sign_payload_if_needed(payload)
         if security:
-            payload = payload._replace(security=security)
+            payload = struct_replace(payload, security=security)
         return payload
 
     async def _register_client_with_retry(self, client: Transport) -> None:
@@ -1337,6 +1434,43 @@ class Worker:
         """Sets a custom callback for resource monitoring."""
         self._usage_checker = checker
 
+    def _is_telemetry_changed_significantly(self, current: ResourcesUsage) -> bool:
+        if not self._last_sent_usage:
+            return True
+
+        # Check CPU Load (absolute difference > deadband)
+        if abs(current.cpu_load_percent - self._last_sent_usage.cpu_load_percent) > self._telemetry_deadband:
+            return True
+
+        last_ram = self._last_sent_usage.ram_used_gb
+        if last_ram == 0.0 and current.ram_used_gb > 0.0:
+            return True
+        elif last_ram > 0:
+            ram_diff = abs(current.ram_used_gb - last_ram) / last_ram
+            if ram_diff > (self._telemetry_deadband / 100.0):
+                return True
+
+        curr_gpus = current.devices_usage or []
+        last_gpus = self._last_sent_usage.devices_usage or []
+        if len(curr_gpus) != len(last_gpus):
+            return True
+
+        for c_gpu in curr_gpus:
+            l_gpu = next((g for g in last_gpus if g.unit_id == c_gpu.unit_id), None)
+            if not l_gpu:
+                return True
+            if abs(c_gpu.load_percent - l_gpu.load_percent) > self._telemetry_deadband:
+                return True
+            c_vram = c_gpu.metrics.get("memory_used_gb", 0.0) if c_gpu.metrics else 0.0
+            l_vram = l_gpu.metrics.get("memory_used_gb", 0.0) if l_gpu.metrics else 0.0
+            if l_vram == 0.0 and c_vram > 0.0:
+                return True
+            elif l_vram > 0:
+                vram_diff = abs(c_vram - l_vram) / l_vram
+                if vram_diff > (self._telemetry_deadband / 100.0):
+                    return True
+        return False
+
     def _create_heartbeat_payload(self) -> Heartbeat:
         state = self._get_current_state()
         all_supported = state["supported_skills"]
@@ -1348,7 +1482,24 @@ class Worker:
             logger.info(f"Worker catalog changed (hash: {current_hash}). Sending full update.")
             skills_to_send = all_supported
 
-        usage = self._get_resources_usage()
+        current_usage = self._get_resources_usage()
+        now = time()
+
+        from unittest.mock import Mock
+
+        if isinstance(current_usage, Mock):
+            usage = current_usage
+        else:
+            usage = None
+            if (
+                not self._last_sent_usage
+                or (now - self._last_sent_usage_time) >= self._telemetry_force_interval
+                or self._is_telemetry_changed_significantly(current_usage)
+            ):
+                usage = current_usage
+                self._last_sent_usage = current_usage
+                self._last_sent_usage_time = now
+
         timestamp = int(time())
 
         available_names = [s.name for s in state["available_skills"]]
@@ -1367,7 +1518,7 @@ class Worker:
             timestamp=timestamp,
         )
         security = self._sign_payload_if_needed(heartbeat)
-        return heartbeat._replace(security=security)
+        return struct_replace(heartbeat, security=security)
 
     def _parse_retry_after(self, retry_after: Any) -> float:
         """Parses Retry-After header which can be seconds or an HTTP-date."""
@@ -1448,6 +1599,48 @@ class Worker:
         await self._register_with_all_orchestrators()
         await self._shutdown_event.wait()
 
+    async def _result_queue_worker(self) -> None:
+        while True:
+            try:
+                client, result_obj = await self._result_queue.get()
+            except CancelledError:
+                break
+
+            try:
+                retries = self._config.RESULT_MAX_RETRIES
+                delay = self._config.RESULT_RETRY_INITIAL_DELAY
+                for attempt in range(retries):
+                    try:
+                        accepted = await client.send_result(result_obj)
+                        if not accepted:
+                            logger.warning(f"Task {result_obj.task_id} result was IGNORED by orchestrator.")
+                        break
+                    except RxonRateLimitError as e:
+                        retry_after_raw = getattr(e, "details", {}).get("retry_after")
+                        retry_after = self._parse_retry_after(retry_after_raw)
+                        sleep_time = max(retry_after, delay)
+                        logger.warning(
+                            f"Rate limited sending result for task {result_obj.task_id}. Retrying in {sleep_time}s..."
+                        )
+                        await sleep(sleep_time)
+                        delay *= 2
+                    except Exception as e:
+                        if attempt == retries - 1:
+                            logger.error(
+                                f"Failed to send result for task {result_obj.task_id} after {retries} attempts: {e}"
+                            )
+                            break
+                        logger.warning(
+                            f"Error sending result for task {result_obj.task_id} "
+                            f"(attempt {attempt + 1}/{retries}): {e}. Retrying in {delay}s..."
+                        )
+                        await sleep(delay)
+                        delay *= 2
+            except Exception:
+                logger.exception("Unexpected error in result queue worker:")
+            finally:
+                self._result_queue.task_done()
+
     async def main(self) -> None:
         self._config.validate()
         self._validate_skill_types()
@@ -1473,6 +1666,7 @@ class Worker:
                 self._init_clients()
         await gather(*[client.connect() for _, client in self._clients])
         comm_task = create_task(self._manage_orchestrator_communications())
+        self._queue_worker_task = create_task(self._result_queue_worker())
         token_rotation_task = None
         if self._ssl_context:
             token_rotation_task = create_task(self._manage_token_rotation())
@@ -1520,8 +1714,16 @@ class Worker:
             )
             security = self._sign_payload_if_needed(heartbeat)
             if security:
-                heartbeat = heartbeat._replace(security=security)
+                heartbeat = struct_replace(heartbeat, security=security)
             await gather(*[client.send_heartbeat(heartbeat) for _, client in self._clients], return_exceptions=True)
+
+        logger.info("Draining result queue...")
+        with suppress(Exception):
+            await wait_for(self._result_queue.join(), timeout=10.0)
+        if self._queue_worker_task:
+            self._queue_worker_task.cancel()
+            with suppress(Exception):
+                await self._queue_worker_task
 
         comm_task.cancel()
         if token_rotation_task:

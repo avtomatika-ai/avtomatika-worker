@@ -13,10 +13,14 @@ Official SDK for building workers compatible with the **Avtomatika** orchestrato
   - Mandatory HMAC SHA256 signing for all messages using `WORKER_TOKEN`.
   - Identity Chain and Origin Worker ID support for provenance tracking.
   - Replay protection with timestamp validation.
-- **Traffic Optimization:**
-  - **3-Tier Skills:** *Supported* (catalog), *Available* (dynamic limits), and *Hot* (cached).
+- **Traffic & Performance Optimization:**
+  - **Telemetry Throttling (Heartbeat Deadband):** Telemetry (CPU/RAM/GPU) is only sent when value changes by $>5\%$ or after 60s force interval, drastically saving bandwidth.
+  - **ETag-Based Blob Caching:** Heavy assets (e.g. AI model weights) are downloaded only once, cached locally, and symlinked to tasks' workspace.
+  - **Async Results Uploader:** Task results are sent using a non-blocking `asyncio.Queue` with retry policy, rate limiting wait times, and backoff, instantly freeing the worker for the next task.
+  - **3-Tier Skills:** _Supported_ (catalog), _Available_ (dynamic limits), and _Hot_ (cached).
   - **Stable Hashing:** Sends full skill catalog only when changed, using `skills_hash` for light heartbeats.
 - **S3 Streaming:** High-performance data transfer using `obstore`. No OOM on large files.
+- **AI-Agent Support:** Supports Chain of Thought and Tool Use via `OrchestratorClient` dependency injection for subtask delegation.
 - **Hardware Awareness:** Built-in monitoring for CPU, RAM, and NVIDIA GPUs (via `psutil` and `GPUtil`).
 - **Observability:**
   - Built-in support for **OpenTelemetry** (traces and metrics).
@@ -39,6 +43,7 @@ pip install avtomatika-worker[s3,pydantic]
 ```
 
 For development:
+
 ```bash
 pip install -e .[test,dev]
 ```
@@ -46,7 +51,7 @@ pip install -e .[test,dev]
 ## 💻 Quick Start
 
 ```python
-from avtomatika_worker import Worker, TaskFiles
+from avtomatika_worker import Worker, TaskFiles, OrchestratorClient
 
 worker = Worker()
 
@@ -54,6 +59,12 @@ worker = Worker()
 async def my_skill(params: dict, files: TaskFiles):
     """Simple skill that says hello."""
     return {"message": f"Hello, {params.get('name', 'World')}!"}
+
+@worker.skill("ai_agent_reasoning")
+async def agent_skill(params: dict, orchestrator_client: OrchestratorClient):
+    """AI agent skill delegating a subtask (tool use) via OrchestratorClient."""
+    search_result = await orchestrator_client.call_skill("web_search", {"query": params["search_query"]})
+    return {"result": f"Based on web search: {search_result['data']}"}
 
 @worker.on_command("reboot")
 async def handle_reboot(command):
@@ -66,10 +77,14 @@ if __name__ == "__main__":
 ## ⚙️ Configuration
 
 Controlled via environment variables:
+
 - `ORCHESTRATORS_CONFIG`: JSON list of orchestrator configs (URLs, priorities, weights).
 - `ORCHESTRATOR_URL`: Simple fallback if only one orchestrator is used (default: `http://localhost:8080`).
 - `WORKER_TOKEN`: Secret for HMAC signing (Zero Trust).
 - `S3_ENDPOINT_URL`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_DEFAULT_BUCKET`: Storage settings for large payloads.
+- `WORKER_BLOB_CACHE_DIR`: Directory for caching S3 blobs (default: `/tmp/avtomatika_cache`).
+- `WORKER_TELEMETRY_DEADBAND`: Threshold (percent) for throttling telemetry updates (default: `5.0`).
+- `WORKER_TELEMETRY_FORCE_INTERVAL`: Maximum time (seconds) to wait before sending telemetry even if unchanged (default: `60.0`).
 - `STRICT_EVENT_VALIDATION`: (Default: `True`) Validates events against schemas before emitting.
 - `LOG_LEVEL`: Logging verbosity (DEBUG, INFO, WARNING, ERROR).
 - `POLL_BACKOFF_INITIAL`: Initial delay (seconds) after a 429 error or network failure (default: `1.0`). Honors `Retry-After` header.

@@ -8,9 +8,9 @@
 
 1. Clone el repositorio y navegue hasta este directorio.
 2. Instale las dependencias de desarrollo:
-    ```bash
-    pip install -e .[dev]
-    ```
+   ```bash
+   pip install -e .[dev]
+   ```
 
 ## Control de Calidad
 
@@ -28,6 +28,7 @@ mypy src/avtomatika_worker
 ## Pruebas
 
 Ejecute las pruebas específicas del worker:
+
 ```bash
 pytest
 ```

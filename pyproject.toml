@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "avtomatika-worker"
-version = "1.0b17"
+version = "1.0b18"
 description = "Worker SDK for the Avtomatika orchestrator."
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [
-    {name = "Dmitrii Gagarin", email = "madgagarin@gmail.com"},
+    {name = "Dmitrii Gagarin aka madgagarin", email = "madgagarin@gmail.com"},
 ]
 keywords = ["worker", "sdk", "orchestrator", "distributed", "task-queue", "rxon", "hln"]
 classifiers = [
@@ -21,8 +21,8 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "rxon==1.0b13",
-    "aiohttp~=3.14.0",
+    "rxon==1.0b14",
+    "aiohttp~=3.14.1",
     "python-json-logger~=4.1.0",
     "aiofiles~=25.1.0",
     "orjson~=3.11.9",
@@ -32,21 +32,21 @@ dependencies = [
 worker = "avtomatika_worker.__main__:main"
 
 [project.optional-dependencies]
-s3 = ["obstore~=0.10.0"]
+s3 = ["obstore~=0.11.0"]
 pydantic = ["pydantic~=2.13.4"]
 metrics = [
-    "opentelemetry-api~=1.30.0",
-    "opentelemetry-sdk~=1.30.0",
+    "opentelemetry-api~=1.43.0",
+    "opentelemetry-sdk~=1.43.0",
+    "opentelemetry-exporter-otlp~=1.43.0",
     "opentelemetry-semantic-conventions~=0.50b0",
-    "opentelemetry-exporter-otlp~=1.30.0",
 ]
 test = [
-    "avtomatika-worker[s3,pydantic]",
-    "pytest",
-    "pytest-asyncio",
-    "aioresponses",
+    "avtomatika-worker[s3,pydantic,metrics]",
+    "pytest~=9.1.0",
+    "pytest-asyncio~=1.4.0",
+    "aioresponses~=0.7.9",
     "pytest-mock",
-    "types-aiofiles",
+    "types-aiofiles~=25.1.0.20260518",
 ]
 dev = [
     "avtomatika-worker[test]",
@@ -80,7 +80,8 @@ target-version = "py311"
 line-length = 120
 
 [tool.ruff.lint]
-select = ["E", "W", "F", "I", "B", "A", "SIM", "C4", "PLC2401", "UP", "TID", "E402"]
+select = ["E", "W", "F", "I", "B", "A", "SIM", "C4", "PLC", "UP", "TID", "E402"]
+ignore = ["PLC0415"]
 
 [tool.ruff.lint.flake8-tidy-imports]
 ban-relative-imports = "parents"

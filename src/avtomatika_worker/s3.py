@@ -162,6 +162,34 @@ class S3Manager:
         if await exists(task_dir):
             await to_thread(lambda: rmtree(task_dir, ignore_errors=True))
 
+    async def _download_file_cached(self, uri: str, local_path: str) -> None:
+        meta = await self._provider.get_metadata(uri)
+        etag = meta.get("etag") if meta else None
+
+        if etag:
+            cache_dir = self._config.WORKER_BLOB_CACHE_DIR
+            await makedirs(cache_dir, exist_ok=True)
+            cache_file = join(cache_dir, etag)
+
+            if await exists(cache_file):
+                import os
+
+                if await exists(local_path):
+                    await to_thread(os.unlink, local_path)
+                await to_thread(os.symlink, cache_file, local_path)
+                self._observability.record_s3_op("download_cache_hit", "success")
+            else:
+                await self._provider.download(uri, cache_file)
+                import os
+
+                if await exists(local_path):
+                    await to_thread(os.unlink, local_path)
+                await to_thread(os.symlink, cache_file, local_path)
+                self._observability.record_s3_op("download", "success")
+        else:
+            await self._provider.download(uri, local_path)
+            self._observability.record_s3_op("download", "success")
+
     async def process_params(
         self, params: dict[str, Any], task_id: str, metadata: dict[str, FileMetadata] | None = None
     ) -> dict[str, Any]:
@@ -182,8 +210,7 @@ class S3Manager:
                             return await self._download_folder(item, local_path)
 
                         local_path = join(local_root, basename(key))
-                        await self._provider.download(item, local_path)
-                        self._observability.record_s3_op("download", "success")
+                        await self._download_file_cached(item, local_path)
                         return local_path
                 finally:
                     self._active_ops -= 1
@@ -205,7 +232,7 @@ class S3Manager:
             rel = relpath(obj.path, prefix)
             target = join(local_path, rel)
             await makedirs(dirname(target), exist_ok=True)
-            await self._provider.download(f"s3://{bucket}/{obj.path}", target)
+            await self._download_file_cached(f"s3://{bucket}/{obj.path}", target)
         return local_path
 
     async def process_result(

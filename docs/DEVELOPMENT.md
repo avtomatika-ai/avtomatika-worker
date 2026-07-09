@@ -7,24 +7,27 @@ This document describes how to create a custom Worker compatible with the Avtoma
 ## Core Concept
 
 Workers created with the SDK implement a hybrid interaction model with the Orchestrator:
+
 - **PULL Model for Task Retrieval:** The worker initiates the connection to the Orchestrator and "pulls" tasks from its personal queue. This allows workers to operate from any network (including behind NAT or corporate firewalls) without needing a public IP address.
 - **WebSocket for Real-time Communication:** An optional bidirectional channel to receive commands (e.g., task cancellation) and send intermediate execution progress.
 - **HLN Optimization:** The SDK uses the **Reverse Axon (RXON)** protocol, which reduces traffic by hashing skill lists and sending updates only when changes occur.
-- **Connection Resilience:** 
-    - **Independent Orchestrators:** Each orchestrator connection is managed by a separate background task. One server failure doesn't block communications with others.
-    - **Registration Retries:** Infinite retries with exponential backoff if an orchestrator is offline.
-    - **Non-blocking Startup:** The worker starts polling for tasks as soon as it successfully registers with at least one orchestrator.
+- **Connection Resilience:**
+  - **Independent Orchestrators:** Each orchestrator connection is managed by a separate background task. One server failure doesn't block communications with others.
+  - **Registration Retries:** Infinite retries with exponential backoff if an orchestrator is offline.
+  - **Non-blocking Startup:** The worker starts polling for tasks as soon as it successfully registers with at least one orchestrator.
 
 ## How to Build a Worker with the SDK
 
 ### Step 1: Install `avtomatika-worker`
 
 Ensure the SDK is installed in your environment. Recommended for all features (S3 and Pydantic):
+
 ```bash
 pip install "avtomatika-worker[s3,pydantic,metrics]"
 ```
 
 If you are working in the main repository, you can install it in editable mode:
+
 ```bash
 pip install -e .[dev]
 ```
@@ -53,7 +56,7 @@ class ReportParams(BaseModel):
 @worker.skill(description="Generates complex reports")
 async def generate_report(params: ReportParams, send_progress, send_event, **kwargs) -> dict:
     """
-    - `params` (ReportParams): Validated and typed parameters. 
+    - `params` (ReportParams): Validated and typed parameters.
       IMPORTANT: The argument MUST be named 'params' for automatic schema inference to work.
     - `send_progress`: Async function to send progress updates.
     - `send_event`: Async function to emit custom events.
@@ -65,7 +68,7 @@ async def generate_report(params: ReportParams, send_progress, send_event, **kwa
 
     # Send progress (standard event)
     await send_progress(progress=0.5, message="Processing data...")
-    
+
     # Send custom event
     await send_event("milestone", {"name": "data_parsed"})
 
@@ -137,15 +140,16 @@ POLL_BACKOFF_FACTOR=2.0     # Multiplier for each retry
 ### Step 5: Real-time Communication (WebSocket)
 
 To enable this feature, set `WORKER_ENABLE_WEBSOCKETS=true`. This allows you to:
+
 1.  **Send Progress & Events:** Use the injected `send_progress` and `send_event` functions.
 2.  **Task Cancellation:** The Orchestrator can send a command that will instantly trigger an `asyncio.CancelledError` in your handler.
-
 
 ### Step 6: Modular Skills (SkillBlueprint)
 
 Organize tasks into modules in the `skills/` directory.
 
 `skills/image_skills.py`:
+
 ```python
 from avtomatika_worker import SkillBlueprint
 from pydantic import BaseModel
@@ -178,15 +182,16 @@ from avtomatika_worker import Worker, TaskFiles
 async def process_video(params: dict, files: TaskFiles):
     # 'video_url' in params might have been an S3 URI, now replaced with the local path
     local_path = params["video_url"]
-    
+
     # Create result path
     result_path = await files.path_to("output.mp4")
     # ... process ...
-    
+
     return {"status": "success", "data": {"result": result_path}}
 ```
 
 #### S3 Configuration
+
 - `S3_ENDPOINT_URL`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_DEFAULT_BUCKET`.
 - `TASK_FILES_DIR`: Local root for temporary data (default: `/tmp/payloads`).
 
@@ -214,7 +219,7 @@ async def monitored_task(params: dict, obs: ObservabilityManager):
         span.set_attribute("model.name", "whisper-v3")
         # ... model work ...
         result = "processed data"
-        
+
     # 2. Metrics and logs inside the span are tied to the Task Trace ID
     return {"status": "success", "data": result}
 ```
@@ -232,11 +237,11 @@ The SDK provides `add_to_hot_skills` and `remove_from_hot_skills` functions that
 async def heavy_ai_task(params: dict, add_to_hot_skills, **kwargs):
     # 1. Load your model if needed
     model = await load_model("my_large_model")
-    
+
     # 2. Mark this resource or skill name as 'hot'
     # This will be sent in the next heartbeat to the Orchestrator
     add_to_hot_skills("my_large_model")
-    
+
     # 3. Process
     return {"status": "success"}
 ```
@@ -247,5 +252,26 @@ You can also use these methods on the `worker` instance directly: `worker.add_to
 
 By default, the SDK starts a small aiohttp server on `0.0.0.0:8083`. You can check the worker's status at `/health`.
 This is useful for Kubernetes (Liveness/Readiness probes) or monitoring systems.
+
 - Variable: `WORKER_PORT` (default: 8083)
 - CLI flag: `--health-check` (enabled by default)
+
+### Step 11: AI-Agent Tool Use (Subtask Delegation)
+
+For AI Agents performing complex reasoning, you can request other skills (tools) from the orchestrator and await their results inline.
+
+Request the `OrchestratorClient` dependency in your handler:
+
+```python
+from avtomatika_worker import Worker, OrchestratorClient
+
+@worker.skill()
+async def agent_reasoning(params: dict, orchestrator_client: OrchestratorClient):
+    # Delegate a subtask (e.g. tool execution) to the orchestrator
+    subtask_result = await orchestrator_client.call_skill(
+        skill_name="web_search",
+        params={"query": "latest news about AI"}
+    )
+    # Continue reasoning using the tool result
+    return {"final_answer": f"Web search returned: {subtask_result['data']}"}
+```
