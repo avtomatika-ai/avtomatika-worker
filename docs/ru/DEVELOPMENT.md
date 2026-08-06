@@ -112,6 +112,7 @@ worker run --app my_worker:worker --reload
 ORCHESTRATOR_URL=http://localhost:8080
 WORKER_ID=report-worker-01
 WORKER_TOKEN=a-super-secret-token-for-this-worker
+ORCHESTRATOR_SECRET_KEY=опциональный-секрет-для-проверки-подписи-входящих-задач
 ```
 
 #### Вариант 2: Расширенное соединение (Несколько оркестраторов)

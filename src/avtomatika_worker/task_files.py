@@ -8,12 +8,14 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from os.path import dirname, join
+from os import makedirs as std_makedirs
+from os.path import basename, dirname, join
 from typing import TYPE_CHECKING, Any, cast
 
 from aiofiles import open as aiopen
 from aiofiles.os import listdir, makedirs
 from aiofiles.ospath import exists as aio_exists
+from aiofiles.ospath import getsize
 from orjson import OPT_INDENT_2, dumps, loads
 from rxon.models import FileMetadata
 
@@ -61,8 +63,6 @@ class TaskFiles:
         """
         Synchronously returns the root directory for the task.
         """
-        from os import makedirs as std_makedirs
-
         std_makedirs(self._task_dir, exist_ok=True)
         return self._task_dir
 
@@ -134,10 +134,6 @@ class TaskFiles:
             raise RuntimeError("S3Manager not configured for this TaskFiles instance.")
 
         path = await self.path_to(filename)
-        from os.path import basename
-
-        from aiofiles.ospath import getsize
-
         bucket = self._s3_manager._config.S3_DEFAULT_BUCKET
         target_uri = f"s3://{bucket}/{join(self._job_id, basename(path)).lstrip('/')}"
 
@@ -158,7 +154,6 @@ class TaskFiles:
 
         path = join(self._task_dir, dirname) if dirname else self._task_dir
 
-        # We use a fixed key 'root' to avoid path-based KeyError
         _, metadata = await self._s3_manager.process_result({"root": path}, s3_prefix=self._job_id)
         return metadata["root"]
 
@@ -176,8 +171,6 @@ class TaskFiles:
             await self._s3_manager._provider.download(uri, local_path)
 
         if verify_meta:
-            from aiofiles.ospath import getsize
-
             actual_size = await getsize(local_path)
             if verify_meta.size is not None and actual_size != verify_meta.size:
                 raise ValueError(f"Size mismatch for {uri}")

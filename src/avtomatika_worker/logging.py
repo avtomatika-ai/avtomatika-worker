@@ -11,7 +11,7 @@ from os import getenv
 from sys import stdout
 from typing import Any
 
-from pythonjsonlogger import json as jsonlogger
+from pythonjsonlogger.json import JsonFormatter
 
 
 class ContextFilter(Filter):
@@ -42,9 +42,7 @@ def setup_logging(worker_id: str | None = None) -> None:
     handler = StreamHandler(stdout)
 
     if log_format == "json":
-        formatter = jsonlogger.JsonFormatter(
-            "%(asctime)s %(levelname)s %(name)s %(message)s %(worker_id)s %(task_id)s %(job_id)s"
-        )
+        formatter = JsonFormatter("%(asctime)s %(levelname)s %(name)s %(message)s %(worker_id)s %(task_id)s %(job_id)s")
     else:
         formatter = Formatter("[%(asctime)s] %(levelname)s in %(name)s: %(message)s")
 

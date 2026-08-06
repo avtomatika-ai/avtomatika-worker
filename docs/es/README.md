@@ -9,8 +9,11 @@ SDK oficial para construir trabajadores compatibles con el orquestador **Avtomat
 - **Modelo de Comunicación:**
   - **PULL:** Los trabajadores sondean tareas desde los orquestadores (funciona detrás de NAT/Firewall).
   - **WebSocket:** Canal de comandos en tiempo real (cancelación, comandos personalizados).
-- **Seguridad Zero Trust:**
+- **Seguridad Zero Trust y Cumplimiento de Políticas:**
   - Firma HMAC SHA256 obligatoria para todos los mensajes con `WORKER_TOKEN`.
+  - Verificación de la firma del orquestador (`orchestrator_signature` / `sig`) en tareas entrantes antes de su ejecución.
+  - Aplicación estricta de políticas de ejecución de tareas (`allowed_skills`).
+  - Recopilación y reporte automático de métricas de costo y tiempo de ejecución (`costs`).
   - Soporte para Identity Chain y Origin Worker ID para rastreo de procedencia.
   - Protección contra ataques de repetición mediante validación de marcas de tiempo.
 - **Optimización de Tráfico y Rendimiento:**

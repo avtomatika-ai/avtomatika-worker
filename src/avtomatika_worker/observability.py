@@ -127,7 +127,14 @@ class ObservabilityManager:
 
     @contextmanager
     def start_task_span(
-        self, task_type: str, task_id: str, job_id: str, parent_context: dict[str, Any] | None = None
+        self,
+        task_type: str,
+        task_id: str,
+        job_id: str,
+        parent_context: dict[str, Any] | None = None,
+        step: int = 0,
+        depth: int = 0,
+        parent_hash: str | None = None,
     ) -> Generator[Any | None, None, None]:
         """Starts a span for a task execution, optionally linked to a parent context."""
         if not self.enabled or not self.tracer:
@@ -138,14 +145,20 @@ class ObservabilityManager:
         if parent_context and propagate:
             ctx = propagate.extract(parent_context)
 
+        attributes = {
+            "task.id": task_id,
+            "job.id": job_id,
+            "task.type": task_type,
+            "task.step": step,
+            "task.depth": depth,
+        }
+        if parent_hash:
+            attributes["task.parent_hash"] = parent_hash
+
         with self.tracer.start_as_current_span(
             f"task.{task_type}",
             context=ctx,
-            attributes={
-                "task.id": task_id,
-                "job.id": job_id,
-                "task.type": task_type,
-            },
+            attributes=attributes,
         ) as span:
             yield span
 

@@ -110,6 +110,7 @@ worker run --app my_worker:worker --reload
 ORCHESTRATOR_URL=http://localhost:8080
 WORKER_ID=report-worker-01
 WORKER_TOKEN=a-super-secret-token-for-this-worker
+ORCHESTRATOR_SECRET_KEY=optional-secret-key-for-incoming-task-signature-verification
 ```
 
 #### Option 2: Advanced Connection (Multiple Orchestrators)

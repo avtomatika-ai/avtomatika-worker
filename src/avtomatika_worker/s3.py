@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from asyncio import Semaphore, sleep, to_thread
 from logging import getLogger
+from os import symlink, unlink
 from os.path import basename, dirname, join, relpath
 from shutil import rmtree
 from typing import Any, cast
@@ -39,7 +40,6 @@ except ImportError:
     obstore_put = None
     obstore_delete = None
 
-# Limit concurrent S3 operations to avoid "Too many open files"
 MAX_S3_CONCURRENCY = 50
 
 
@@ -172,19 +172,15 @@ class S3Manager:
             cache_file = join(cache_dir, etag)
 
             if await exists(cache_file):
-                import os
-
                 if await exists(local_path):
-                    await to_thread(os.unlink, local_path)
-                await to_thread(os.symlink, cache_file, local_path)
+                    await to_thread(unlink, local_path)
+                await to_thread(symlink, cache_file, local_path)
                 self._observability.record_s3_op("download_cache_hit", "success")
             else:
                 await self._provider.download(uri, cache_file)
-                import os
-
                 if await exists(local_path):
-                    await to_thread(os.unlink, local_path)
-                await to_thread(os.symlink, cache_file, local_path)
+                    await to_thread(unlink, local_path)
+                await to_thread(symlink, cache_file, local_path)
                 self._observability.record_s3_op("download", "success")
         else:
             await self._provider.download(uri, local_path)

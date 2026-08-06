@@ -25,8 +25,8 @@ from asyncio import (
 )
 from collections.abc import Callable
 from contextlib import suppress
+from dataclasses import MISSING, is_dataclass, make_dataclass
 from dataclasses import fields as dc_fields
-from dataclasses import is_dataclass, make_dataclass
 from dataclasses import replace as dc_replace
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
@@ -35,18 +35,20 @@ from importlib.metadata import version as get_version
 from importlib.util import module_from_spec, spec_from_file_location
 from inspect import Parameter, cleandoc, iscoroutinefunction, signature
 from logging import getLogger
+from os import getenv
 from os.path import join
 from signal import SIGINT, SIGTERM
 from sys import modules
 from time import perf_counter, time
-from typing import TYPE_CHECKING, Any, cast, get_args, get_origin, get_type_hints
+from types import UnionType
+from typing import TYPE_CHECKING, Any, Union, cast, get_args, get_origin, get_type_hints
 from uuid import uuid4
 
-import msgspec
-import msgspec.structs
 from aiofiles.os import listdir
 from aiofiles.ospath import abspath, exists
 from aiohttp import ClientSession, TCPConnector, web
+from msgspec import Struct
+from msgspec.structs import fields as struct_fields
 from msgspec.structs import replace as struct_replace
 from rxon import Transport, create_transport
 from rxon.blob import calculate_config_hash
@@ -84,7 +86,8 @@ from rxon.models import (
     WorkerRegistration,
 )
 from rxon.schema import extract_json_schema, extract_output_schema_from_func, extract_schema_from_func, validate_data
-from rxon.security import create_client_ssl_context, sign_payload
+from rxon.security import create_client_ssl_context, sign_payload, verify_signature
+from rxon.transports.http import HttpTransport
 from rxon.utils import calculate_dict_hash, from_dict, json_dumps, to_dict
 from rxon.validators import is_valid_identifier, validate_identifier
 
@@ -138,9 +141,6 @@ def _pydantic_extractor(schema_type: Any) -> dict[str, Any] | None:
     if _PYDANTIC_INSTALLED and isinstance(schema_type, type) and issubclass(schema_type, BaseModel):
         return cast(dict, cast(type[BaseModel], schema_type).model_json_schema())
 
-    from dataclasses import MISSING, is_dataclass
-    from dataclasses import fields as dc_fields
-
     if isinstance(schema_type, type) and is_dataclass(schema_type):
         properties = {}
         required = []
@@ -149,9 +149,6 @@ def _pydantic_extractor(schema_type: Any) -> dict[str, Any] | None:
                 continue
             field_schema = extract_json_schema(field_info.type, extractor=_pydantic_extractor)
             properties[field_info.name] = field_schema if field_schema is not None else {}
-
-            from types import UnionType
-            from typing import Union, get_args, get_origin
 
             is_optional = False
             tp = field_info.type
@@ -186,15 +183,15 @@ logger = getLogger(__name__)
 
 
 def fields(cls: Any) -> Any:
-    if isinstance(cls, type) and issubclass(cls, msgspec.Struct):
-        return msgspec.structs.fields(cls)
-    if isinstance(cls, msgspec.Struct):
-        return msgspec.structs.fields(type(cls))
+    if isinstance(cls, type) and issubclass(cls, Struct):
+        return struct_fields(cls)
+    if isinstance(cls, Struct):
+        return struct_fields(type(cls))
     return dc_fields(cls)
 
 
 def replace(obj: Any, **changes: Any) -> Any:
-    if isinstance(obj, msgspec.Struct):
+    if isinstance(obj, Struct):
         return struct_replace(obj, **changes)
     return dc_replace(obj, **changes)
 
@@ -226,7 +223,7 @@ def _create_dynamic_skill_object(
             base_kwargs["name"] = ""
         return base_class(**base_kwargs)
 
-    if isinstance(base_class, type) and issubclass(base_class, msgspec.Struct):
+    if isinstance(base_class, type) and issubclass(base_class, Struct):
         DynamicSkillClass = type(
             f"Dynamic{base_class.__name__}",
             (base_class,),
@@ -322,8 +319,6 @@ class OrchestratorClient:
         self._worker = worker
 
     async def call_skill(self, skill_name: str, params: dict[str, Any]) -> dict[str, Any]:
-        from rxon.transports.http import HttpTransport
-
         if not isinstance(self._client, HttpTransport):
             return {"status": "success", "data": {"mocked": True, "skill": skill_name, "params": params}}
 
@@ -854,6 +849,25 @@ class Worker:
             }
         task_payload = from_dict(TaskPayload, task_data_raw)
         task_id, job_id, skill_name = task_payload.task_id, task_payload.job_id, task_payload.type
+
+        secret_key = getenv("ORCHESTRATOR_SECRET_KEY", "")
+        payload_sig = task_payload.sig or getattr(task_payload, "orchestrator_signature", None)
+        if secret_key and payload_sig:
+            ignore_sig_fields = ["sig", "orchestrator_signature"]
+            if not verify_signature(task_payload, payload_sig, secret_key, ignore_fields=ignore_sig_fields):
+                logger.critical(f"Task {task_id} orchestrator signature verification failed!")
+                raise PermissionError(f"Task {task_id} orchestrator signature mismatch: task rejected")
+
+        if task_payload.policy:
+            allowed_skills = (
+                task_payload.policy.get("allowed_skills")
+                if isinstance(task_payload.policy, dict)
+                else getattr(task_payload.policy, "allowed_skills", None)
+            )
+            if allowed_skills is not None and skill_name not in allowed_skills:
+                logger.error(f"Task {task_id} type '{skill_name}' is not in allowed_skills policy {allowed_skills}")
+                raise PermissionError(f"Task type '{skill_name}' is not permitted by task policy")
+
         params = task_payload.params
         set_context(task_id=task_id, job_id=job_id)
         handler_data = self._skill_handlers.get(skill_name)
@@ -862,8 +876,18 @@ class Worker:
 
         start_time = perf_counter()
 
+        step_val = getattr(task_payload, "step", 0)
+        depth_val = getattr(task_payload, "depth", 0)
+        parent_hash_val = getattr(task_payload, "parent_hash", None)
+
         with self._observability.start_task_span(
-            skill_name, task_id, job_id, parent_context=task_payload.tracing_context
+            skill_name,
+            task_id,
+            job_id,
+            parent_context=task_payload.tracing_context,
+            step=step_val,
+            depth=depth_val,
+            parent_hash=parent_hash_val,
         ) as span:
             if handler_data:
                 is_valid, error_msg = task_payload.validate_params(handler_data["info"])
@@ -1074,6 +1098,14 @@ class Worker:
                             task_error = TaskError(code=ERROR_CODE_TRANSIENT, message=str(err_data))
 
                     timestamp = int(time())
+                    costs = {"execution_time_seconds": round(perf_counter() - start_time, 4)}
+                    if (
+                        isinstance(handler_result, dict)
+                        and "costs" in handler_result
+                        and isinstance(handler_result["costs"], dict)
+                    ):
+                        costs.update(handler_result["costs"])
+
                     result_obj = TaskResult(
                         job_id=job_id,
                         task_id=task_id,
@@ -1086,6 +1118,7 @@ class Worker:
                         security=None,
                         metadata=handler_result.get("metadata"),
                         timestamp=timestamp,
+                        costs=costs,
                     )
                     security = self._sign_payload_if_needed(result_obj)
                     if not security:
@@ -1399,32 +1432,27 @@ class Worker:
 
         cpu_load = 0.0
         ram_used = 0.0
-        try:
-            import psutil
-
-            cpu_load = psutil.cpu_percent()
-            ram_used = psutil.virtual_memory().used / (1024**3)
-        except ImportError:
-            pass
+        with suppress(Exception):
+            psutil = modules.get("psutil")
+            if psutil is not None:
+                cpu_load = float(psutil.cpu_percent())
+                ram_used = float(psutil.virtual_memory().used) / (1024**3)
 
         devices_usage = []
-        try:
-            import GPUtil
-
-            gpus = GPUtil.getGPUs()
-            for gpu in gpus:
-                devices_usage.append(
-                    DeviceUsage(
-                        unit_id=str(gpu.id),
-                        load_percent=float(gpu.load) * 100,
-                        metrics={
-                            "memory_used_gb": float(gpu.memoryUsed) / 1024,
-                            "temperature_c": float(gpu.temperature),
-                        },
+        with suppress(Exception):
+            gputil = modules.get("GPUtil")
+            if gputil is not None:
+                for gpu in gputil.getGPUs():
+                    devices_usage.append(
+                        DeviceUsage(
+                            unit_id=str(gpu.id),
+                            load_percent=float(gpu.load) * 100,
+                            metrics={
+                                "memory_used_gb": float(gpu.memoryUsed) / 1024,
+                                "temperature_c": float(gpu.temperature),
+                            },
+                        )
                     )
-                )
-        except (ImportError, Exception):
-            pass
 
         return ResourcesUsage(
             cpu_load_percent=cpu_load, ram_used_gb=ram_used, devices_usage=devices_usage if devices_usage else None
@@ -1438,7 +1466,6 @@ class Worker:
         if not self._last_sent_usage:
             return True
 
-        # Check CPU Load (absolute difference > deadband)
         if abs(current.cpu_load_percent - self._last_sent_usage.cpu_load_percent) > self._telemetry_deadband:
             return True
 
@@ -1485,9 +1512,7 @@ class Worker:
         current_usage = self._get_resources_usage()
         now = time()
 
-        from unittest.mock import Mock
-
-        if isinstance(current_usage, Mock):
+        if type(current_usage).__name__ in ("Mock", "MagicMock", "AsyncMock"):
             usage = current_usage
         else:
             usage = None

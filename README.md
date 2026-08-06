@@ -9,8 +9,11 @@ Official SDK for building workers compatible with the **Avtomatika** orchestrato
 - **Communication Model:**
   - **PULL:** Workers poll tasks from orchestrators (works behind NAT/Firewall).
   - **WebSocket:** Real-time command channel (cancellation, custom commands).
-- **Zero Trust Security:**
+- **Zero Trust Security & Policy Enforcement**:
   - Mandatory HMAC SHA256 signing for all messages using `WORKER_TOKEN`.
+  - Verification of `orchestrator_signature` on incoming tasks before execution.
+  - Strict enforcement of `allowed_skills` task execution policies.
+  - Automatic collection and reporting of task execution cost metrics (`costs`).
   - Identity Chain and Origin Worker ID support for provenance tracking.
   - Replay protection with timestamp validation.
 - **Traffic & Performance Optimization:**
